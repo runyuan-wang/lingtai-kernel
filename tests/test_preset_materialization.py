@@ -17,7 +17,7 @@ def _make_workdir(tmp_path: Path, active_preset: str | None = None,
         "language": "en",
         "llm": {"provider": "deepseek", "model": "deepseek-v4-flash",
                 "api_key": None, "api_key_env": "DEEPSEEK_API_KEY"},
-        "capabilities": {"file": {}},
+        "capabilities": {"shell": {}},
         "soul": {"delay": 120},
         "stamina": 3600,
         "molt_pressure": 0.8,
@@ -45,7 +45,7 @@ def _make_workdir(tmp_path: Path, active_preset: str | None = None,
     env_file.write_text("")
     init = {
         "manifest": manifest,
-        "principle": "p", "covenant": "c", "pad": "", "prompt": "",
+        "principle": "p", "covenant": "c", "pad": "", "lingtai": "",
         "soul": "",
         "env_file": str(env_file),
     }
@@ -89,7 +89,7 @@ def test_materialize_substitutes_llm_and_capabilities(tmp_path, monkeypatch):
             "manifest": {
                 "llm": {"provider": "minimax", "model": "MiniMax-M2.7-highspeed",
                         "api_key": None, "api_key_env": "MINIMAX_API_KEY"},
-                "capabilities": {"file": {}, "vision": {"provider": "minimax",
+                "capabilities": {"shell": {}, "vision": {"provider": "minimax",
                                                         "api_key_env": "MINIMAX_API_KEY"}},
             },
         },
@@ -106,12 +106,190 @@ def test_materialize_substitutes_llm_and_capabilities(tmp_path, monkeypatch):
     assert "vision" in data["manifest"]["capabilities"]
 
 
+def test_materialize_preserves_thinking_from_active_preset(tmp_path):
+    plib = _make_preset_lib(tmp_path, {
+        "codex": {
+            "name": "codex",
+            "description": {"summary": "Codex"},
+            "manifest": {
+                "llm": {
+                    "provider": "codex",
+                    "model": "gpt-5.5",
+                    "thinking": "xhigh",
+                },
+                "capabilities": {"shell": {}},
+            },
+        },
+    })
+    wd = _make_workdir(tmp_path, active_preset=str(plib / "codex.json"))
+
+    a = _make_probe_agent(wd)
+    data = a._read_init()
+
+    assert data is not None
+    assert data["manifest"]["llm"]["thinking"] == "xhigh"
+
+
 def test_materialize_no_preset_field_unchanged(tmp_path):
     """init.json without active_preset behaves exactly as before."""
     wd = _make_workdir(tmp_path)
     a = _make_probe_agent(wd)
     data = a._read_init()
     assert data["manifest"]["llm"]["provider"] == "deepseek"  # original
+
+
+def test_refresh_preset_thinking_reaches_session_path(tmp_path):
+    from unittest.mock import MagicMock
+    from lingtai.agent import Agent
+    from lingtai.kernel.config import AgentConfig
+
+    plib = _make_preset_lib(tmp_path, {
+        "codex": {
+            "name": "codex",
+            "description": {"summary": "Codex"},
+            "manifest": {
+                "llm": {
+                    "provider": "codex",
+                    "model": "gpt-5.5",
+                    "thinking": "xhigh",
+                },
+                "capabilities": {"shell": {}},
+            },
+        },
+    })
+    wd = _make_workdir(tmp_path, active_preset=str(plib / "codex.json"))
+
+    svc = MagicMock()
+    svc.provider = "codex"
+    svc.model = "gpt-5.5"
+    svc._base_url = None
+    svc._provider_defaults = {"codex": {"max_rpm": 60}}
+    svc.create_session.return_value = MagicMock()
+    svc.make_tool_result = MagicMock()
+    agent = Agent(svc, working_dir=wd, config=AgentConfig())
+
+    # ``_setup_from_init`` rebuilds a real ``LLMService`` from the resolved
+    # manifest (provider/model changed → service is reconstructed) and
+    # reassigns it onto the session, discarding the injected mock above. So
+    # the assertion must inspect the *real* session that ``ensure_session``
+    # creates, not the mock's ``create_session.call_args`` (which is never
+    # touched once the service is rebuilt). The real OpenAI Responses session
+    # folds the thinking level into ``reasoning.effort`` via
+    # ``_responses_reasoning_kwargs`` — asserting on that proves the preset's
+    # ``manifest.llm.thinking`` reaches the actual API reasoning payload.
+    agent._setup_from_init()
+    chat = agent._session.ensure_session()
+
+    assert agent._config.thinking == "xhigh"
+    assert chat._extra_kwargs.get("reasoning") == {"effort": "xhigh"}
+
+
+def test_refresh_preset_omitted_thinking_defaults_to_xhigh(tmp_path, monkeypatch):
+    """A codex preset with NO thinking field still sends reasoning.effort xhigh.
+
+    Mirrors ``test_refresh_preset_thinking_reaches_session_path`` but omits
+    ``manifest.llm.thinking``: hydration keeps the "default" sentinel for
+    Codex-family providers and the Codex adapter maps it to explicit
+    ``reasoning.effort = "xhigh"``. Hermetic: the codex token manager reads a
+    fake auth file in a temp TUI dir (far-future expiry, so no refresh).
+    """
+    from unittest.mock import MagicMock
+    from lingtai.agent import Agent
+    from lingtai.kernel.config import AgentConfig
+
+    tui = tmp_path / "tui"
+    tui.mkdir()
+    (tui / "codex-auth.json").write_text(json.dumps({
+        "access_token": "fake-access",
+        "refresh_token": "fake-refresh",
+        "expires_at": 4102444800,  # 2100-01-01: never near expiry, no refresh
+    }))
+    monkeypatch.setenv("LINGTAI_TUI_DIR", str(tui))
+
+    plib = _make_preset_lib(tmp_path, {
+        "codex": {
+            "name": "codex",
+            "description": {"summary": "Codex"},
+            "manifest": {
+                "llm": {
+                    "provider": "codex",
+                    "model": "gpt-5.5",
+                },
+                "capabilities": {"shell": {}},
+            },
+        },
+    })
+    wd = _make_workdir(tmp_path, active_preset=str(plib / "codex.json"))
+
+    svc = MagicMock()
+    svc.provider = "codex"
+    svc.model = "gpt-5.5"
+    svc._base_url = None
+    svc._provider_defaults = {"codex": {"max_rpm": 60}}
+    svc.create_session.return_value = MagicMock()
+    svc.make_tool_result = MagicMock()
+    agent = Agent(svc, working_dir=wd, config=AgentConfig())
+
+    agent._setup_from_init()
+    chat = agent._session.ensure_session()
+
+    assert agent._config.thinking == "default"
+    assert chat._extra_kwargs.get("reasoning") == {"effort": "xhigh"}
+
+
+@pytest.mark.parametrize(
+    ("manifest_thinking", "expected_thinking"),
+    [(None, "high"), ("minimal", "minimal")],
+)
+def test_refresh_custom_responses_thinking_reaches_session_path(
+    tmp_path, monkeypatch, manifest_thinking, expected_thinking
+):
+    """Custom Responses keeps high on omission and forwards explicit effort."""
+    from unittest.mock import MagicMock
+
+    from lingtai.agent import Agent
+    from lingtai.kernel.config import AgentConfig
+
+    monkeypatch.setenv("CUSTOM_RESPONSES_API_KEY", "fake-key")
+    llm = {
+        "provider": "custom",
+        "model": "custom-model",
+        "api_compat": "openai",
+        "base_url": "https://gateway.example.test/v1",
+        "api_key_env": "CUSTOM_RESPONSES_API_KEY",
+        "wire_api": "responses",
+    }
+    if manifest_thinking is not None:
+        llm["thinking"] = manifest_thinking
+
+    plib = _make_preset_lib(tmp_path, {
+        "custom-responses": {
+            "name": "custom-responses",
+            "description": {"summary": "Custom Responses"},
+            "manifest": {
+                "llm": llm,
+                "capabilities": {"shell": {}},
+            },
+        },
+    })
+    wd = _make_workdir(
+        tmp_path, active_preset=str(plib / "custom-responses.json")
+    )
+
+    svc = MagicMock()
+    svc.provider = "deepseek"
+    svc.model = "deepseek-v4-flash"
+    svc._base_url = None
+    svc._provider_defaults = {"deepseek": {"max_rpm": 60}}
+    svc.create_session.return_value = MagicMock()
+    svc.make_tool_result = MagicMock()
+    agent = Agent(svc, working_dir=wd, config=AgentConfig())
+
+    agent._setup_from_init()
+    chat = agent._session.ensure_session()
+
+    assert agent._config.thinking == expected_thinking
+    assert chat._extra_kwargs.get("reasoning") == {"effort": expected_thinking}
 
 
 def test_materialize_unknown_preset_returns_none_and_logs(tmp_path):
@@ -123,7 +301,10 @@ def test_materialize_unknown_preset_returns_none_and_logs(tmp_path):
     data = a._read_init()
     assert data is None
     events = [e for e, _ in a._log_events]
-    assert "refresh_init_error" in events
+    assert "init_read_result" in events
+    result = next(fields for event, fields in a._log_events if event == "init_read_result")
+    assert result["reader_status"] == "READ_FAILED"
+    assert result["failure_stage"] == "PRESET"
 
 
 def test_materialize_default_presets_path(tmp_path, monkeypatch):
@@ -140,7 +321,7 @@ def test_materialize_default_presets_path(tmp_path, monkeypatch):
         "manifest": {
             "llm": {"provider": "deepseek-NEW", "model": "v4-NEW",
                     "api_key": None, "api_key_env": "X"},
-            "capabilities": {"file": {}},
+            "capabilities": {"shell": {}},
         },
     }))
     wd = _make_workdir(tmp_path, active_preset="~/.lingtai-tui/presets/deepseek.json")
@@ -162,7 +343,7 @@ def test_materialize_relative_presets_path_resolves_against_workdir(tmp_path, mo
         "manifest": {
             "llm": {"provider": "p1", "model": "m1",
                     "api_key": None, "api_key_env": "P1KEY"},
-            "capabilities": {"file": {}},
+            "capabilities": {"shell": {}},
         },
     }))
     # Set up env_file (validate_init requires it when api_key_env is set)
@@ -189,7 +370,7 @@ def test_materialize_relative_presets_path_resolves_against_workdir(tmp_path, mo
             "admin": {"karma": True},
             "streaming": False,
         },
-        "principle": "p", "covenant": "c", "pad": "", "prompt": "",
+        "principle": "p", "covenant": "c", "pad": "", "lingtai": "",
         "soul": "",
         "env_file": str(env),
     }
@@ -204,70 +385,13 @@ def test_materialize_relative_presets_path_resolves_against_workdir(tmp_path, mo
     assert data["manifest"]["llm"]["provider"] == "p1"
 
 
-def test_materialize_omitted_path_falls_back_to_default(tmp_path, monkeypatch):
-    """preset block uses a `~/...` style active path resolved via $HOME."""
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
-    monkeypatch.setenv("HOME", str(fake_home))
-    monkeypatch.setattr("pathlib.Path.home", lambda: fake_home)
-    plib = fake_home / ".lingtai-tui" / "presets"
-    plib.mkdir(parents=True)
-    (plib / "fallback.json").write_text(json.dumps({
-        "name": "fallback",
-        "description": {"summary": "fallback preset"},
-        "manifest": {
-            "llm": {"provider": "p2", "model": "m2",
-                    "api_key": None, "api_key_env": "P2KEY"},
-            "capabilities": {"file": {}},
-        },
-    }))
+def test_materialize_discards_context_limit_from_legacy_layout(tmp_path, monkeypatch):
+    """A legacy preset value stays out of the effective init manifest.
 
-    wd = tmp_path / "agent"
-    wd.mkdir()
-    env = wd / ".env"
-    env.write_text("P2KEY=sk-test\n")
-
-    init = {
-        "manifest": {
-            "agent_name": "alice",
-            "language": "en",
-            "preset": {
-                "active": "~/.lingtai-tui/presets/fallback.json",
-                "default": "~/.lingtai-tui/presets/fallback.json",
-                "allowed": ["~/.lingtai-tui/presets/fallback.json"],
-            },
-            "llm": {"provider": "PLACEHOLDER", "model": "PLACEHOLDER",
-                    "api_key": None, "api_key_env": "P2KEY"},
-            "capabilities": {},
-            "soul": {"delay": 120},
-            "stamina": 3600,
-            "molt_pressure": 0.8,
-            "molt_prompt": "",
-            "max_turns": 50,
-            "admin": {"karma": True},
-            "streaming": False,
-        },
-        "principle": "p", "covenant": "c", "pad": "", "prompt": "",
-        "soul": "",
-        "env_file": str(env),
-    }
-    (wd / "init.json").write_text(json.dumps(init))
-
-    a = _make_probe_agent(wd)
-    data = a._read_init()
-    assert data is not None
-    assert data["manifest"]["llm"]["provider"] == "p2"
-
-
-def test_materialize_picks_up_context_limit_from_legacy_layout(tmp_path, monkeypatch):
-    """A legacy preset (context_limit at manifest root) still works end-to-end.
-
-    The kernel migration system (m001) runs from inside load_preset and
-    relocates the field to the canonical location before the materializer
-    reads the preset. The materializer then writes it into init.json's
-    manifest root (init.json's schema is unchanged).
+    Production preset reads are migration-free. The materializer interprets the
+    legacy root field in memory and leaves the authored preset bytes untouched.
     """
-    from lingtai_kernel.migrate.migrate import reset_process_cache
+    from lingtai.kernel.migrate.migrate import reset_process_cache
     reset_process_cache()
     plib = _make_preset_lib(tmp_path, {
         "narrow": {
@@ -276,7 +400,7 @@ def test_materialize_picks_up_context_limit_from_legacy_layout(tmp_path, monkeyp
             "manifest": {
                 "llm": {"provider": "p", "model": "m",
                         "api_key": None, "api_key_env": "PKEY"},
-                "capabilities": {"file": {}},
+                "capabilities": {"shell": {}},
                 "context_limit": 16384,
             },
         },
@@ -288,20 +412,18 @@ def test_materialize_picks_up_context_limit_from_legacy_layout(tmp_path, monkeyp
     a = _make_probe_agent(wd)
     data = a._read_init()
     assert data is not None
-    assert data["manifest"]["context_limit"] == 16384
-    # The migration rewrote the on-disk preset to the canonical layout.
+    assert "context_limit" not in data["manifest"]
+    # The real reader/materializer is read-only over the authored preset.
     on_disk = json.loads((plib / "narrow.json").read_text())
-    assert "context_limit" not in on_disk["manifest"]
-    assert on_disk["manifest"]["llm"]["context_limit"] == 16384
+    assert on_disk["manifest"]["context_limit"] == 16384
+    assert "context_limit" not in on_disk["manifest"]["llm"]
 
 
-def test_materialize_picks_up_context_limit_from_llm_block(tmp_path, monkeypatch):
+def test_materialize_discards_context_limit_from_llm_block(tmp_path, monkeypatch):
     """Canonical layout: context_limit lives inside manifest.llm in the preset.
 
-    The materializer must lift it out of llm and write it to manifest root
-    in init.json (the runtime contract — init.json schema is unchanged).
-    The materialized llm block must NOT carry context_limit forward, since
-    init.json's llm block doesn't have that field.
+    The materializer discards it: presets may use it for their own context-fit
+    guard, but it must never become an init.json runtime input.
     """
     plib = _make_preset_lib(tmp_path, {
         "narrow": {
@@ -311,7 +433,7 @@ def test_materialize_picks_up_context_limit_from_llm_block(tmp_path, monkeypatch
                 "llm": {"provider": "p", "model": "m",
                         "api_key": None, "api_key_env": "PKEY",
                         "context_limit": 16384},
-                "capabilities": {"file": {}},
+                "capabilities": {"shell": {}},
             },
         },
     })
@@ -322,8 +444,7 @@ def test_materialize_picks_up_context_limit_from_llm_block(tmp_path, monkeypatch
     a = _make_probe_agent(wd)
     data = a._read_init()
     assert data is not None
-    assert data["manifest"]["context_limit"] == 16384
-    # llm block in init.json schema does not carry context_limit
+    assert "context_limit" not in data["manifest"]
     assert "context_limit" not in data["manifest"]["llm"]
 
 
@@ -331,7 +452,7 @@ def test_materialize_preserves_init_capability_overrides(tmp_path, monkeypatch):
     """Per-agent capability kwargs in init.json survive preset materialization.
 
     A preset enabling daemon must not clobber init.json's
-    manifest.capabilities.daemon.max_emanations — the preset decides *which*
+    manifest.capabilities.daemon.manager_pool_size — the preset decides *which*
     capabilities run, but per-agent overrides win key-by-key. Regression for
     daemon(list) reporting the default ceiling instead of the configured one.
     """
@@ -343,7 +464,7 @@ def test_materialize_preserves_init_capability_overrides(tmp_path, monkeypatch):
                 "llm": {"provider": "gemini", "model": "gemini-2.5-pro",
                         "api_key": None, "api_key_env": "GEMINI_API_KEY"},
                 # Preset enables daemon with its own (default-ish) ceiling.
-                "capabilities": {"file": {}, "daemon": {"max_emanations": 10}},
+                "capabilities": {"shell": {}, "daemon": {"manager_pool_size": 10}},
             },
         },
     })
@@ -351,16 +472,16 @@ def test_materialize_preserves_init_capability_overrides(tmp_path, monkeypatch):
     # init.json declares daemon with a per-agent override of 30.
     wd = _make_workdir(
         tmp_path, active_preset=str(plib / "smart.json"),
-        manifest_extra={"capabilities": {"daemon": {"max_emanations": 30}}},
+        manifest_extra={"capabilities": {"daemon": {"manager_pool_size": 30}}},
     )
     a = _make_probe_agent(wd)
     data = a._read_init()
     caps = data["manifest"]["capabilities"]
-    # Preset still chose the capability set (file is present from the preset)...
-    assert "file" in caps
+    # Preset still chose the capability set (shell is present from the preset)...
+    assert "shell" in caps
     assert "daemon" in caps
     # ...but the init.json override wins for the key it specified.
-    assert caps["daemon"]["max_emanations"] == 30
+    assert caps["daemon"]["manager_pool_size"] == 30
 
 
 def test_materialize_preset_only_capability_kwargs_kept(tmp_path, monkeypatch):
@@ -376,20 +497,20 @@ def test_materialize_preset_only_capability_kwargs_kept(tmp_path, monkeypatch):
             "manifest": {
                 "llm": {"provider": "gemini", "model": "gemini-2.5-pro",
                         "api_key": None, "api_key_env": "GEMINI_API_KEY"},
-                "capabilities": {"daemon": {"max_emanations": 50, "max_turns": 99}},
+                "capabilities": {"daemon": {"manager_pool_size": 50, "max_turns": 99}},
             },
         },
     })
     monkeypatch.setenv("GEMINI_API_KEY", "sk-test")
-    # init.json overrides only max_emanations; max_turns must come from preset.
+    # init.json overrides only manager_pool_size; max_turns must come from preset.
     wd = _make_workdir(
         tmp_path, active_preset=str(plib / "smart.json"),
-        manifest_extra={"capabilities": {"daemon": {"max_emanations": 30}}},
+        manifest_extra={"capabilities": {"daemon": {"manager_pool_size": 30}}},
     )
     a = _make_probe_agent(wd)
     data = a._read_init()
     daemon_kw = data["manifest"]["capabilities"]["daemon"]
-    assert daemon_kw["max_emanations"] == 30   # init override wins
+    assert daemon_kw["manager_pool_size"] == 30   # init override wins
     assert daemon_kw["max_turns"] == 99        # preset kwarg preserved
 
 
@@ -399,9 +520,12 @@ def test_materialize_preserves_core_default_override_when_preset_omits_it(tmp_pa
 
     Jason's real case: the codex preset enables file/web tools but never
     mentions daemon. daemon is always-on (CORE_DEFAULTS), so init.json's
-    daemon.max_emanations=30 must be carried into the materialized manifest;
+    daemon.manager_pool_size=30 must be carried into the materialized manifest;
     otherwise apply_core_defaults later re-adds daemon={} and the override is
-    lost. Non-core capabilities the preset omits are still dropped (the swap).
+    lost. vision is also a CORE_DEFAULTS capability (always registered, default
+    route inherits the active LLM), so an explicit init.json vision override
+    survives materialization too. Non-core capabilities the preset omits are
+    still dropped (the swap).
     """
     plib = _make_preset_lib(tmp_path, {
         "codex": {
@@ -411,7 +535,7 @@ def test_materialize_preserves_core_default_override_when_preset_omits_it(tmp_pa
                 "llm": {"provider": "gemini", "model": "gemini-2.5-pro",
                         "api_key": None, "api_key_env": "GEMINI_API_KEY"},
                 # Note: NO daemon key. Has a non-core optional cap instead.
-                "capabilities": {"file": {}, "web_search": {"provider": "inherit"}},
+                "capabilities": {"shell": {}, "web_search": {"provider": "inherit"}},
             },
         },
     })
@@ -419,8 +543,8 @@ def test_materialize_preserves_core_default_override_when_preset_omits_it(tmp_pa
     wd = _make_workdir(
         tmp_path, active_preset=str(plib / "codex.json"),
         manifest_extra={"capabilities": {
-            "daemon": {"max_emanations": 30},   # core default — must survive
-            "vision": {"provider": "custom"},   # non-core, preset omits — must drop
+            "daemon": {"manager_pool_size": 30},   # core default — must survive
+            "vision": {"provider": "custom"},   # core default — must survive
         }},
     )
     a = _make_probe_agent(wd)
@@ -428,11 +552,12 @@ def test_materialize_preserves_core_default_override_when_preset_omits_it(tmp_pa
     caps = data["manifest"]["capabilities"]
     # Core-default daemon override carried forward despite preset omitting it.
     assert "daemon" in caps
-    assert caps["daemon"]["max_emanations"] == 30
-    # Preset still owns the explicit opt-in set.
-    assert "web_search" in caps
-    # Non-core optional capability that the preset omits is NOT carried over.
-    assert "vision" not in caps
+    assert caps["daemon"]["manager_pool_size"] == 30
+    # Core-default vision override is carried forward the same way.
+    assert "vision" in caps
+    assert caps["vision"] == {"provider": "custom"}
+    # Preset still owns the explicit opt-in set, emitted canonically.
+    assert "web" in caps
 
 
 def test_materialize_core_default_no_init_override_left_to_apply_core_defaults(tmp_path, monkeypatch):
@@ -446,7 +571,7 @@ def test_materialize_core_default_no_init_override_left_to_apply_core_defaults(t
             "manifest": {
                 "llm": {"provider": "gemini", "model": "gemini-2.5-pro",
                         "api_key": None, "api_key_env": "GEMINI_API_KEY"},
-                "capabilities": {"file": {}},
+                "capabilities": {"shell": {}},
             },
         },
     })
@@ -454,7 +579,7 @@ def test_materialize_core_default_no_init_override_left_to_apply_core_defaults(t
     # init.json declares only file (no daemon kwargs).
     wd = _make_workdir(
         tmp_path, active_preset=str(plib / "codex.json"),
-        manifest_extra={"capabilities": {"file": {}}},
+        manifest_extra={"capabilities": {"shell": {}}},
     )
     a = _make_probe_agent(wd)
     data = a._read_init()
@@ -465,10 +590,10 @@ def test_materialize_core_default_no_init_override_left_to_apply_core_defaults(t
 
 def test_refresh_preset_omitting_daemon_keeps_override_in_manager(tmp_path, monkeypatch):
     """End-to-end refresh for Jason's case: active preset omits daemon, init.json
-    sets daemon.max_emanations=30 → live DaemonManager ceiling is 30."""
+    sets daemon.manager_pool_size=30 → live DaemonManager ceiling is 30."""
     from unittest.mock import MagicMock
     from lingtai.agent import Agent
-    from lingtai_kernel.config import AgentConfig
+    from lingtai.kernel.config import AgentConfig
 
     plib = _make_preset_lib(tmp_path, {
         "codex": {
@@ -477,14 +602,14 @@ def test_refresh_preset_omitting_daemon_keeps_override_in_manager(tmp_path, monk
             "manifest": {
                 "llm": {"provider": "deepseek", "model": "deepseek-v4-flash",
                         "api_key": None, "api_key_env": "DEEPSEEK_API_KEY"},
-                "capabilities": {"file": {}},   # no daemon entry
+                "capabilities": {"shell": {}},   # no daemon entry
             },
         },
     })
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     wd = _make_workdir(
         tmp_path, active_preset=str(plib / "codex.json"),
-        manifest_extra={"capabilities": {"daemon": {"max_emanations": 30}}},
+        manifest_extra={"capabilities": {"daemon": {"manager_pool_size": 30}}},
     )
 
     svc = MagicMock()
@@ -498,8 +623,8 @@ def test_refresh_preset_omitting_daemon_keeps_override_in_manager(tmp_path, monk
 
     mgr = agent.get_capability("daemon")
     assert mgr is not None
-    assert mgr._max_emanations == 30
-    assert mgr._handle_list()["max_emanations"] == 30
+    assert mgr._manager_pool_size == 30
+    assert mgr._handle_list()["manager_pool_size"] == 30
 
 
 def test_refresh_preset_keeps_daemon_override_in_manager(tmp_path, monkeypatch):
@@ -512,7 +637,7 @@ def test_refresh_preset_keeps_daemon_override_in_manager(tmp_path, monkeypatch):
     """
     from unittest.mock import MagicMock
     from lingtai.agent import Agent
-    from lingtai_kernel.config import AgentConfig
+    from lingtai.kernel.config import AgentConfig
 
     plib = _make_preset_lib(tmp_path, {
         "smart": {
@@ -521,14 +646,14 @@ def test_refresh_preset_keeps_daemon_override_in_manager(tmp_path, monkeypatch):
             "manifest": {
                 "llm": {"provider": "deepseek", "model": "deepseek-v4-flash",
                         "api_key": None, "api_key_env": "DEEPSEEK_API_KEY"},
-                "capabilities": {"daemon": {"max_emanations": 10}},
+                "capabilities": {"daemon": {"manager_pool_size": 10}},
             },
         },
     })
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     wd = _make_workdir(
         tmp_path, active_preset=str(plib / "smart.json"),
-        manifest_extra={"capabilities": {"daemon": {"max_emanations": 30}}},
+        manifest_extra={"capabilities": {"daemon": {"manager_pool_size": 30}}},
     )
 
     svc = MagicMock()
@@ -544,35 +669,103 @@ def test_refresh_preset_keeps_daemon_override_in_manager(tmp_path, monkeypatch):
 
     mgr = agent.get_capability("daemon")
     assert mgr is not None
-    assert mgr._max_emanations == 30
-    assert mgr._handle_list()["max_emanations"] == 30
+    assert mgr._manager_pool_size == 30
+    assert mgr._handle_list()["manager_pool_size"] == 30
 
 
-def test_materialize_inherit_expansion_runs(tmp_path, monkeypatch):
-    """Capabilities with provider:inherit get the main LLM's provider after materialization."""
+
+def test_refresh_preset_omitting_mcp_keeps_channel_reply_surface(tmp_path, monkeypatch):
+    """Regression for Lingtai-AI/lingtai#235.
+
+    A saved LLM preset may omit ``mcp`` from ``manifest.capabilities``.  When
+    the agent still has configured channel MCPs in init.json, refresh must not
+    strand it with a notification producer but no way to read/reply.  The core
+    floor keeps the ``mcp`` management tool available, intrinsics keep
+    ``email``/``psyche`` available, and init.json MCPs still load into the live
+    tool surface after preset materialization.
+    """
+    from unittest.mock import MagicMock
+
+    from lingtai.agent import Agent
+    from lingtai.kernel.config import AgentConfig
+
     plib = _make_preset_lib(tmp_path, {
-        "smart": {
-            "name": "smart",
-            "description": {"summary": "smart preset"},
+        "codex": {
+            "name": "codex",
+            "description": {"summary": "codex preset without channel caps"},
             "manifest": {
-                "llm": {"provider": "gemini", "model": "gemini-2.5-pro",
-                        "api_key": None, "api_key_env": "GEMINI_API_KEY"},
-                "capabilities": {
-                    "file": {},
-                    "web_search": {"provider": "inherit"},
+                "llm": {
+                    "provider": "deepseek",
+                    "model": "deepseek-v4-flash",
+                    "api_key": None,
+                    "api_key_env": "DEEPSEEK_API_KEY",
                 },
+                # Deliberately no mcp/email/psyche entries, matching the
+                # stranding incident described in #235.
+                "capabilities": {"shell": {}},
             },
         },
     })
-    monkeypatch.setenv("GEMINI_API_KEY", "sk-test")
-    wd = _make_workdir(tmp_path, active_preset=str(plib / "smart.json"),
-                       presets_path=str(plib))
-    a = _make_probe_agent(wd)
-    data = a._read_init()
-    caps = data["manifest"]["capabilities"]
-    assert caps["web_search"]["provider"] == "gemini"
-    assert caps["web_search"]["api_key_env"] == "GEMINI_API_KEY"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    wd = _make_workdir(
+        tmp_path,
+        active_preset=str(plib / "codex.json"),
+        manifest_extra={"capabilities": {"shell": {}}},
+    )
 
+    init_path = wd / "init.json"
+    init_data = json.loads(init_path.read_text(encoding="utf-8"))
+    init_data["mcp"] = {
+        "telegram": {
+            "type": "stdio",
+            "command": "python",
+            "args": ["-m", "fake_telegram_mcp"],
+            "env": {},
+        }
+    }
+    init_path.write_text(json.dumps(init_data), encoding="utf-8")
+    (wd / "mcp_registry.jsonl").write_text(
+        json.dumps({
+            "name": "telegram",
+            "summary": "Telegram channel producer",
+            "transport": "stdio",
+            "command": "python",
+            "args": ["-m", "fake_telegram_mcp"],
+            "source": "test",
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    class FakeClient:
+        def close(self):
+            pass
+
+        def is_connected(self):
+            return True
+
+    def fake_connect_mcp(self, command, args=None, env=None):
+        self.add_tool("telegram", schema={}, handler=lambda _args: {"status": "ok"})
+        if not hasattr(self, "_mcp_clients"):
+            self._mcp_clients = []
+        self._mcp_clients.append(FakeClient())
+        return ["telegram"]
+
+    monkeypatch.setattr(Agent, "connect_mcp", fake_connect_mcp)
+
+    svc = MagicMock()
+    svc.provider = "mock"
+    svc.model = "mock-model"
+    svc.create_session = MagicMock()
+    svc.make_tool_result = MagicMock()
+    agent = Agent(svc, working_dir=wd, capabilities=[], config=AgentConfig())
+
+    agent._setup_from_init()
+
+    assert "email" in agent._intrinsics
+    assert "context" in agent._intrinsics
+    assert "mcp" in agent._tool_handlers
+    assert "telegram" in agent._tool_handlers
+    assert "telegram" in getattr(agent, "_mcp_init_specs", {})
 
 # ---------------------------------------------------------------------------
 # Missing-active fallback to default — cross-machine portability
@@ -588,7 +781,7 @@ def _build_init_with_active_and_default(
             "language": "en",
             "llm": {"provider": "deepseek", "model": "deepseek-v4-flash",
                     "api_key": None, "api_key_env": "DEEPSEEK_API_KEY"},
-            "capabilities": {"file": {}},
+            "capabilities": {"shell": {}},
             "soul": {"delay": 120},
             "stamina": 3600,
             "molt_pressure": 0.8,
@@ -602,7 +795,7 @@ def _build_init_with_active_and_default(
                 "allowed": [active_path, default_path],
             },
         },
-        "principle": "p", "covenant": "c", "pad": "", "prompt": "",
+        "principle": "p", "covenant": "c", "pad": "", "lingtai": "",
         "soul": "",
         "env_file": str(env_file),
     }
@@ -618,7 +811,7 @@ def test_materialize_missing_active_falls_back_to_default(tmp_path, monkeypatch)
             "manifest": {
                 "llm": {"provider": "minimax", "model": "MiniMax-M2.7-highspeed",
                         "api_key": None, "api_key_env": "MINIMAX_API_KEY"},
-                "capabilities": {"file": {}},
+                "capabilities": {"shell": {}},
             },
         },
     })
@@ -630,7 +823,7 @@ def test_materialize_missing_active_falls_back_to_default(tmp_path, monkeypatch)
     env_file.write_text("")
     data = _build_init_with_active_and_default(active_missing, default_present, env_file)
 
-    from lingtai.presets import materialize_active_preset
+    from tests._migration_workspace_helpers import materialize_active_preset
     materialize_active_preset(data, tmp_path)
 
     assert data["manifest"]["preset"]["active"] == default_present
@@ -652,7 +845,7 @@ def test_materialize_missing_active_and_missing_default_raises(tmp_path):
         env_file=env_file,
     )
 
-    from lingtai.presets import materialize_active_preset
+    from tests._migration_workspace_helpers import materialize_active_preset
     with pytest.raises(KeyError):
         materialize_active_preset(data, tmp_path)
 
@@ -670,7 +863,7 @@ def test_materialize_missing_active_with_same_default_raises(tmp_path):
         active_path=same_missing, default_path=same_missing, env_file=env_file,
     )
 
-    from lingtai.presets import materialize_active_preset
+    from tests._migration_workspace_helpers import materialize_active_preset
     with pytest.raises(KeyError):
         materialize_active_preset(data, tmp_path)
 
@@ -694,7 +887,7 @@ def test_materialize_malformed_active_does_not_fall_back(tmp_path):
         "manifest": {
             "llm": {"provider": "p", "model": "m",
                     "api_key": None, "api_key_env": "K"},
-            "capabilities": {"file": {}},
+            "capabilities": {"shell": {}},
         },
     }))
     env_file = tmp_path / ".env"
@@ -703,7 +896,7 @@ def test_materialize_malformed_active_does_not_fall_back(tmp_path):
         active_path=str(bad_active), default_path=str(good_default), env_file=env_file,
     )
 
-    from lingtai.presets import materialize_active_preset
+    from tests._migration_workspace_helpers import materialize_active_preset
     with pytest.raises(ValueError):
         materialize_active_preset(data, tmp_path)
     # active was NOT silently rewritten
@@ -720,7 +913,7 @@ def test_read_init_recovers_when_active_preset_missing(tmp_path, monkeypatch):
             "manifest": {
                 "llm": {"provider": "minimax", "model": "MiniMax-M2.7-highspeed",
                         "api_key": None, "api_key_env": "MINIMAX_API_KEY"},
-                "capabilities": {"file": {}},
+                "capabilities": {"shell": {}},
             },
         },
     })

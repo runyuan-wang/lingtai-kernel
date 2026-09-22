@@ -1,3 +1,19 @@
+---
+related_files:
+  - src/lingtai/llm/ANATOMY.md
+  - src/lingtai/llm/anthropic/adapter.py
+  - src/lingtai/llm/minimax/__init__.py
+  - src/lingtai/llm/minimax/adapter.py
+  - src/lingtai/llm/minimax/mcp_client.py
+maintenance: |
+  Keep related_files as repo-relative paths to real files. Include neighboring
+  ANATOMY.md files so the anatomy graph stays connected rather than isolated;
+  anatomy links must be bidirectional. If you create a new ANATOMY.md, copy this
+  maintenance field. If you notice drift between this anatomy and the code,
+  report it. See lingtai-dev-guide for details.
+  Capability mentions in any document require explicit bidirectional
+  related_files mapping to the implementing code (see root ## Maintenance).
+---
 # src/lingtai/llm/minimax
 
 MiniMax adapter — inherits Anthropic-compatible endpoint, adds MCP client factory for MiniMax coding-plan tools.
@@ -9,14 +25,13 @@ MiniMax adapter — inherits Anthropic-compatible endpoint, adds MCP client fact
 | File | LOC | Role |
 |------|-----|------|
 | `__init__.py` | 4 | Re-exports `MiniMaxAdapter`, `get_minimax_mcp_client` |
-| `adapter.py` | 21 | `MiniMaxAdapter(AnthropicAdapter)` — thin subclass |
+| `adapter.py` | 27 | `MiniMaxAdapter(AnthropicAdapter)` — thin subclass |
 | `mcp_client.py` | 153 | Singleton MCP client factory for MiniMax MCP server (vision/compose/draw/talk) |
-| `defaults.py` | 7 | `DEFAULTS` dict: `api_compat=anthropic`, `base_url=https://api.minimax.io/anthropic`, `api_key_env=MINIMAX_API_KEY`, `model=MiniMax-M2.7-highspeed`, `max_rpm=120` |
 
 ## Connections
 
 - **Inherits**: `AnthropicAdapter` from `../anthropic/adapter.py` — full Anthropic Messages API protocol.
-- **MCP client**: `mcp_client.py` imports `MCPClient` from `lingtai_kernel.services.mcp`.
+- **MCP client**: `mcp_client.py` imports `MCPClient` from `lingtai.kernel.services.mcp`.
 - **External**: `anthropic` SDK (inherited), `uvx` binary (for MCP subprocess).
 - **No direct google/openai imports**.
 
@@ -28,7 +43,7 @@ Only override is `__init__`:
 
 | Override | Line | What changes |
 |----------|------|-------------|
-| `__init__` | 15 | Sets `base_url` to `https://api.minimax.io/anthropic` (or custom), calls `super().__init__()`, re-calls `_setup_gate(max_rpm=120)` |
+| `__init__` | 15 | Sets `base_url` to `https://api.minimax.io/anthropic` (or custom), forwards `default_headers`, calls `super().__init__()`, re-calls `_setup_gate(max_rpm=120)` |
 
 All other methods (`create_chat`, `generate`, `make_tool_result_message`, `is_quota_error`, `send`, `send_stream`, etc.) are **inherited unchanged** from `AnthropicAdapter` / `AnthropicChatSession`.
 
@@ -68,6 +83,5 @@ Module-level singletons and config:
 
 - **OpenAI-compatible quirks**: MiniMax's Anthropic-compatible endpoint (`/anthropic`) means the wire format is Anthropic Messages, not OpenAI Chat Completions. Tool shapes use `input_schema`, system is a separate parameter, etc.
 - **Default RPM**: 120 (vs 0/unlimited for base Anthropic).
-- **`defaults.py` `api_compat: "anthropic"`**: Signals to the custom-provider factory that this uses Anthropic wire format.
 - **MCP subprocess**: Kept alive for agent process lifetime; `atexit` registered for cleanup. Requires `uvx` (from `uv` package manager).
 - Git history: 5 commits; recent refactor removed compose/video/draw/talk/listen capabilities.

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from lingtai_kernel.config import AgentConfig
+from lingtai.kernel.config import AgentConfig
 from lingtai.llm.service import LLMService
 from lingtai.llm.base import LLMAdapter, _GatedSession
 from lingtai.llm.api_gate import APICallGate
@@ -72,6 +72,65 @@ def test_wrap_with_gate_returns_proxy_when_gate_present():
     a._gate.shutdown()
 
 
+
+def test_gated_session_adapter_comment_delegates_to_inner():
+    class _StubAdapter(LLMAdapter):
+        def create_chat(self, *a, **kw): pass
+        def generate(self, *a, **kw): pass
+        def make_tool_result_message(self, *a, **kw): pass
+        def is_quota_error(self, exc): return False
+
+    a = _StubAdapter()
+    a._setup_gate(60)
+    inner = MagicMock()
+    inner.adapter_comment.return_value = {
+        "adapter": "dummy",
+        "summary": "inner note",
+    }
+    wrapped = a._wrap_with_gate(inner)
+
+    assert wrapped.adapter_comment() == {
+        "adapter": "dummy",
+        "summary": "inner note",
+    }
+    a._gate.shutdown()
+
+def test_gated_session_history_summarized_delegates_to_inner():
+    class _StubAdapter(LLMAdapter):
+        def create_chat(self, *a, **kw): pass
+        def generate(self, *a, **kw): pass
+        def make_tool_result_message(self, *a, **kw): pass
+        def is_quota_error(self, exc): return False
+
+    a = _StubAdapter()
+    a._setup_gate(60)
+    inner = MagicMock()
+    wrapped = a._wrap_with_gate(inner)
+
+    wrapped.on_history_summarized(["call_1"])
+
+    inner.on_history_summarized.assert_called_once_with(["call_1"])
+    a._gate.shutdown()
+
+
+def test_gated_session_notification_dismissed_delegates_to_inner():
+    class _StubAdapter(LLMAdapter):
+        def create_chat(self, *a, **kw): pass
+        def generate(self, *a, **kw): pass
+        def make_tool_result_message(self, *a, **kw): pass
+        def is_quota_error(self, exc): return False
+
+    a = _StubAdapter()
+    a._setup_gate(60)
+    inner = MagicMock()
+    wrapped = a._wrap_with_gate(inner)
+
+    wrapped.on_notification_dismissed("system")
+
+    inner.on_notification_dismissed.assert_called_once_with("system")
+    a._gate.shutdown()
+
+
 def test_wrap_with_gate_returns_inner_when_no_gate():
     class _StubAdapter(LLMAdapter):
         def create_chat(self, *a, **kw): pass
@@ -95,11 +154,29 @@ def test_gated_session_routes_send_through_gate():
     a = _StubAdapter()
     a._setup_gate(60)
     inner = MagicMock()
-    inner.send.return_value = "response"
+    inner.pre_request_hook = None
+    inner.session_id = "inner-sess"
+    # Model a real adapter: read the (inner) hook and fire it once at send.
+    inner.send.side_effect = lambda m: (
+        inner.pre_request_hook(inner.interface), "response")[1]
     wrapped = a._wrap_with_gate(inner)
-    result = wrapped.send("hi")
+
+    fired = []
+    wrapped.pre_request_hook = lambda iface: fired.append(iface)
+    # The named slot delegates to the inner (the object whose send reads it),
+    # never landing in the proxy __dict__.
+    assert wrapped.pre_request_hook is inner.pre_request_hook
+    assert "pre_request_hook" not in wrapped.__dict__
+    # Metadata writes forward to the inner session (issue #724) — the proxy is
+    # transparent in both directions; only _inner/_gate stay proxy-local.
+    wrapped.session_id = "proxy-sess"
+
+    result = wrapped.send("hi")  # drive the real gate
     assert result == "response"
     inner.send.assert_called_once_with("hi")
+    assert fired == [inner.interface]
+    assert wrapped.session_id == "proxy-sess"
+    assert inner.session_id == "proxy-sess"
     a._gate.shutdown()
 
 

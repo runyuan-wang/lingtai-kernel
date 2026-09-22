@@ -14,6 +14,7 @@ Signal file detection and karma system intrinsic actions are tested in
 test_karma.py.
 """
 from __future__ import annotations
+from lingtai.tools.registry import INTRINSICS as _TEST_INTRINSICS
 
 import json
 import threading
@@ -22,8 +23,15 @@ from pathlib import Path
 from unittest.mock import MagicMock
 from uuid import uuid4
 
+import pytest
+
 from lingtai.agent import Agent
-from lingtai_kernel.base_agent import BaseAgent
+from lingtai.kernel.base_agent import BaseAgent
+from tests._workdir_lease_helpers import make_test_lease
+from tests._snapshot_helpers import make_test_snapshot_port, make_test_source_revision_port
+from tests._lifecycle_clock_helpers import make_test_lifecycle_clock
+from tests._notification_store_helpers import notification_store_for
+from tests._agent_presence_helpers import make_test_presence_store
 
 
 def _persist_inbox_email(working_dir: Path, *, sender="sender", subject="hi",
@@ -59,9 +67,14 @@ def make_mock_service():
 
 def test_cancel_event_always_created(tmp_path):
     """Agent should always have _cancel_event (no external injection)."""
-    agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
+    agent = BaseAgent(intrinsics=_TEST_INTRINSICS, service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test", workdir_lease=make_test_lease(), snapshot_port=make_test_snapshot_port(), agent_presence=make_test_presence_store(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test"))
     assert isinstance(agent._cancel_event, threading.Event)
     assert not agent._cancel_event.is_set()
+
+    agent._request_turn_cancel()
+    agent._request_turn_cancel()
+
+    assert agent._cancel_event.is_set()
 
 
 # ---------------------------------------------------------------------------
@@ -71,15 +84,17 @@ def test_cancel_event_always_created(tmp_path):
 
 def test_admin_dict_stored_defaults_empty(tmp_path):
     """Agent without admin= should have an empty _admin dict."""
-    agent = BaseAgent(service=make_mock_service(), agent_name="a", working_dir=tmp_path / "t1")
+    agent = BaseAgent(intrinsics=_TEST_INTRINSICS, service=make_mock_service(), agent_name="a", working_dir=tmp_path / "t1", workdir_lease=make_test_lease(), snapshot_port=make_test_snapshot_port(), agent_presence=make_test_presence_store(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "t1"))
     assert agent._admin == {}
 
 
 def test_karma_admin_stored(tmp_path):
     """admin={"karma": True} should be stored on the agent as-is."""
     agent = BaseAgent(
+        intrinsics=_TEST_INTRINSICS,
         service=make_mock_service(), agent_name="b", working_dir=tmp_path / "t2",
-        admin={"karma": True},
+        admin={"karma": True}, workdir_lease=make_test_lease(),
+        snapshot_port=make_test_snapshot_port(), agent_presence=make_test_presence_store(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "t2"),
     )
     assert agent._admin.get("karma") is True
 
@@ -87,8 +102,10 @@ def test_karma_admin_stored(tmp_path):
 def test_nirvana_admin_stored(tmp_path):
     """admin={"nirvana": True} should be stored on the agent as-is."""
     agent = BaseAgent(
+        intrinsics=_TEST_INTRINSICS,
         service=make_mock_service(), agent_name="c", working_dir=tmp_path / "t3",
-        admin={"nirvana": True},
+        admin={"nirvana": True}, workdir_lease=make_test_lease(),
+        snapshot_port=make_test_snapshot_port(), agent_presence=make_test_presence_store(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "t3"),
     )
     assert agent._admin.get("nirvana") is True
 
@@ -96,8 +113,10 @@ def test_nirvana_admin_stored(tmp_path):
 def test_old_admin_keys_ignored(tmp_path):
     """admin={"silence": True} should NOT grant karma authority."""
     agent = BaseAgent(
+        intrinsics=_TEST_INTRINSICS,
         service=make_mock_service(), agent_name="d", working_dir=tmp_path / "t4",
-        admin={"silence": True, "kill": True},
+        admin={"silence": True, "kill": True}, workdir_lease=make_test_lease(),
+        snapshot_port=make_test_snapshot_port(), agent_presence=make_test_presence_store(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "t4"),
     )
     # Old keys are stored as-is (agent just persists the dict), but they do
     # not map to karma/nirvana authority — those gates check for those keys.
@@ -112,11 +131,11 @@ def test_old_admin_keys_ignored(tmp_path):
 
 def test_sequential_execution_stops_on_cancel(tmp_path):
     """Sequential tool execution should return empty when cancel event is set."""
-    from lingtai_kernel.loop_guard import LoopGuard
-    from lingtai_kernel.tool_executor import ToolExecutor
+    from lingtai.kernel.loop_guard import LoopGuard
+    from lingtai.kernel.tool_executor import ToolExecutor
     from lingtai.llm import ToolCall
 
-    agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
+    agent = BaseAgent(intrinsics=_TEST_INTRINSICS, service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test", workdir_lease=make_test_lease(), snapshot_port=make_test_snapshot_port(), agent_presence=make_test_presence_store(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test"))
     agent._cancel_event.set()
 
     tc = ToolCall(name="system", args={"action": "sleep"}, id="tc1")
@@ -144,44 +163,69 @@ def test_sequential_execution_stops_on_cancel(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_normal_email_notifies_inbox(tmp_path):
-    """Normal-type mail publishes ``.notification/email.json``.
+@pytest.mark.parametrize("mail_type", ["normal", "silence", "kill"])
+def test_mail_types_are_treated_as_normal(tmp_path, mail_type):
+    """Legacy-looking mail types still publish normally and never cancel."""
+    from tests._notification_store_helpers import snapshot_notifications
 
-    Under the .notification/ filesystem redesign, mail arrival no longer
-    posts MSG_TC_WAKE to the agent inbox.  Instead it writes the unread
-    digest to ``.notification/email.json`` and calls ``_wake_nap`` to
-    nudge the heartbeat for sub-second sync latency.  The kernel's
-    notification sync mechanism reads the file and injects the wire
-    pair (or wakes the agent if asleep).
-    """
-    from lingtai_kernel.notifications import collect_notifications
+    agent = BaseAgent(
+        intrinsics=_TEST_INTRINSICS,
+        service=make_mock_service(),
+        agent_name="test",
+        working_dir=tmp_path / "test",
+        workdir_lease=make_test_lease(),
+        snapshot_port=make_test_snapshot_port(),
+        agent_presence=make_test_presence_store(),
+        lifecycle_clock=make_test_lifecycle_clock(),
+        source_revision_port=make_test_source_revision_port(),
+        notification_store=notification_store_for(tmp_path / "test"),
+    )
+    assert not agent._cancel_event.is_set()
+    _persist_inbox_email(
+        agent.working_dir,
+        sender="colleague",
+        subject="hello",
+        message="hi there",
+    )
 
-    agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
-    _persist_inbox_email(agent.working_dir, sender="colleague", subject="hello", message="hi there")
     agent._on_mail_received({
-        "_mailbox_id": "test123",
-        "from": "colleague", "to": "test", "subject": "hello",
-        "message": "hi there", "type": "normal",
+        "_mailbox_id": f"mail-{mail_type}",
+        "from": "colleague",
+        "to": "test",
+        "subject": "hello",
+        "message": "hi there",
+        "type": mail_type,
     })
-    out = collect_notifications(agent.working_dir)
+
+    assert not agent._cancel_event.is_set()
+    out = snapshot_notifications(agent.working_dir)
     assert "email" in out
     assert out["email"]["data"]["count"] == 1
-    assert not agent._cancel_event.is_set()
+
+
 
 
 def test_non_admin_can_send_normal_mail(tmp_path):
     """Non-admin should be able to send normal mail."""
     agent = BaseAgent(
-        service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test", admin={},
+        intrinsics=_TEST_INTRINSICS,
+        service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test", admin={}, workdir_lease=make_test_lease(),
+        snapshot_port=make_test_snapshot_port(), agent_presence=make_test_presence_store(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test"),
     )
     mock_mail = MagicMock()
     mock_mail.address = "127.0.0.1:8000"
     mock_mail.send.return_value = None
     agent._mail_service = mock_mail
 
+    # ``email`` is a migrated LTP v2 family: the send arguments live in
+    # ``send``'s own strict ``input`` object, not at the envelope root.
     result = agent._intrinsics["email"]({
-        "action": "send", "address": "127.0.0.1:8001",
-        "subject": "hello", "message": "hi there",
+        "action": "send",
+        "input": {
+            "address": "127.0.0.1:8001",
+            "subject": "hello",
+            "message": "hi there",
+        },
     })
     assert result["status"] == "sent"
 
@@ -189,48 +233,3 @@ def test_non_admin_can_send_normal_mail(tmp_path):
 # ---------------------------------------------------------------------------
 # Mail type=silence/kill — now treated as normal mail (no special handling)
 # ---------------------------------------------------------------------------
-
-
-def test_mail_type_silence_treated_as_normal(tmp_path):
-    """type='silence' is treated like normal mail: publishes ``.notification/email.json``,
-    does not set cancel."""
-    from lingtai_kernel.notifications import collect_notifications
-
-    agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
-    assert not agent._cancel_event.is_set()
-    _persist_inbox_email(agent.working_dir, sender="boss", subject="shh", message="be quiet")
-
-    agent._on_mail_received({
-        "_mailbox_id": "msg001",
-        "from": "boss", "to": "test", "subject": "shh",
-        "message": "be quiet", "type": "silence",
-    })
-
-    # Must NOT set the cancel event — silence goes through signal files now.
-    assert not agent._cancel_event.is_set()
-    # Mail published as normal; the notification sync owns wake.
-    out = collect_notifications(agent.working_dir)
-    assert "email" in out
-    assert out["email"]["data"]["count"] == 1
-
-
-def test_mail_type_kill_treated_as_normal(tmp_path):
-    """type='kill' is treated like normal mail: publishes ``.notification/email.json``,
-    does not set cancel or shutdown."""
-    from lingtai_kernel.notifications import collect_notifications
-
-    agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
-    assert not agent._cancel_event.is_set()
-    _persist_inbox_email(agent.working_dir, sender="boss", subject="die", message="terminate")
-
-    agent._on_mail_received({
-        "_mailbox_id": "msg002",
-        "from": "boss", "to": "test", "subject": "die",
-        "message": "terminate", "type": "kill",
-    })
-
-    # Must NOT set cancel or shutdown — kill goes through karma system intrinsic.
-    assert not agent._cancel_event.is_set()
-    out = collect_notifications(agent.working_dir)
-    assert "email" in out
-    assert out["email"]["data"]["count"] == 1

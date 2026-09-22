@@ -1,9 +1,9 @@
-"""Tests for the 10K-char tool-result cap and spill-to-artifact behavior.
+"""Tests for the 100K-char tool-result hard cap and spill-to-artifact behavior.
 
 Covers the unified hard cap applied by ``ToolExecutor`` immediately before a
 result reaches the LLM wire: small results pass through unchanged; oversized
 results spill to ``<workdir>/tmp/tool-results/<name>`` and the wire sees a
-compact manifest pointing at the artifact.
+compact manifest pointing at the artifact.  Default hard cap is 200 000 chars. ToolExecutor(max_result_chars=N) may choose a smaller cap for tests/embedded use, but cannot raise above the hard ceiling.
 """
 from __future__ import annotations
 
@@ -14,16 +14,69 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from lingtai_kernel.llm.base import ToolCall
-from lingtai_kernel.loop_guard import LoopGuard
-from lingtai_kernel.tool_executor import (
+from lingtai.kernel.llm.base import ToolCall
+from lingtai.kernel.loop_guard import LoopGuard
+from lingtai.kernel.tool_executor import (
     _DEFAULT_MAX_RESULT_CHARS,
     ToolExecutor,
     _spill_oversized_result,
 )
+from lingtai.kernel.tool_result_artifacts import PREVENTIVE_MAX_CHARS
 
 
 CAP = _DEFAULT_MAX_RESULT_CHARS
+
+
+def test_preventive_cap_default_is_200k():
+    """Default preventive cap must be the 200 000 char hard ceiling."""
+    assert PREVENTIVE_MAX_CHARS == 200_000, (
+        f"PREVENTIVE_MAX_CHARS should be 200 000, got {PREVENTIVE_MAX_CHARS}"
+    )
+    assert _DEFAULT_MAX_RESULT_CHARS == 200_000, (
+        f"_DEFAULT_MAX_RESULT_CHARS should be 200 000, got {_DEFAULT_MAX_RESULT_CHARS}"
+    )
+
+
+def test_configurable_cap_via_executor(tmp_path):
+    """ToolExecutor(max_result_chars=N) may lower the preventive cap."""
+    custom_cap = 500
+
+    def dispatch(tc):
+        return "A" * 600  # exceeds custom cap but not default
+
+    captured = MagicMock(side_effect=lambda name, result, **kw: result)
+    executor = ToolExecutor(
+        dispatch_fn=dispatch,
+        make_tool_result_fn=captured,
+        guard=LoopGuard(max_total_calls=50),
+        working_dir=tmp_path,
+        max_result_chars=custom_cap,
+    )
+    executor.execute([ToolCall(name="read", args={}, id="tc-custom")])
+    _, wire_payload = captured.call_args.args
+    assert wire_payload["status"] == "spilled", (
+        "Result of 600 chars should spill when cap is 500"
+    )
+    assert wire_payload["cap_chars"] == custom_cap
+
+
+def test_executor_cap_cannot_exceed_hard_ceiling(tmp_path):
+    """ToolExecutor(max_result_chars=N) cannot raise above the 200k hard cap."""
+    def dispatch(tc):
+        return "A" * (PREVENTIVE_MAX_CHARS + 1)
+
+    captured = MagicMock(side_effect=lambda name, result, **kw: result)
+    executor = ToolExecutor(
+        dispatch_fn=dispatch,
+        make_tool_result_fn=captured,
+        guard=LoopGuard(max_total_calls=50),
+        working_dir=tmp_path,
+        max_result_chars=PREVENTIVE_MAX_CHARS * 2,
+    )
+    executor.execute([ToolCall(name="read", args={}, id="tc-hard")])
+    _, wire_payload = captured.call_args.args
+    assert wire_payload["status"] == "spilled"
+    assert wire_payload["cap_chars"] == PREVENTIVE_MAX_CHARS
 
 
 def _serialized_len(value):
@@ -137,6 +190,54 @@ def test_spill_oversized_dict_writes_artifact(tmp_path):
     assert on_disk == payload
 
 
+def test_spill_string_artifact_redacts_secrets(tmp_path):
+    """Spilled string artifacts must be redacted like other durable surfaces (#626)."""
+    api_key = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    assert len(api_key) > 22, "shape guard: sk- + 20+ token chars"
+    big = f'cat config.json -> {{"api_key": "{api_key}"}}\n' + ("x" * (CAP * 2))
+
+    out = _spill_oversized_result(
+        big,
+        max_chars=CAP,
+        tool_name="read",
+        tool_call_id="tc-redact-str",
+        working_dir=tmp_path,
+    )
+
+    assert out["status"] == "spilled"
+    artifact = tmp_path / out["spill_path"]
+    on_disk = artifact.read_text(encoding="utf-8")
+    assert api_key not in on_disk, "spill artifact must not store the raw secret"
+    assert "<REDACTED:" in on_disk, "artifact must carry a redaction placeholder"
+    # Non-secret bulk content must survive redaction untouched.
+    assert "x" * 100 in on_disk
+
+
+def test_spill_dict_artifact_redacts_secrets(tmp_path):
+    """JSON-serialized dict artifacts must also be redacted (#626)."""
+    token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    assert len(token) > 33, "shape guard: ghp_ + 30+ token chars"
+    payload = {
+        "status": "ok",
+        "output": f"token={token}",
+        "blob": "Y" * (CAP * 2),
+    }
+
+    out = _spill_oversized_result(
+        payload,
+        max_chars=CAP,
+        tool_name="read",
+        tool_call_id="tc-redact-dict",
+        working_dir=tmp_path,
+    )
+
+    assert out["status"] == "spilled"
+    artifact = tmp_path / out["spill_path"]
+    on_disk = artifact.read_text(encoding="utf-8")
+    assert token not in on_disk, "spill artifact must not store the raw token"
+    assert "<REDACTED:" in on_disk, "artifact must carry a redaction placeholder"
+
+
 def test_spill_handles_missing_working_dir():
     """When working_dir is None the manifest still returns, with spill_error."""
     big = "Z" * (CAP * 2)
@@ -231,9 +332,8 @@ def test_large_dict_result_through_executor_spills(tmp_path):
     on_disk_text = artifact.read_text(encoding="utf-8")
     # The artifact must contain the full content the agent would otherwise
     # have missed.  We don't compare equal to ``huge_payload`` directly
-    # because the executor may have stamped meta or already-truncated
-    # secondary keys onto the dict before spilling; we just confirm the
-    # full big_chunk text round-tripped.
+    # because the executor may have stamped meta onto the dict before
+    # spilling; we just confirm the full big_chunk text round-tripped.
     assert big_chunk in on_disk_text
 
 
@@ -318,7 +418,7 @@ def test_artifact_directory_created_lazily(tmp_path):
 
 def test_spill_preserves_unicode(tmp_path):
     """Non-ASCII content must survive the round trip to disk."""
-    big = ("器灵 — 灵台方寸山 — " + "字" * 50) * 200  # well over CAP
+    big = ("器灵 — 灵台方寸山 — " + "字" * 50) * 4000  # well over 200K CAP
     assert _serialized_len(big) > CAP
 
     out = _spill_oversized_result(
@@ -336,7 +436,7 @@ def test_spill_preserves_unicode(tmp_path):
 def test_spill_artifact_preserves_full_payload_beyond_legacy_50k_cap(tmp_path):
     """Regression: the legacy 50KB lossy `_truncate_result` must NOT run on
     the primary path before the spill boundary.  A payload that exceeds both
-    the 10K spill cap AND the legacy 50KB byte cap must land in the sidecar
+    the 200K spill cap AND the legacy 50KB byte cap must land in the sidecar
     artifact with its full content intact — no ``[truncated — N bytes total]``
     marker, no half-dict surgery, no dropped list items.
 
@@ -350,7 +450,7 @@ def test_spill_artifact_preserves_full_payload_beyond_legacy_50k_cap(tmp_path):
     # Use a length above the legacy 50K byte cap so the bug would trigger
     # the destructive path if `_truncate_result` were still in the way.
     LEGACY_LEGACY_BYTE_CAP = 50_000
-    payload_chunk = "Z" * (LEGACY_LEGACY_BYTE_CAP * 2)  # 100K of Zs
+    payload_chunk = "Z" * (CAP + LEGACY_LEGACY_BYTE_CAP)  # >200K of Zs
     assert len(payload_chunk) > LEGACY_LEGACY_BYTE_CAP
 
     huge_payload = {"status": "ok", "blob": payload_chunk, "marker": "TAIL"}
@@ -442,63 +542,17 @@ def test_executor_logs_spill_event(tmp_path):
     assert spill_events[0][1]["tool_call_id"] == "tc-log"
     assert spill_events[0][1]["original_char_count"] == len(big)
 
-
-# -- PR #147 review fix: hoist reserved fields onto spill manifest ----------
-
-def test_spill_manifest_hoists_secondary_summary_from_oversized_dict(tmp_path):
-    """Regression for PR #147 review: when ``_attach_secondary_result`` has
-    written ``_secondary`` onto a primary result and the primary then spills,
-    the manifest sent to the LLM must still expose the bounded secondary
-    summary.  Otherwise the agent never learns whether the same-turn
-    secondary tool (e.g. ``email(action="read")``) actually ran.
-    """
-    secondary_summary = {
-        "status": "success",
-        "tool": "email",
-        "action": "read",
-        "result": {
-            "emails": [
-                {"id": "e1", "from": "human", "subject": "ping", "body": "hi"},
-            ],
-        },
-    }
-    result = {
-        "status": "ok",
-        "big_blob": "X" * (CAP * 4),  # forces the primary to spill
-        "_secondary": secondary_summary,
-    }
-    out = _spill_oversized_result(
-        result,
-        max_chars=CAP,
-        tool_name="bash",
-        tool_call_id="tc-sec-hoist",
-        working_dir=tmp_path,
-    )
-
-    # Spilled — and _secondary survived the wire replacement.
-    assert out["status"] == "spilled"
-    assert "_secondary" in out, (
-        "Bounded secondary summary lost on spill — agent has no idea "
-        "whether the secondary call ran."
-    )
-    assert out["_secondary"] == secondary_summary
-    assert _serialized_len(out) <= CAP
-
-    # Artifact still holds the full post-dispatch dict, _secondary included.
-    artifact = tmp_path / out["spill_path"]
-    on_disk = json.loads(artifact.read_text(encoding="utf-8"))
-    assert on_disk["big_blob"] == result["big_blob"]
-    assert on_disk["_secondary"] == secondary_summary
+# -- Reserved-field hoisting onto spill manifest ---------------------------
 
 
-def test_spill_manifest_hoists_duplicate_warning_from_oversized_dict(tmp_path):
-    """``_duplicate_warning`` from LoopGuard is provider-visible and short.
+def test_spill_manifest_hoists_advisory_from_oversized_dict(tmp_path):
+    """``_advisory`` from LoopGuard is provider-visible and short.
     Hoist it onto the manifest so the agent still sees the loop-guard
     nudge even when the primary result spilled."""
     result = {
         "status": "ok",
         "blob": "Y" * (CAP * 3),
-        "_duplicate_warning": "warning: duplicate call #3 — consider varying your args",
+        "_advisory": {"type": "duplicate_tool_call", "message": "warning"},
     }
     out = _spill_oversized_result(
         result,
@@ -508,37 +562,25 @@ def test_spill_manifest_hoists_duplicate_warning_from_oversized_dict(tmp_path):
         working_dir=tmp_path,
     )
     assert out["status"] == "spilled"
-    assert out.get("_duplicate_warning") == result["_duplicate_warning"]
+    assert out.get("_advisory") == result["_advisory"]
     assert _serialized_len(out) <= CAP
 
 
-def test_spill_manifest_hoists_both_reserved_fields_when_both_present(tmp_path):
-    """Both _secondary and _duplicate_warning hoist simultaneously."""
-    result = {
-        "status": "ok",
-        "blob": "Z" * (CAP * 3),
-        "_secondary": {"status": "success", "tool": "email", "action": "send"},
-        "_duplicate_warning": "warn: dup #2",
-    }
-    out = _spill_oversized_result(
-        result, max_chars=CAP, tool_name="bash", tool_call_id="tc-both",
-        working_dir=tmp_path,
-    )
-    assert out["status"] == "spilled"
-    assert out["_secondary"] == result["_secondary"]
-    assert out["_duplicate_warning"] == result["_duplicate_warning"]
-    assert _serialized_len(out) <= CAP
+def test_spill_manifest_does_not_hoist_arbitrary_business_or_removed_secondary_keys(tmp_path):
+    """Allowlist is tight: only current reserved fields hoist.
 
-
-def test_spill_manifest_does_not_hoist_arbitrary_business_keys(tmp_path):
-    """Allowlist is tight — top-level business keys that happen to be small
-    are NOT lifted onto the manifest.  Their content lives in the artifact."""
+    ``_secondary`` used to be a reserved same-turn side-channel summary. The
+    side channel has been removed, so a tool result that happens to contain an
+    ``_secondary`` business key should live only in the artifact, not on the
+    wire manifest.
+    """
     result = {
         "status": "ok",
         "blob": "B" * (CAP * 3),
-        "rows_processed": 12345,           # business key — must NOT hoist
-        "warnings": ["row 17 skipped"],    # business key — must NOT hoist
-        "_secondary": {"status": "success", "tool": "email", "action": "read"},
+        "rows_processed": 12345,
+        "warnings": ["row 17 skipped"],
+        "_secondary": {"status": "legacy", "tool": "email", "action": "read"},
+        "_advisory": {"type": "duplicate_tool_call", "message": "warn"},
     }
     out = _spill_oversized_result(
         result, max_chars=CAP, tool_name="bash", tool_call_id="tc-tight",
@@ -546,8 +588,12 @@ def test_spill_manifest_does_not_hoist_arbitrary_business_keys(tmp_path):
     )
     assert "rows_processed" not in out
     assert "warnings" not in out
-    # But _secondary still hoisted (it's on the allowlist).
-    assert "_secondary" in out
+    assert "_secondary" not in out
+    assert out["_advisory"] == result["_advisory"]
+
+    artifact = tmp_path / out["spill_path"]
+    on_disk = json.loads(artifact.read_text(encoding="utf-8"))
+    assert on_disk["_secondary"] == result["_secondary"]
 
 
 def test_spill_manifest_no_hoist_when_original_is_non_dict(tmp_path):
@@ -560,31 +606,18 @@ def test_spill_manifest_no_hoist_when_original_is_non_dict(tmp_path):
     )
     assert out["status"] == "spilled"
     assert "_secondary" not in out
-    assert "_duplicate_warning" not in out
+    assert "_advisory" not in out
 
 
-def test_spill_manifest_hoist_survives_through_executor_call_site(tmp_path):
-    """End-to-end: a primary dispatch whose dict result carries ``_secondary``
-    (as attached by ``_attach_secondary_result``) and is then oversized must
-    reach the wire with ``_secondary`` intact on the manifest.
+def test_spill_manifest_advisory_survives_through_executor_call_site(tmp_path):
+    """End-to-end: current reserved fields survive executor spill."""
+    advisory = {"type": "duplicate_tool_call", "message": "warning"}
 
-    Reproduces the PR #147 review scenario: secondary email read on an
-    oversized primary result.
-    """
-    secondary_summary = {
-        "status": "success",
-        "tool": "email",
-        "action": "read",
-        "result": {"emails": [{"id": "e1", "subject": "ping"}]},
-    }
-    # Build a dispatch_fn that returns a result with _secondary already
-    # attached (simulating the post-_attach_secondary_result state); the
-    # executor passes this to _build_result_message → spill.
     def dispatch(tc):
         return {
             "status": "ok",
             "blob": "X" * (CAP * 3),
-            "_secondary": secondary_summary,
+            "_advisory": advisory,
         }
 
     captured = MagicMock(side_effect=lambda name, result, **kw: result)
@@ -599,7 +632,6 @@ def test_spill_manifest_hoist_survives_through_executor_call_site(tmp_path):
     name, wire_payload = captured.call_args.args
     assert name == "bash"
     assert wire_payload["status"] == "spilled"
-    assert "_secondary" in wire_payload
-    assert wire_payload["_secondary"] == secondary_summary
-    # The wire payload is still under the cap.
+    assert wire_payload["_advisory"] == advisory
+    assert "_secondary" not in wire_payload
     assert _serialized_len(wire_payload) <= CAP

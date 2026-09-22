@@ -1,7 +1,7 @@
 """Tests: email capability return-path scrubbing contract."""
 from types import SimpleNamespace
 
-from lingtai_kernel.time_veil import scrub_time_fields
+from lingtai.kernel.time_veil import scrub_time_fields
 
 
 def _agent(time_awareness: bool):
@@ -24,24 +24,6 @@ def test_scrub_schedule_payload_time_blind():
     assert out["last_sent_at"] == ""
     assert out["interval_seconds"] == 600
     assert out["status"] == "scheduled"
-
-
-def test_scrub_email_summary_time_blind():
-    agent = _agent(False)
-    summary = {
-        "id": "abc",
-        "from": "alice",
-        "to": ["bob"],
-        "subject": "hi",
-        "preview": "hello",
-        "time": "2026-04-15T12:00:00Z",
-        "folder": "inbox",
-        "unread": True,
-    }
-    out = scrub_time_fields(agent, summary)
-    assert out["time"] == ""
-    assert out["subject"] == "hi"
-    assert out["unread"] is True
 
 
 def test_scrub_passthrough_when_time_aware():

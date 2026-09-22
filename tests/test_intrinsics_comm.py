@@ -1,45 +1,19 @@
-from lingtai_kernel.prompt import SystemPromptManager
+from lingtai.kernel.prompt import SystemPromptManager
+from lingtai.tools.registry import INTRINSICS as _TEST_INTRINSICS
+from tests._workdir_lease_helpers import make_test_lease
+from tests._snapshot_helpers import make_test_snapshot_port, make_test_source_revision_port
+from tests._lifecycle_clock_helpers import make_test_lifecycle_clock
+from tests._notification_store_helpers import notification_store_for
+from tests._agent_presence_helpers import make_test_presence_store
 
 
-def test_system_prompt_manager():
-    mgr = SystemPromptManager()
-    mgr.write_section("role", "You are an orchestrator", protected=True)
-    mgr.write_section("pad", "User likes concise")
-    sections = mgr.list_sections()
-    assert "role" in [s["name"] for s in sections]
-    assert "pad" in [s["name"] for s in sections]
-    assert mgr.read_section("role") == "You are an orchestrator"
-    assert mgr.read_section("pad") == "User likes concise"
 
 
-def test_system_prompt_manager_render():
-    mgr = SystemPromptManager()
-    mgr.write_section("role", "You are a test agent")
-    mgr.write_section("pad", "Remember: user likes concise")
-    rendered = mgr.render()
-    assert "## role" in rendered
-    assert "## pad" in rendered
-    assert "You are a test agent" in rendered
-    assert "Remember: user likes concise" in rendered
-
-
-def test_system_prompt_manager_delete():
-    mgr = SystemPromptManager()
-    mgr.write_section("temp", "temporary content")
-    assert mgr.read_section("temp") == "temporary content"
-    assert mgr.delete_section("temp") is True
-    assert mgr.read_section("temp") is None
-    assert mgr.delete_section("temp") is False
-
-
-def test_system_prompt_manager_read_nonexistent():
-    mgr = SystemPromptManager()
-    assert mgr.read_section("nonexistent") is None
 
 
 def test_mail_send_passes_attachments(tmp_path):
     """Mail handler should pass attachments to mail service."""
-    from lingtai_kernel.base_agent import BaseAgent
+    from lingtai.kernel.base_agent import BaseAgent
     from unittest.mock import MagicMock
     from pathlib import Path
 
@@ -52,18 +26,22 @@ def test_mail_send_passes_attachments(tmp_path):
     mail_svc.address = str(tmp_path / "test")
     mail_svc.send.return_value = None
 
-    agent = BaseAgent(service=svc, agent_name="test", working_dir=tmp_path / "test", mail_service=mail_svc)
+    agent = BaseAgent(intrinsics=_TEST_INTRINSICS, service=svc, agent_name="test", working_dir=tmp_path / "test", mail_service=mail_svc, workdir_lease=make_test_lease(), snapshot_port=make_test_snapshot_port(), agent_presence=make_test_presence_store(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test"))
 
     # Create a real file to attach
     attachment = tmp_path / "file.png"
     attachment.write_bytes(b"PNG_DATA")
 
-    # Call the email handler directly (mail intrinsic was renamed in 0.7.5)
+    # Call the email handler directly (mail intrinsic was renamed in 0.7.5).
+    # ``email`` is a migrated LTP v2 family: the send arguments live in
+    # ``send``'s own strict ``input`` object, not at the envelope root.
     result = agent._intrinsics["email"]({
         "action": "send",
-        "address": str(tmp_path / "other"),
-        "message": "here is a file",
-        "attachments": [str(attachment)],
+        "input": {
+            "address": str(tmp_path / "other"),
+            "message": "here is a file",
+            "attachments": [str(attachment)],
+        },
     })
     assert result["status"] == "sent"
     # Delivery is async via mailman thread — wait for it

@@ -1,0 +1,350 @@
+"""Identity — naming, manifest building, and status reporting.
+
+Everything the agent knows about itself: how it presents, how it
+serializes to disk, and how it reports runtime status.
+"""
+from __future__ import annotations
+
+import os
+import platform
+import sys
+from urllib.parse import SplitResult, urlsplit, urlunsplit
+
+
+def sanitize_endpoint(value: str) -> str:
+    """Remove endpoint credentials, query parameters, and fragments for display."""
+    try:
+        parsed = urlsplit(value)
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+        hostname = parsed.hostname or ""
+        host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        return urlunsplit(SplitResult(parsed.scheme, host, parsed.path, "", ""))
+    except (TypeError, ValueError):
+        return ""
+
+
+def _set_name(agent, name: str) -> None:
+    """Set the agent's true name (真名). Immutable once set."""
+    if not name:
+        raise ValueError("Agent name cannot be empty.")
+    if agent.agent_name is not None:
+        raise RuntimeError(
+            f"True name already set ({agent.agent_name!r}). "
+            f"True names are immutable. Use set_nickname() instead."
+        )
+    agent.agent_name = name
+    _update_identity(agent)
+
+
+def _set_nickname(agent, nickname: str) -> None:
+    """Set or change the agent's nickname (别名). Mutable."""
+    agent.nickname = nickname or None
+    _update_identity(agent)
+
+
+def _update_identity(agent) -> None:
+    """Write manifest and update identity section in system prompt.
+
+    The system-prompt section excludes runtime-transient fields (`state`)
+    to preserve prompt-cache stability. The disk manifest keeps them.
+    """
+    from . import _build_identity_section
+
+    manifest_data = _build_manifest(agent)
+    agent._workdir.write_manifest(manifest_data)
+    agent._prompt_manager.write_section(
+        "identity",
+        _build_identity_section(
+            manifest_data,
+            mailbox_name=getattr(agent, "_mailbox_name", None),
+        ),
+        protected=True,
+    )
+
+
+#: Whitelisted (non-secret) keys we surface from ``service``/``llm`` configs.
+#: Safelist is more robust than denylist here — a single leaked credential
+#: field is enough to break the contract, so anything outside this set is
+#: dropped silently. ``base_url`` is included because operators rely on it
+#: to disambiguate self-hosted endpoints from upstream providers.
+_LLM_PUBLIC_KEYS = (
+    "provider",
+    "model",
+    "base_url",
+    "api_compat",
+    "context_limit",
+    "service_tier",
+)
+
+
+def _build_manifest(agent) -> dict:
+    """Build the manifest dict for .agent.json.
+
+    Subclasses override to add fields (e.g. capabilities, preset block).
+    Contains everything the agent knows about itself.
+    address is always the current working_dir (hot-refreshed on every write).
+    Must not depend on _session or _chat — called during __init__.
+    """
+    data = {
+        "agent_id": agent._agent_id,
+        "agent_name": agent.agent_name,
+        "nickname": agent.nickname,
+        "address": agent._working_dir.name,
+        "created_at": agent._created_at,
+        "started_at": agent._started_at,
+        "admin": agent._admin,
+        "language": agent._config.language,
+        "state": agent._state.value,
+        "molt_count": agent._molt_count,
+    }
+    if agent._mail_service is not None and agent._mail_service.address:
+        data["address"] = agent._mail_service.address
+
+    # LLM identity — provider/model/base_url surfaced from the live service.
+    # The endpoint is read from the explicit service `_base_url` when present
+    # and falls back to provider-default `base_url`; api keys live behind the
+    # adapter and are not on `service`.
+    llm = _safe_llm_from_service(agent)
+    if llm:
+        data["llm"] = llm
+
+    return data
+
+
+def _safe_llm_from_service(agent) -> dict:
+    """Extract a sanitized ``llm`` block from the live LLMService.
+
+    Returns a safelisted public block (provider/model/base_url plus optional
+    api_compat/context_limit) with only string/int values. Empty values, None,
+    and non-scalars are dropped. Returns ``{}`` on any unexpected service shape
+    (mocks in tests, future adapter rewrites). Never raises.
+    """
+    service = getattr(agent, "service", None)
+    if service is None:
+        return {}
+    llm: dict = {}
+    for key, attr in (
+        ("provider", "provider"),
+        ("model", "model"),
+    ):
+        try:
+            val = getattr(service, attr, None)
+        except Exception:
+            val = None
+        if isinstance(val, str) and val:
+            llm[key] = val
+        elif isinstance(val, int) and not isinstance(val, bool):
+            llm[key] = val
+
+    base_url = _effective_base_url_from_service(service)
+    if isinstance(base_url, str) and base_url:
+        llm["base_url"] = sanitize_endpoint(base_url)
+
+    context_limit = _safe_int_attr(service, "_context_window")
+    if context_limit is not None:
+        llm["context_limit"] = context_limit
+
+    api_compat = _provider_default_from_service(service, "api_compat")
+    if isinstance(api_compat, str) and api_compat:
+        llm["api_compat"] = api_compat
+
+    # The native Codex adapter always uses the Responses API. Its configured
+    # service tier is safe runtime identity metadata; other adapters do not
+    # consume this option and must not claim one in presentation surfaces.
+    provider = llm.get("provider")
+    if isinstance(provider, str) and provider.lower() in {
+        "codex",
+        "codex-pool",
+        "codex_pool",
+    }:
+        service_tier = _provider_default_from_service(service, "service_tier")
+        if isinstance(service_tier, str) and service_tier.strip():
+            llm["service_tier"] = service_tier.strip()
+        else:
+            # The request omits service_tier, so label the known request-side
+            # default rather than inventing a provider-returned tier.
+            llm["service_tier"] = "default"
+
+    return llm
+
+
+def _effective_base_url_from_service(service) -> str | None:
+    """Return explicit or provider-default base URL from an LLMService-like object."""
+    try:
+        base_url = getattr(service, "_base_url", None)
+    except Exception:
+        base_url = None
+    if isinstance(base_url, str) and base_url:
+        return base_url
+
+    val = _provider_default_from_service(service, "base_url")
+    if isinstance(val, str) and val:
+        return val
+    return None
+
+
+def _provider_default_from_service(service, key: str):
+    """Read a scalar provider default from an LLMService-like object."""
+    try:
+        provider = getattr(service, "provider", None)
+        defaults = getattr(service, "_provider_defaults", None)
+    except Exception:
+        return None
+    if not isinstance(provider, str) or not isinstance(defaults, dict):
+        return None
+    provider_defaults = defaults.get(provider.lower())
+    if not isinstance(provider_defaults, dict):
+        return None
+    return provider_defaults.get(key)
+
+
+def _safe_int_attr(service, attr: str) -> int | None:
+    try:
+        val = getattr(service, attr, None)
+    except Exception:
+        return None
+    if isinstance(val, int) and not isinstance(val, bool):
+        return val
+    return None
+
+
+def _status(agent) -> dict:
+    """Return live runtime status — written to .status.json on each turn for TUI/portal.
+
+    Contains identity, runtime metrics, and token/context usage.
+    Must only be called after _session exists (not during __init__).
+    """
+    from ..time_veil import now_iso, scrub_time_fields
+
+    mail_addr = None
+    if agent._mail_service is not None and agent._mail_service.address:
+        mail_addr = agent._mail_service.address
+
+    uptime = (
+        agent._lifecycle_clock.monotonic_seconds() - agent._uptime_anchor
+        if agent._uptime_anchor is not None
+        else 0.0
+    )
+
+    usage = agent.get_token_usage()
+
+    window_size = None
+    usage_pct = None
+    if agent._chat is not None:
+        try:
+            # Use configured context_limit if set, otherwise model default
+            window_size = agent._config.context_limit or agent._chat.context_window()
+            ctx_total = usage["ctx_total_tokens"]
+            usage_pct = round(ctx_total / window_size * 100, 1) if window_size else 0.0
+        except Exception:
+            pass
+
+    # Issue #164 — expose enough runtime state for an external observer
+    # (TUI, watchdog process, ops grep on .status.json) to tell apart
+    # "actually computing" from "wedged ACTIVE with no turn." The
+    # heartbeat-only signal is not enough; see
+    # reports/dual-agent-stuck-forensics-2026-05-26.md.
+    state_changed_at = getattr(agent, "_state_changed_at", None)
+    last_progress_at = getattr(agent, "_last_progress_at", None)
+    last_api_call_at = getattr(agent, "_last_api_call_at", None)
+    no_progress_seconds = None
+    if last_progress_at is not None:
+        no_progress_seconds = round(max(0.0, agent._lifecycle_clock.wall_seconds() - last_progress_at), 1)
+
+    active_turn_block: dict | None = None
+    active_kind = getattr(agent, "_active_turn_kind", None)
+    if active_kind is not None:
+        started_at = getattr(agent, "_active_turn_started_at", None)
+        elapsed = None
+        if started_at is not None:
+            elapsed = round(max(0.0, agent._lifecycle_clock.wall_seconds() - started_at), 1)
+        active_turn_block = {
+            "kind": active_kind,
+            "id": getattr(agent, "_active_turn_id", None),
+            "started_at": started_at,
+            "elapsed_seconds": elapsed,
+        }
+
+    deferred_block: dict | None = None
+    deferred_count = getattr(agent, "_deferred_notifications_count", 0)
+    if deferred_count:
+        deferred_block = {
+            "count": deferred_count,
+            "oldest_at": getattr(agent, "_deferred_notifications_oldest_at", None),
+            "reason": "active",
+        }
+
+    heartbeat = float(getattr(agent, "_heartbeat", 0.0) or 0.0)
+    heartbeat_age_seconds = None
+    if heartbeat > 0:
+        heartbeat_age_seconds = round(max(0.0, agent._lifecycle_clock.wall_seconds() - heartbeat), 3)
+
+    runtime_block = scrub_time_fields(
+        agent,
+        {
+            "current_time": now_iso(agent),
+            "pid": os.getpid(),
+            "running": (
+                getattr(agent, "_heartbeat_thread", None) is not None
+                and not agent._shutdown.is_set()
+            ),
+            "started_at": agent._started_at,
+            "last_heartbeat": heartbeat if heartbeat > 0 else None,
+            "heartbeat_age_seconds": heartbeat_age_seconds,
+            "uptime_seconds": round(uptime, 1),
+            "state": agent._state.value,
+            "state_changed_at": state_changed_at,
+            "last_progress_at": last_progress_at,
+            "last_api_call_at": last_api_call_at,
+            "no_progress_seconds": no_progress_seconds,
+        },
+        keys=(
+            "current_time", "started_at", "uptime_seconds",
+            "state_changed_at", "last_progress_at", "last_api_call_at",
+            "no_progress_seconds",
+        ),
+    )
+
+    # Issue #178 — expose runtime fingerprint for drift detection
+    fp = getattr(agent, "_runtime_fingerprint", None)
+    runtime_block["fingerprint"] = fp if isinstance(fp, dict) else None
+    runtime_block["python_version"] = sys.version.split()[0]
+    runtime_block["platform"] = platform.system().lower()
+
+    result = {
+        "identity": {
+            "agent_id": agent._agent_id,
+            "address": str(agent._working_dir),
+            "agent_name": agent.agent_name,
+            "mail_address": mail_addr,
+        },
+        "runtime": runtime_block,
+        "tokens": {
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+            "thinking_tokens": usage["thinking_tokens"],
+            "cached_tokens": usage["cached_tokens"],
+            "total_tokens": usage["total_tokens"],
+            "api_calls": usage["api_calls"],
+            "estimated": agent._session._token_fallback_warned,
+            "context": {
+                "system_tokens": usage["ctx_system_tokens"],
+                "tools_tokens": usage["ctx_tools_tokens"],
+                "history_tokens": usage["ctx_history_tokens"],
+                "total_tokens": usage["ctx_total_tokens"],
+                "window_size": window_size,
+                "usage_pct": usage_pct,
+                # Meta-line decomposition (matches build_meta's buckets)
+                "fixed_tokens": usage["ctx_system_tokens"] + usage["ctx_tools_tokens"],
+                "growing_tokens": usage["ctx_history_tokens"],
+            },
+        },
+    }
+    if active_turn_block is not None:
+        result["active_turn"] = active_turn_block
+    if deferred_block is not None:
+        result["deferred_notifications"] = deferred_block
+    return result

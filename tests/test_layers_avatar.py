@@ -5,16 +5,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from lingtai.core.bash import BashManager
-from lingtai.core.avatar import AvatarManager, setup as setup_avatar
+from lingtai.tools.bash import BashManager
+from lingtai.tools.avatar import AvatarManager
+from lingtai.tools.avatar._launcher import AvatarLaunchReceipt
+from tests._service_helpers import make_gemini_mock_service as make_mock_service
 
 
-def make_mock_service():
-    svc = MagicMock()
-    svc.get_adapter.return_value = MagicMock()
-    svc.provider = "gemini"
-    svc.model = "gemini-test"
-    return svc
 
 
 @pytest.fixture
@@ -26,12 +22,13 @@ def fake_avatar_launch():
     init.json written to its working_dir on construction — required by
     AvatarManager._spawn's ``parent has no init.json`` gate.
 
-    The new _launch contract returns (Popen, stderr_path); _wait_for_boot
-    returns (status, error). We synthesize a fake-but-shape-correct
-    response that lets the manager's success branch run."""
-    proc = MagicMock()
-    proc.pid = 12345
+    The launcher contract returns (AvatarLaunchReceipt, stderr_path);
+    _wait_for_boot returns (status, error). We synthesize a shape-correct
+    receipt that lets the manager's success branch run and exposes release.
+    """
+    proc = MagicMock(pid=12345)
     proc.poll.return_value = None
+    receipt = AvatarLaunchReceipt(pid=12345, handle=proc)
     fake_stderr = Path("/tmp/avatar_stderr.log")
 
     from lingtai.agent import Agent as _OrigAgent
@@ -59,10 +56,10 @@ def fake_avatar_launch():
                     },
                 }))
 
-    with patch.object(AvatarManager, "_launch", return_value=(proc, fake_stderr)), \
+    with patch.object(AvatarManager, "_launch", return_value=(receipt, fake_stderr)), \
          patch.object(AvatarManager, "_wait_for_boot", return_value=("ok", None)), \
          patch("lingtai.agent.Agent", _AutoInitAgent):
-        yield
+        yield proc
 
 
 class TestAvatarManager:
@@ -71,24 +68,25 @@ class TestAvatarManager:
         """Apply launch patch automatically to every test in this class."""
         yield
 
-    def test_spawn_returns_address(self, tmp_path):
+    def test_spawn_returns_address(self, tmp_path, fake_avatar_launch):
         """Spawn should return a valid address."""
         from lingtai.agent import Agent
         parent = Agent(service=make_mock_service(), agent_name="parent", working_dir=tmp_path / "test",
                             capabilities=["avatar"])
         mgr = parent.get_capability("avatar")
-        result = mgr.handle({"name": "helper", "confirm": True})
+        result = mgr.handle({"action": "spawn", "input": {"name": "helper", "confirm": True}})
         assert result["status"] == "ok"
         assert "address" in result
         assert result["address"]  # filesystem path (non-empty string)
         assert result["agent_name"] == "helper"
+        fake_avatar_launch.poll.assert_called_once_with()
 
     def test_spawn_inherits_capabilities(self, tmp_path):
         """Spawned agent's init.json should carry all of parent's capabilities."""
         from lingtai.agent import Agent
         parent = Agent(service=make_mock_service(), agent_name="parent", working_dir=tmp_path / "test",
                             capabilities={"bash": {"yolo": True}, "avatar": {}})
-        result = parent._tool_handlers["avatar"]({"name": "child", "confirm": True})
+        result = parent._tool_handlers["avatar"]({"action": "spawn", "input": {"name": "child", "confirm": True}})
         assert result["status"] == "ok"
         # New architecture: avatars run as their own processes; introspection
         # is via the avatar's on-disk init.json, not an in-process _peers map.
@@ -96,8 +94,31 @@ class TestAvatarManager:
         assert child_init_path.is_file()
         child_init = json.loads(child_init_path.read_text())
         child_caps = child_init.get("manifest", {}).get("capabilities", {})
-        assert "bash" in child_caps
+        assert "shell" in child_caps
+        assert "bash" not in child_caps
         assert "avatar" in child_caps
+
+    @pytest.mark.parametrize("avatar_type", ["shallow", "deep"])
+    def test_generic_spawn_does_not_persist_driver_derived_child_state(self, tmp_path, avatar_type):
+        """A legacy avatar spawn must not become Driver-derived by itself."""
+        from lingtai.agent import Agent
+        from lingtai.tools.avatar._launcher import derived_avatar_state_path
+
+        parent = Agent(
+            service=make_mock_service(),
+            agent_name="parent",
+            working_dir=tmp_path / "test",
+            capabilities=["avatar"],
+        )
+        result = parent.get_capability("avatar").handle(
+            {
+                "action": "spawn",
+                "input": {"name": "child", "type": avatar_type, "confirm": True},
+            }
+        )
+
+        assert result["status"] == "ok"
+        assert not derived_avatar_state_path(parent._working_dir.parent / "child").exists()
 
     def test_spawn_inherits_covenant(self, tmp_path):
         """Spawned agent should inherit parent's covenant."""
@@ -105,7 +126,7 @@ class TestAvatarManager:
         parent = Agent(service=make_mock_service(), agent_name="parent", working_dir=tmp_path / "test",
                             capabilities=["avatar"], covenant="Be helpful and concise.")
         mgr = parent.get_capability("avatar")
-        result = mgr.handle({"name": "helper", "confirm": True})
+        result = mgr.handle({"action": "spawn", "input": {"name": "helper", "confirm": True}})
         assert result["status"] == "ok"
 
     def test_spawn_no_admin(self, tmp_path):
@@ -114,7 +135,7 @@ class TestAvatarManager:
         parent = Agent(service=make_mock_service(), agent_name="parent", working_dir=tmp_path / "test",
                             capabilities=["avatar"], admin={"karma": True})
         mgr = parent.get_capability("avatar")
-        result = mgr.handle({"name": "helper", "confirm": True})
+        result = mgr.handle({"action": "spawn", "input": {"name": "helper", "confirm": True}})
         assert result["status"] == "ok"
         child_init = json.loads((parent._working_dir.parent / "helper" / "init.json").read_text())
         child_admin = child_init.get("manifest", {}).get("admin", {})
@@ -134,9 +155,9 @@ class TestAvatarManager:
         parent = Agent(service=make_mock_service(), agent_name="parent", working_dir=tmp_path / "test",
                             capabilities=["avatar"])
         mgr = parent.get_capability("avatar")
-        r1 = mgr.handle({"name": "helper", "confirm": True})
+        r1 = mgr.handle({"action": "spawn", "input": {"name": "helper", "confirm": True}})
         assert r1["status"] == "ok"
-        r2 = mgr.handle({"name": "helper", "confirm": True})
+        r2 = mgr.handle({"action": "spawn", "input": {"name": "helper", "confirm": True}})
         assert "error" in r2 or r2.get("status") == "already_active"
 
     def test_spawn_does_not_copy_identity_files(self, tmp_path):
@@ -155,37 +176,347 @@ class TestAvatarManager:
         (knowledge_dir / "knowledge.json").write_text('{"entries": []}')
 
         mgr = parent.get_capability("avatar")
-        result = mgr.handle({"name": "blank", "confirm": True})
+        result = mgr.handle({"action": "spawn", "input": {"name": "blank", "confirm": True}})
         assert result["status"] == "ok"
         child_dir = parent._working_dir.parent / "blank"
         # Character and knowledge should NOT be copied
         assert not (child_dir / "system" / "character.md").is_file()
         assert not (child_dir / "knowledge" / "knowledge.json").is_file()
 
-    def test_spawn_missing_files_ok(self, tmp_path):
-        """Spawn with no identity files in the parent should not error."""
-        from lingtai.agent import Agent
-        parent = Agent(service=make_mock_service(), agent_name="parent", working_dir=tmp_path / "test",
-                            capabilities=["avatar"])
-        mgr = parent.get_capability("avatar")
-        result = mgr.handle({"name": "clone", "confirm": True})
-        assert result["status"] == "ok"
-
     def test_ledger_records_spawn(self, tmp_path):
         """Ledger should record the spawn event with name + boot_status."""
         from lingtai.agent import Agent
         parent = Agent(service=make_mock_service(), agent_name="parent", working_dir=tmp_path / "test",
-                            capabilities=["avatar"])
+                        capabilities=["avatar"])
         mgr = parent.get_capability("avatar")
-        mgr.handle({"name": "clone", "confirm": True})
+        mgr.handle({"action": "spawn", "input": {"name": "clone", "confirm": True}})
         ledger = (parent._working_dir / "delegates" / "ledger.jsonl").read_text().strip()
-        record = json.loads(ledger)
+        records = [json.loads(line) for line in ledger.splitlines()]
+        assert records[0]["event"] == "avatar_admission_decision"
+        assert records[0]["reason_code"] == "legacy_default"
+        record = records[-1]
         assert record["name"] == "clone"
         assert record["boot_status"] == "ok"
 
+    def test_profile_avatar_launch_reaches_structured_admission_before_spawn(
+        self, tmp_path, monkeypatch
+    ):
+        """The real AvatarManager/Agent adapter path reaches the 2a seam."""
+        from lingtai.adapters.acp.puffo_v0 import RUNTIME_POLICY
+        from lingtai.kernel.provider_admission import (
+            DerivedLaunchCapability,
+            DerivedLaunchDecision,
+            ProviderAdmissionState,
+            RootProviderAdmission,
+            bind_provider_admission,
+            clear_provider_admission,
+        )
+        from lingtai.agent import Agent
+
+        class _Lease:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class _DenyingPort:
+            def __init__(self):
+                self.calls = []
+
+            def authorize_derived_launch(self, parent, capability):
+                self.calls.append((parent, capability))
+                return DerivedLaunchDecision(
+                    ProviderAdmissionState.DENIED,
+                    "derived_launch_denied_by_test",
+                    audit_id="audit-avatar-2a",
+                    child_endpoint_lease=lease,
+                )
+
+        lease = _Lease()
+        parent = Agent(
+            service=make_mock_service(),
+            agent_name="parent",
+            working_dir=tmp_path / "parent",
+            capabilities=["avatar"],
+            _turn_origin_policy=RUNTIME_POLICY,
+            derived_launch_admission_port=_DenyingPort(),
+        )
+        port = parent._derived_launch_admission_port
+        root = RootProviderAdmission("root-avatar-2a", RUNTIME_POLICY.policy_version)
+        token = bind_provider_admission(root)
+        try:
+            result = parent.get_capability("avatar").handle(
+                {"action": "spawn", "input": {"name": "child", "confirm": True}}
+            )
+        finally:
+            clear_provider_admission(token)
+
+        assert "derived_launch_denied_by_test" in result["error"]
+        assert lease.closed is True
+        assert port.calls == [(root, DerivedLaunchCapability.AVATAR)]
+        assert not (parent._working_dir.parent / "child").exists()
+        records = [
+            json.loads(line)
+            for line in (parent._working_dir / "delegates" / "ledger.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert records == [
+            {
+                "ts": records[0]["ts"],
+                "event": "avatar_admission_decision",
+                "name": "child",
+                "capability": "avatar",
+                "state": "denied",
+                "reason_code": "derived_launch_denied_by_test",
+                "audit_id": "audit-avatar-2a",
+            }
+        ]
+
+    def test_profile_avatar_admission_error_closes_untransferred_lease(self, tmp_path):
+        """A port-raised rejection releases the lease before Avatar returns."""
+        from lingtai.adapters.acp.puffo_v0 import RUNTIME_POLICY
+        from lingtai.kernel.provider_admission import (
+            DerivedLaunchAdmissionError,
+            DerivedLaunchDecision,
+            ProviderAdmissionState,
+            RootProviderAdmission,
+            bind_provider_admission,
+            clear_provider_admission,
+        )
+        from lingtai.agent import Agent
+
+        class _Lease:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        lease = _Lease()
+
+        class _RaisingPort:
+            def authorize_derived_launch(self, _parent, _capability):
+                raise DerivedLaunchAdmissionError(
+                    DerivedLaunchDecision(
+                        ProviderAdmissionState.INDETERMINATE,
+                        "driver_unavailable",
+                        child_endpoint_lease=lease,
+                    )
+                )
+
+        parent = Agent(
+            service=make_mock_service(),
+            agent_name="parent",
+            working_dir=tmp_path / "parent",
+            capabilities=["avatar"],
+            _turn_origin_policy=RUNTIME_POLICY,
+            derived_launch_admission_port=_RaisingPort(),
+        )
+        token = bind_provider_admission(
+            RootProviderAdmission("root-avatar-raised-lease", RUNTIME_POLICY.policy_version)
+        )
+        try:
+            result = parent.get_capability("avatar").handle(
+                {"action": "spawn", "input": {"name": "child", "confirm": True}}
+            )
+        finally:
+            clear_provider_admission(token)
+
+        assert "driver_unavailable" in result["error"]
+        assert lease.closed is True
+
+    def test_profile_avatar_ledger_failure_closes_untransferred_lease(self, tmp_path, monkeypatch):
+        """Ledger I/O cannot strand a grant before spawn owns its lease."""
+        from lingtai.adapters.acp.puffo_v0 import RUNTIME_POLICY
+        from lingtai.kernel.provider_admission import (
+            DerivedLaunchDecision,
+            ProviderAdmissionState,
+            RootProviderAdmission,
+            bind_provider_admission,
+            clear_provider_admission,
+        )
+        from lingtai.agent import Agent
+
+        class _Lease:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        lease = _Lease()
+
+        class _GrantingPort:
+            def authorize_derived_launch(self, _parent, _capability):
+                return DerivedLaunchDecision(
+                    ProviderAdmissionState.GRANTED,
+                    "allowed",
+                    child_endpoint_lease=lease,
+                )
+
+        parent = Agent(
+            service=make_mock_service(),
+            agent_name="parent",
+            working_dir=tmp_path / "parent",
+            capabilities=["avatar"],
+            _turn_origin_policy=RUNTIME_POLICY,
+            derived_launch_admission_port=_GrantingPort(),
+        )
+        manager = parent.get_capability("avatar")
+        monkeypatch.setattr(manager, "_append_ledger", MagicMock(side_effect=OSError("disk full")))
+        token = bind_provider_admission(
+            RootProviderAdmission("root-avatar-ledger-lease", RUNTIME_POLICY.policy_version)
+        )
+        try:
+            with pytest.raises(OSError, match="disk full"):
+                manager._authorize_derived_launch("child")
+        finally:
+            clear_provider_admission(token)
+
+        assert lease.closed is True
+
+    def test_profile_avatar_grant_reaches_the_same_launch_recorder(
+        self, tmp_path, monkeypatch
+    ):
+        """The zero-avatar-spawn assertion has a same-recorder positive control."""
+        from lingtai.adapters.acp.puffo_v0 import RUNTIME_POLICY
+        from lingtai.kernel.provider_admission import (
+            DerivedLaunchCapability,
+            DerivedLaunchDecision,
+            ProviderAdmissionState,
+            RootProviderAdmission,
+            bind_provider_admission,
+            clear_provider_admission,
+        )
+        from lingtai.agent import Agent
+
+        lease = object()
+
+        class _GrantingPort:
+            def __init__(self):
+                self.calls = []
+
+            def authorize_derived_launch(self, parent, capability):
+                self.calls.append((parent, capability))
+                return DerivedLaunchDecision(
+                    ProviderAdmissionState.GRANTED,
+                    "derived_launch_allowed_by_test",
+                    audit_id="audit-avatar-positive-2a",
+                    child_endpoint_lease=lease,
+                )
+
+        launch_calls = []
+        proc = MagicMock(pid=12345)
+        proc.poll.return_value = None
+        receipt = AvatarLaunchReceipt(pid=12345, handle=proc)
+        # Scope this override inside the autouse fixture's AvatarManager patch.
+        # A test-level monkeypatch restored after that fixture would otherwise
+        # leave its stale mock behind for later launcher-contract tests.
+        with monkeypatch.context() as launch_patch:
+            launch_patch.setattr(
+                AvatarManager,
+                "_launch",
+                lambda _self, working_dir, **kwargs: (
+                    launch_calls.append((working_dir, kwargs))
+                    or (receipt, Path("/tmp/avatar-positive-2a.stderr"))
+                ),
+            )
+            parent = Agent(
+                service=make_mock_service(),
+                agent_name="parent",
+                working_dir=tmp_path / "parent",
+                capabilities=["avatar"],
+                _turn_origin_policy=RUNTIME_POLICY,
+                derived_launch_admission_port=_GrantingPort(),
+            )
+            port = parent._derived_launch_admission_port
+            root = RootProviderAdmission("root-avatar-positive-2a", RUNTIME_POLICY.policy_version)
+            token = bind_provider_admission(root)
+            try:
+                result = parent.get_capability("avatar").handle(
+                    {"action": "spawn", "input": {"name": "child", "confirm": True}}
+                )
+            finally:
+                clear_provider_admission(token)
+
+        assert result["status"] == "ok"
+        assert port.calls == [(root, DerivedLaunchCapability.AVATAR)]
+        assert launch_calls == [
+            (
+                parent._working_dir.parent / "child",
+                {"authority_lease": lease, "derived_child": True},
+            )
+        ]
+        from lingtai.tools.avatar._launcher import derived_avatar_state_path
+        assert derived_avatar_state_path(parent._working_dir.parent / "child").is_file()
+        records = [
+            json.loads(line)
+            for line in (parent._working_dir / "delegates" / "ledger.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert records[0]["event"] == "avatar_admission_decision"
+        assert records[0]["state"] == "granted"
+        assert records[0]["audit_id"] == "audit-avatar-positive-2a"
+
+    def test_profile_avatar_early_return_closes_unhanded_driver_lease(self, tmp_path):
+        """A Driver lease is closed when spawn aborts before the launcher Port."""
+        from lingtai.adapters.acp.puffo_v0 import RUNTIME_POLICY
+        from lingtai.kernel.provider_admission import (
+            DerivedLaunchDecision,
+            ProviderAdmissionState,
+            RootProviderAdmission,
+            bind_provider_admission,
+            clear_provider_admission,
+        )
+        from lingtai.agent import Agent
+
+        class _Lease:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class _GrantingPort:
+            def __init__(self, lease):
+                self.lease = lease
+
+            def authorize_derived_launch(self, _parent, _capability):
+                return DerivedLaunchDecision(
+                    ProviderAdmissionState.GRANTED,
+                    "derived_launch_allowed_by_test",
+                    child_endpoint_lease=self.lease,
+                )
+
+        lease = _Lease()
+        parent = Agent(
+            service=make_mock_service(),
+            agent_name="parent",
+            working_dir=tmp_path / "parent",
+            capabilities=["avatar"],
+            _turn_origin_policy=RUNTIME_POLICY,
+            derived_launch_admission_port=_GrantingPort(lease),
+        )
+        (parent._working_dir.parent / "child").mkdir()
+        token = bind_provider_admission(
+            RootProviderAdmission("root-avatar-lease-close", RUNTIME_POLICY.policy_version)
+        )
+        try:
+            result = parent.get_capability("avatar").handle(
+                {"action": "spawn", "input": {"name": "child", "confirm": True}}
+            )
+        finally:
+            clear_provider_admission(token)
+
+        assert result == {"error": "Directory 'child' already exists. Choose another name."}
+        assert lease.closed is True
+
 
 class TestMissionQualityGate:
-    """Issue #33 — mission/dry_run/confirm guardrails on avatar(spawn)."""
+    """Issue #33 — mission/dry_run/confirm guardrails on avatar_spawn."""
 
     @pytest.fixture(autouse=True)
     def _autopatch(self, fake_avatar_launch):
@@ -201,27 +532,27 @@ class TestMissionQualityGate:
         )
 
     def test_helper_rejects_empty(self):
-        from lingtai.core.avatar import _mission_looks_unsafe
+        from lingtai.tools.avatar import _mission_looks_unsafe
         unsafe, reason = _mission_looks_unsafe("")
         assert unsafe and "empty" in reason
 
     def test_helper_rejects_short(self):
-        from lingtai.core.avatar import _mission_looks_unsafe
+        from lingtai.tools.avatar import _mission_looks_unsafe
         unsafe, reason = _mission_looks_unsafe("too short")
         assert unsafe and "short" in reason
 
     def test_helper_rejects_test_word(self):
-        from lingtai.core.avatar import _mission_looks_unsafe
+        from lingtai.tools.avatar import _mission_looks_unsafe
         unsafe, reason = _mission_looks_unsafe("test")
         assert unsafe
 
     def test_helper_rejects_test_prefix(self):
-        from lingtai.core.avatar import _mission_looks_unsafe
+        from lingtai.tools.avatar import _mission_looks_unsafe
         unsafe, reason = _mission_looks_unsafe("debug something something something")
         assert unsafe and "placeholder" in reason
 
     def test_helper_accepts_real_mission(self):
-        from lingtai.core.avatar import _mission_looks_unsafe
+        from lingtai.tools.avatar import _mission_looks_unsafe
         unsafe, reason = _mission_looks_unsafe(
             "Investigate the heartbeat regression in the kernel and report findings"
         )
@@ -231,7 +562,7 @@ class TestMissionQualityGate:
         """Spawn with no _reasoning and no confirm should be refused with a preview."""
         parent = self._parent(tmp_path)
         mgr = parent.get_capability("avatar")
-        result = mgr.handle({"name": "helper"})
+        result = mgr.handle({"action": "spawn", "input": {"name": "helper"}})
         assert result["status"] == "confirmation_needed"
         assert "warning" in result
         assert "preview" in result
@@ -244,7 +575,7 @@ class TestMissionQualityGate:
     def test_spawn_with_short_mission_returns_confirmation_needed(self, tmp_path):
         parent = self._parent(tmp_path)
         mgr = parent.get_capability("avatar")
-        result = mgr.handle({"name": "helper", "_reasoning": "test"})
+        result = mgr.handle({"action": "spawn", "input": {"name": "helper"}, "_reasoning": "test"})
         assert result["status"] == "confirmation_needed"
         assert result["preview"]["mission"] == "test"
         assert result["preview"]["mission_chars"] == 4
@@ -253,7 +584,7 @@ class TestMissionQualityGate:
         parent = self._parent(tmp_path)
         mgr = parent.get_capability("avatar")
         # No mission, but confirm=True acknowledges the risk.
-        result = mgr.handle({"name": "helper", "confirm": True})
+        result = mgr.handle({"action": "spawn", "input": {"name": "helper", "confirm": True}})
         assert result["status"] == "ok"
         assert (parent._working_dir.parent / "helper").is_dir()
 
@@ -261,7 +592,8 @@ class TestMissionQualityGate:
         parent = self._parent(tmp_path)
         mgr = parent.get_capability("avatar")
         result = mgr.handle({
-            "name": "helper",
+            "action": "spawn",
+            "input": {"name": "helper"},
             "_reasoning": "Investigate the heartbeat regression and report back via mail",
         })
         assert result["status"] == "ok"
@@ -269,7 +601,7 @@ class TestMissionQualityGate:
     def test_dry_run_returns_preview_without_spawning(self, tmp_path):
         parent = self._parent(tmp_path)
         mgr = parent.get_capability("avatar")
-        result = mgr.handle({"name": "helper", "dry_run": True})
+        result = mgr.handle({"action": "spawn", "input": {"name": "helper", "dry_run": True}})
         assert result["status"] == "dry_run"
         assert result["preview"]["name"] == "helper"
         assert result["preview"]["type"] == "shallow"
@@ -285,15 +617,15 @@ class TestMissionQualityGate:
         parent = self._parent(tmp_path)
         mgr = parent.get_capability("avatar")
         # Empty mission + no confirm + dry_run=True → returns dry_run, not confirmation_needed.
-        result = mgr.handle({"name": "helper", "dry_run": True})
+        result = mgr.handle({"action": "spawn", "input": {"name": "helper", "dry_run": True}})
         assert result["status"] == "dry_run"
 
     def test_dry_run_preview_reports_real_mission_safe(self, tmp_path):
         parent = self._parent(tmp_path)
         mgr = parent.get_capability("avatar")
         result = mgr.handle({
-            "name": "helper",
-            "dry_run": True,
+            "action": "spawn",
+            "input": {"name": "helper", "dry_run": True},
             "_reasoning": "Investigate the heartbeat regression and report back via mail",
         })
         assert result["status"] == "dry_run"
@@ -301,36 +633,55 @@ class TestMissionQualityGate:
         assert result["preview"]["mission_reason"] == ""
 
     def test_schema_exposes_dry_run_and_confirm(self):
-        from lingtai.core.avatar import get_schema
-        sch = get_schema("en")
-        assert "dry_run" in sch["properties"]
-        assert sch["properties"]["dry_run"]["type"] == "boolean"
-        assert "confirm" in sch["properties"]
-        assert sch["properties"]["confirm"]["type"] == "boolean"
+        """The dry_run/confirm gates stay model-visible after the LTP v2 migration.
 
-    def test_description_points_to_avatar_manual_after_prompt_compaction(self):
-        """The terse tool description should route safety guidance to the manual.
-
-        Prompt-token compaction moved verbose WARNING copy out of the always-on
-        tool description and into avatar-manual. The safety contract now lives
-        in the schema gates (dry_run/confirm) plus the manual pointer, not in a
-        long description string.
+        Under the action-separated envelope they live inside the ``spawn``
+        branch of ``input.anyOf`` rather than at the root, but they must still
+        be declared with their gate types so the model can actually reach
+        them.
         """
-        from lingtai.core.avatar import get_description, get_schema
+        from lingtai.tools.avatar import get_schema
+        sch = get_schema("en")
+        branches = {b["title"]: b for b in sch["properties"]["input"]["anyOf"]}
+        spawn_props = branches["spawn input"]["properties"]
+        assert "dry_run" in spawn_props
+        assert spawn_props["dry_run"]["type"] == ["boolean", "null"]
+        assert "confirm" in spawn_props
+        assert spawn_props["confirm"]["type"] == ["boolean", "null"]
+        assert "rules input" not in branches
+        assert sch["required"] == ["action", "input", "reasoning"]
+        assert sch["properties"]["action"]["enum"] == [
+            "spawn", "settings", "manual"
+        ]
+
+    def test_description_routes_only_consequential_avatar_guidance(self):
+        """Routine schema-sufficient spawn needs no mandatory manual round trip.
+
+        The always-on description stays mechanical and points to avatar-manual
+        only for unfamiliar or consequential lifecycle decisions. Spawn's strict
+        schema still exposes the dry_run/confirm gates in its input branch.
+        """
+        from lingtai.tools.avatar import get_description, get_schema
         desc = get_description("en")
         schema = get_schema("en")
         assert "avatar-manual" in desc
+        assert "Read avatar-manual for unfamiliar or consequential" in desc
+        assert "Before the first spawn" not in desc
         assert "WARNING" not in desc
-        assert "confirm" in schema["properties"]
-        assert "dry_run" in schema["properties"]
+        manual = (
+            Path(__file__).parents[1] / "src/lingtai/tools/avatar/manual/SKILL.md"
+        ).read_text(encoding="utf-8")
+        assert "Routine schema-sufficient" in manual
+        assert "do not load this manual as a ritual" in manual
+        assert "reference/spawn.md" in manual
+        assert "reference/lifecycle.md" in manual
+        spawn_props = {
+            b["title"]: b for b in schema["properties"]["input"]["anyOf"]
+        }["spawn input"]["properties"]
+        assert "confirm" in spawn_props
+        assert "dry_run" in spawn_props
+        assert "action" in schema["properties"]
 
-
-class TestSetupAvatar:
-    def test_setup_avatar(self):
-        agent = MagicMock()
-        mgr = setup_avatar(agent)
-        assert isinstance(mgr, AvatarManager)
-        agent.add_tool.assert_called_once()
 
 
 class TestAddCapability:
@@ -341,6 +692,11 @@ class TestAddCapability:
         mgr = agent.get_capability("avatar")
         assert isinstance(mgr, AvatarManager)
         assert "avatar" in agent._tool_handlers
+        assert "avatar" in {s.name for s in agent._tool_schemas}
+        assert "avatar_spawn" not in agent._tool_handlers
+        assert "avatar_spawn" not in {s.name for s in agent._tool_schemas}
+        assert "avatar_rules" not in agent._tool_handlers
+        assert "avatar_rules" not in {s.name for s in agent._tool_schemas}
 
     def test_add_capability_unknown(self, tmp_path):
         """Unknown capability is logged + skipped (not raised) so a bad name
@@ -372,6 +728,205 @@ class TestAddCapability:
         agent = Agent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
                            capabilities={"bash": {"yolo": True}, "avatar": {}})
         caps_by_name = {name: kwargs for name, kwargs in agent._capabilities}
-        # `bash` default is {"yolo": True}; explicit override merges → still yolo
-        assert caps_by_name.get("bash") == {"yolo": True}
+        # Legacy caller input is normalized to the canonical public `shell`
+        # capability before recording/inheritance.
+        assert caps_by_name.get("shell") == {"yolo": True}
+        assert "bash" not in caps_by_name
         assert caps_by_name.get("avatar") == {}
+
+
+class TestUnifiedAvatarTool:
+    """Regression coverage for the avatar_spawn + avatar_rules → avatar merge,
+    and for the later removal of the ``rules`` action and its automatic
+    post-spawn fan-out (Option B)."""
+
+    def test_schema_is_ltp_v2_action_separated_envelope(self):
+        """The root is exactly the LTP v2 envelope, not the old flat object.
+
+        Pre-migration the schema was a plain object with every action's fields
+        merged at the root and no top-level combinators. It is now the
+        action-separated envelope: four root fields, three of them required,
+        closed to anything else, with one ``input.anyOf`` branch per action.
+        """
+        from lingtai.tools.avatar import get_schema
+        sch = get_schema("en")
+        assert sch["type"] == "object"
+        assert set(sch["properties"]) == {"action", "input", "reasoning", "summarize"}
+        assert sch["required"] == ["action", "input", "reasoning"]
+        assert sch["additionalProperties"] is False
+        assert sch["properties"]["action"]["type"] == "string"
+        assert sch["properties"]["action"]["enum"] == [
+            "spawn", "settings", "manual"
+        ]
+        assert len(sch["properties"]["input"]["anyOf"]) == 3
+
+    def test_spawn_dispatch_preserves_behavior_and_reasoning(self, tmp_path, fake_avatar_launch):
+        """action='spawn' preserves outputs and _reasoning → first-prompt propagation."""
+        from lingtai.agent import Agent
+        parent = Agent(service=make_mock_service(), agent_name="parent", working_dir=tmp_path / "test",
+                            capabilities=["avatar"])
+        mgr = parent.get_capability("avatar")
+        result = mgr.handle({
+            "action": "spawn",
+            "input": {"name": "helper"},
+            "_reasoning": "Investigate the heartbeat regression and report back via mail",
+        })
+        assert result["status"] == "ok"
+        assert result["agent_name"] == "helper"
+        prompt_path = parent._working_dir.parent / "helper" / ".prompt"
+        assert "Investigate the heartbeat regression" in prompt_path.read_text(encoding="utf-8")
+
+    def test_rules_action_is_unknown_regardless_of_admin(self, tmp_path):
+        """action='rules' no longer exists — it fails for admin and non-admin alike."""
+        from lingtai.agent import Agent
+        no_admin = Agent(service=make_mock_service(), agent_name="worker",
+                          working_dir=tmp_path / "worker", capabilities=["avatar"], admin={})
+        mgr = no_admin.get_capability("avatar")
+        result = mgr.handle({"action": "rules", "input": {"rules_content": "No deleting."}})
+        assert "error" in result
+        assert not (no_admin._working_dir / ".rules").exists()
+
+        admin = Agent(service=make_mock_service(), agent_name="admin",
+                       working_dir=tmp_path / "admin", capabilities=["avatar"],
+                       admin={"karma": True})
+        mgr2 = admin.get_capability("avatar")
+        admin_result = mgr2.handle({"action": "rules", "input": {"rules_content": "Be concise."}})
+        assert admin_result == {
+            "error": (
+                "unknown action: 'rules', only 'spawn', 'settings', "
+                "or 'manual' is supported"
+            ),
+        }
+        assert not (admin._working_dir / ".rules").exists()
+
+    def test_spawn_never_required_admin(self, tmp_path, fake_avatar_launch):
+        """A non-admin agent can spawn — unaffected by the rules action's removal."""
+        from lingtai.agent import Agent
+        no_admin = Agent(service=make_mock_service(), agent_name="worker",
+                          working_dir=tmp_path / "worker", capabilities=["avatar"], admin={})
+        mgr = no_admin.get_capability("avatar")
+        result = mgr.handle({"action": "spawn", "input": {"name": "helper", "confirm": True}})
+        assert result["status"] == "ok"
+
+    def test_manual_returns_exact_body_and_performs_no_mutation(self, tmp_path):
+        """action='manual' is read-only: returns the exact SKILL.md body, no fs mutation."""
+        from lingtai.agent import Agent
+        parent = Agent(service=make_mock_service(), agent_name="parent",
+                        working_dir=tmp_path / "test", capabilities=["avatar"])
+        mgr = parent.get_capability("avatar")
+
+        manual_source = (
+            Path(__file__).resolve().parents[1]
+            / "src" / "lingtai" / "tools" / "avatar" / "manual" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+
+        result = mgr.handle({"action": "manual", "input": {}})
+        assert result["status"] == "ok"
+        assert result["manual"] == manual_source
+
+        # No spawn side effects: no sibling directory, no ledger.
+        assert not (parent._working_dir.parent / "helper").exists()
+        assert not (parent._working_dir / "delegates" / "ledger.jsonl").exists()
+        # No rules side effects: no .rules signal written.
+        assert not (parent._working_dir / ".rules").exists()
+
+    def test_daemon_excludes_avatar_from_child_surface(self, tmp_path):
+        """The daemon's emanation blacklist covers the canonical 'avatar' name only."""
+        from lingtai.tools.daemon import EMANATION_BLACKLIST
+        assert "avatar" in EMANATION_BLACKLIST
+        assert "avatar_spawn" not in EMANATION_BLACKLIST
+        assert "avatar_rules" not in EMANATION_BLACKLIST
+
+    def test_invalid_action_fails_deterministically(self, tmp_path):
+        from lingtai.agent import Agent
+        parent = Agent(service=make_mock_service(), agent_name="parent",
+                        working_dir=tmp_path / "test", capabilities=["avatar"])
+        mgr = parent.get_capability("avatar")
+        result = mgr.handle({"action": "bogus", "input": {}})
+        assert "error" in result
+        assert "bogus" in result["error"]
+
+    def test_missing_action_fails_deterministically_regardless_of_payload_shape(
+        self, tmp_path, fake_avatar_launch,
+    ):
+        """Missing 'action' must fail the same way no matter which action's
+        fields happen to be present — it must never be inferred from payload
+        shape, and must mutate nothing (no spawn, no ledger, no .rules)."""
+        from lingtai.agent import Agent
+        parent = Agent(service=make_mock_service(), agent_name="parent",
+                        working_dir=tmp_path / "test", capabilities=["avatar"],
+                        admin={"karma": True})
+        mgr = parent.get_capability("avatar")
+        expected_error = (
+            "unknown action: '', only 'spawn', 'settings', "
+            "or 'manual' is supported"
+        )
+
+        # Payload shaped like a formerly-valid rules call, but action omitted.
+        rules_shaped = mgr.handle({"rules_content": "Be concise."})
+        assert rules_shaped["error"] == expected_error
+        assert rules_shaped.get("status") != "ok"
+        assert not (parent._working_dir / ".rules").exists()
+
+        # Payload shaped like a valid spawn call, but action omitted.
+        spawn_shaped = mgr.handle({"name": "helper3", "confirm": True})
+        assert spawn_shaped["error"] == expected_error
+        assert spawn_shaped.get("status") != "ok"
+        assert not (parent._working_dir.parent / "helper3").exists()
+        assert not (parent._working_dir / "delegates" / "ledger.jsonl").exists()
+
+        # Entirely empty payload.
+        empty = mgr.handle({})
+        assert empty["error"] == expected_error
+        assert empty.get("status") != "ok"
+        fake_avatar_launch.poll.assert_not_called()
+
+    def test_spawn_missing_name_fails_without_affecting_other_actions(self, tmp_path):
+        from lingtai.agent import Agent
+        parent = Agent(service=make_mock_service(), agent_name="parent",
+                        working_dir=tmp_path / "test", capabilities=["avatar"],
+                        admin={"karma": True})
+        mgr = parent.get_capability("avatar")
+
+        spawn_result = mgr.handle({"action": "spawn", "input": {}})
+        assert "error" in spawn_result
+        assert "name is required" in spawn_result["error"]
+
+        manual_result = mgr.handle({"action": "manual", "input": {}})
+        assert manual_result["status"] == "ok"
+
+
+def test_avatar_manual_package_links_resolve_from_returned_path():
+    import re
+    from lingtai.tools.avatar import _manual_payload
+    result = _manual_payload({})
+    root = Path(result["manual_path"])
+    for page in [root, *sorted((root.parent / "reference").glob("*.md"))]:
+        for target in re.findall(r"\[[^\]]*\]\(([^)]+)\)", page.read_text()):
+            if "://" not in target and not target.startswith("#"):
+                assert (page.parent / target.split("#")[0]).resolve().exists(), (page, target)
+
+
+def test_avatar_guidance_distinguishes_preview_and_conditional_init():
+    from lingtai.tools.avatar import _SPAWN_INPUT_SCHEMA
+    manual = Path(__file__).parents[1] / "src/lingtai/tools/avatar/manual"
+    text = (manual / "reference/spawn.md").read_text()
+    assert "not launch admission" in text
+    assert "Only when" in text and "manifest.preset.default" in text
+    assert "without a default" in text
+    assert "ASCII space" in text
+    props = _SPAWN_INPUT_SCHEMA["properties"]
+    assert "identity/knowledge" in props["type"]["description"]
+    assert "not inherited" in props["comment"]["description"]
+    assert "empty/short/placeholder" in props["confirm"]["description"]
+
+
+def test_avatar_guidance_preserves_boot_and_settings_limits():
+    manual = Path(__file__).parents[1] / "src/lingtai/tools/avatar/manual"
+    lifecycle = (manual / "reference/lifecycle.md").read_text()
+    root = (manual / "SKILL.md").read_text()
+    assert "freshness" in lifecycle and "not redacted" in lifecycle
+    assert "reads the entire" in lifecycle and "truncation prefix" in lifecycle
+    assert "permanent destruction" in lifecycle
+    assert "LINGTAI_AVATAR_*" in root
+    assert "relaunch" in root and "current=default" in root

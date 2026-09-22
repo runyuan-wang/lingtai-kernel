@@ -7,22 +7,24 @@ that loses the result payload.
 """
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
 
 import pytest
 
-from lingtai_kernel.base_agent.turn import (
+from lingtai.kernel.base_agent.turn import (
     _process_response,
     _restore_tool_results_after_continuation_failure,
 )
-from lingtai_kernel.llm.base import LLMResponse, ToolCall
-from lingtai_kernel.llm.interface import (
+from lingtai.kernel.llm.base import LLMResponse, ToolCall
+from lingtai.kernel.llm.interface import (
     ChatInterface,
     TextBlock,
     ToolCallBlock,
     ToolResultBlock,
 )
+from tests._notification_store_helpers import notification_store_for
 
 
 class _FakeChat:
@@ -45,14 +47,22 @@ class _FakeChat:
 
 
 class _FakeAgent:
-    def __init__(self) -> None:
+    def __init__(self, *, working_dir: Path | None = None) -> None:
         self._chat = _FakeChat()
+        self.agent_name = "test-agent"
         self._notification_live_holder = None
+        self._intrinsics = {}
+        self._working_dir = working_dir or Path(
+            "/nonexistent/lingtai-test-tool-result-restore"
+        )
+        self._notification_store = notification_store_for(self._working_dir)
         self.saved = 0
+        self.save_sources: list[str | None] = []
         self.logs: list[tuple[str, dict]] = []
 
     def _save_chat_history(self, *, ledger_source: str | None = None) -> None:
         self.saved += 1
+        self.save_sources.append(ledger_source)
 
     def _log(self, event: str, **kwargs) -> None:
         self.logs.append((event, kwargs))
@@ -167,6 +177,9 @@ class _FakeGuard:
     def record_calls(self, count: int) -> None:
         pass
 
+    def clear_progress_notice(self) -> None:
+        pass
+
 
 class _ProcessExecutor:
     def __init__(
@@ -184,6 +197,25 @@ class _ProcessExecutor:
         return [self.result], False, ""
 
 
+class _RepeatedErrorExecutor:
+    def __init__(self, error: str = "tool failed identically") -> None:
+        self.guard = _FakeGuard()
+        self.error = error
+        self.calls: list[list] = []
+
+    def execute(self, tool_calls, **kwargs):
+        calls = list(tool_calls)
+        self.calls.append(calls)
+        collected_errors = kwargs.get("collected_errors")
+        if collected_errors is not None:
+            collected_errors.append(self.error)
+        results = [
+            ToolResultBlock(id=tc.id or f"call_{idx}", name=tc.name, content=self.error)
+            for idx, tc in enumerate(calls)
+        ]
+        return results, False, ""
+
+
 class _NoopSentTracker:
     pass
 
@@ -197,15 +229,31 @@ class _FailingSession:
         raise RuntimeError("provider continuation failed")
 
 
-class _CancelAfterInitialClear:
-    def __init__(self) -> None:
-        self.clear_count = 0
+class _ContinuingSession:
+    def __init__(self, chat: _FakeChat, responses: list[LLMResponse]) -> None:
+        self.chat = chat
+        self.responses = list(responses)
+        self.sent = []
 
-    def clear(self) -> None:
-        self.clear_count += 1
-
-    def is_set(self) -> bool:
-        return self.clear_count == 1
+    def send(self, content):
+        self.sent.append(content)
+        if isinstance(content, str):
+            # Hard-stop summary continuation: the production interface appends
+            # the user text before send; mirror that here.
+            self.chat.interface.add_user_message(content)
+        else:
+            self.chat.commit_tool_results(content)
+        response = self.responses.pop(0)
+        blocks = []
+        if response.text:
+            blocks.append(TextBlock(response.text))
+        blocks.extend(
+            ToolCallBlock(id=tc.id or "", name=tc.name, args=tc.args)
+            for tc in response.tool_calls
+        )
+        if blocks:
+            self.chat.interface.add_assistant_message(blocks)
+        return response
 
 
 def test_process_response_restores_real_results_when_continuation_send_fails():
@@ -244,6 +292,61 @@ def test_process_response_restores_real_results_when_continuation_send_fails():
     )
 
 
+def test_process_response_third_identical_tool_error_still_continues(tmp_path):
+    """The third identical tool error remains a normal tool-result continuation.
+
+    There is no repeated-identical-error hard-stop path. The LLM receives the
+    third error result in band, then decides whether to stop/report or continue.
+    """
+    agent = _FakeAgent(working_dir=tmp_path)
+    agent._executor = _RepeatedErrorExecutor(error="same tool error")
+    agent._cancel_event = threading.Event()
+    agent._on_tool_result_hook = None
+    agent._intermediate_text_streamed = True
+    agent._sent_tracker = _NoopSentTracker()
+
+    responses = [
+        LLMResponse(
+            text="",
+            tool_calls=[ToolCall(id="call_2", name="bash", args={"command": "fail"})],
+        ),
+        LLMResponse(
+            text="",
+            tool_calls=[ToolCall(id="call_3", name="bash", args={"command": "fail"})],
+        ),
+        # Continuation from the third ordinary tool result: the agent explains
+        # and stops based on what the model-visible payload said.
+        LLMResponse(
+            text="The bash call failed identically 3 times; reporting and stopping.",
+            tool_calls=[],
+        ),
+    ]
+    agent._session = _ContinuingSession(agent._chat, responses)
+
+    response = LLMResponse(
+        text="",
+        tool_calls=[ToolCall(id="call_1", name="bash", args={"command": "fail"})],
+    )
+
+    result = _process_response(agent, response, ledger_source="test")
+
+    assert result == {
+        "text": "The bash call failed identically 3 times; reporting and stopping.",
+        "failed": False,
+        "errors": ["same tool error", "same tool error", "same tool error"],
+    }
+
+    assert len(agent._session.sent) == 3
+    assert all(isinstance(payload, list) for payload in agent._session.sent)
+    assert [batch[0].id for batch in agent._chat.committed] == [
+        "call_1",
+        "call_2",
+        "call_3",
+    ]
+    assert not agent._chat.interface.has_pending_tool_calls()
+    assert not any(event.startswith("repeated_tool_error") for event, _ in agent.logs)
+    assert not (tmp_path / ".notification" / "repeated_tool_error.json").exists()
+
 def test_process_response_logs_cancel_before_tool_dispatch():
     agent = _FakeAgent()
     real_result = ToolResultBlock(
@@ -252,7 +355,9 @@ def test_process_response_logs_cancel_before_tool_dispatch():
         content="should not execute",
     )
     agent._executor = _ProcessExecutor(real_result)
-    agent._cancel_event = _CancelAfterInitialClear()
+    agent._cancel_event = threading.Event()
+    agent._cancel_event.set()
+    agent._session = _FailingSession()
     agent._on_tool_result_hook = None
     agent._intermediate_text_streamed = True
     agent._sent_tracker = _NoopSentTracker()
@@ -266,6 +371,8 @@ def test_process_response_logs_cancel_before_tool_dispatch():
 
     assert result == {"text": "", "failed": False, "errors": []}
     assert agent._executor.calls == []
+    assert agent._session.sent == []
+    assert agent._cancel_event.is_set()
 
     names = [name for name, _ in agent.logs]
     assert names == ["tool_calls_not_dispatched"]
@@ -295,8 +402,10 @@ def test_process_response_logs_cancel_before_tool_dispatch():
         ),
     ],
 )
-def test_process_response_logs_guarded_tool_calls_not_dispatched(guard, reason, extra):
-    agent = _FakeAgent()
+def test_process_response_closes_and_notifies_guarded_tool_calls_not_dispatched(
+    tmp_path, guard, reason, extra,
+):
+    agent = _FakeAgent(working_dir=tmp_path)
     real_result = ToolResultBlock(
         id="call_1",
         name="bash",
@@ -317,20 +426,60 @@ def test_process_response_logs_guarded_tool_calls_not_dispatched(guard, reason, 
 
     assert result == {"text": "", "failed": False, "errors": []}
     assert agent._executor.calls == []
-    assert agent.logs == [
-        (
-            "tool_calls_not_dispatched",
-            {
-                "ledger_source": "test",
-                "in_tool_loop": False,
-                "reason": reason,
-                "call_count": 1,
-                "call_ids": ["call_1"],
-                "tool_names": ["bash"],
-                **extra,
-            },
-        )
+    tail = agent._chat.interface.entries[-1]
+    assert tail.role == "user"
+    assert len(tail.content) == 1
+    synthetic = tail.content[0]
+    assert synthetic.id == "call_1"
+    assert synthetic.name == "bash"
+    assert synthetic.synthesized is True
+    assert synthetic.content.startswith("[kernel notice — tool call NOT dispatched]")
+    assert "NOT dispatched" in synthetic.content
+    assert f"Reason recorded by the kernel: {reason}" in synthetic.content
+    assert "No side effects occurred from this tool call" in synthetic.content
+    assert "visible in the conversation transcript" in synthetic.content
+    assert "Do not retry the same blocked call unchanged" in synthetic.content
+    assert "MAY OR MAY NOT" not in synthetic.content
+    assert not agent._chat.interface.has_pending_tool_calls()
+    assert agent.saved == 1
+
+    log_names = [name for name, _ in agent.logs]
+    assert log_names == [
+        "tool_calls_not_dispatched",
+        "guarded_tool_calls_closed",
+        "tool_loop_guard_notification_published",
     ]
+    assert agent.logs[0] == (
+        "tool_calls_not_dispatched",
+        {
+            "ledger_source": "test",
+            "in_tool_loop": False,
+            "reason": reason,
+            "detail_field": next(iter(extra.keys())),
+            "call_count": 1,
+            "call_ids": ["call_1"],
+            "tool_names": ["bash"],
+            **extra,
+        },
+    )
+    notification_path = tmp_path / ".notification" / "tool_loop_guard.json"
+    notification = json.loads(notification_path.read_text(encoding="utf-8"))
+    assert notification["header"] == "tool loop guard interrupted work"
+    assert notification["priority"] == "normal"
+    instructions = notification["instructions"]
+    assert "already visible in the conversation transcript" in instructions
+    assert "Do not re-issue the same blocked tool call(s) unchanged" in instructions
+    data = notification["data"]
+    assert data["reason"] == reason
+    assert data["detail"] == next(iter(extra.values()))
+    assert data["ledger_source"] == "test"
+    assert data["in_tool_loop"] is False
+    assert data["closed_tool_result_count"] == 1
+    assert data["call_ids"] == ["call_1"]
+    assert data["tool_names"] == ["bash"]
+    assert "Synthetic tool results were committed to the transcript" in data["message"]
+    assert "no side effects occurred" in data["message"]
+    assert "retry the same blocked calls unchanged" in data["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +678,7 @@ def test_codex_responses_wire_pairs_earlier_orphan_with_synthetic_output():
     )
 
 
-def test_tc_wake_legacy_path_restores_real_item_result_when_send_fails():
+def test_tc_wake_legacy_path_restores_real_item_result_when_send_fails(tmp_path: Path):
     """Issue #170: when the legacy tc_inbox splice path's ``send([item.result])``
     fails and the adapter rolled the user entry back, the kernel must
     restore the real item.result before the catch-all heal calls
@@ -538,8 +687,8 @@ def test_tc_wake_legacy_path_restores_real_item_result_when_send_fails():
     agent loses the message that was on the wire.
     """
     from dataclasses import dataclass, field
-    from lingtai_kernel.base_agent.turn import _handle_tc_wake
-    from lingtai_kernel.tc_inbox import InvoluntaryToolCall, TCInbox
+    from lingtai.kernel.base_agent.turn import _handle_tc_wake
+    from lingtai.kernel.tc_inbox import InvoluntaryToolCall, TCInbox
 
     iface = ChatInterface()
     iface.add_system("system")
@@ -583,7 +732,7 @@ def test_tc_wake_legacy_path_restores_real_item_result_when_send_fails():
         _intrinsics: dict = field(default_factory=dict)
         _tool_handlers: dict = field(default_factory=dict)
         _PARALLEL_SAFE_TOOLS: set = field(default_factory=set)
-        _working_dir = None
+        _working_dir: Path = tmp_path
         _logs: list = field(default_factory=list)
         saves: int = 0
 
@@ -630,7 +779,7 @@ def test_tc_wake_legacy_path_restores_real_item_result_when_send_fails():
         _tc_inbox=inbox,
     )
 
-    from lingtai_kernel.message import Message, MSG_TC_WAKE
+    from lingtai.kernel.message import Message, MSG_TC_WAKE
     wake_msg = Message(type=MSG_TC_WAKE, sender="kernel", content="", timestamp=0.0)
 
     with pytest.raises(RuntimeError, match="No tool output found"):

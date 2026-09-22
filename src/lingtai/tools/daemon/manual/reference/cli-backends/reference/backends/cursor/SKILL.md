@@ -1,0 +1,86 @@
+---
+name: daemon-backend-cursor
+description: >
+  Nested daemon-cli-backends reference for the Cursor daemon backend's flag
+  surface. Read this only when a daemon task needs Cursor-specific CLI flags
+  (model selection, output/tooling switches): it routes you to the installed
+  CLI's live help via shell and shows how to translate that help into the
+  generic `backend_options` mechanism. It is not a flag catalog.
+version: 0.3.0
+last_changed_at: 2026-08-07T00:00:00Z
+related_files:
+- src/lingtai/tools/daemon/manual/reference/cli-backends/SKILL.md
+maintenance: |
+  Tracks the Cursor daemon backend flag-discovery topic it documents; update when that integration changes.
+---
+
+# Cursor Daemon Backend — Flag Discovery Entrypoint
+
+The installed CLI's own help is the authority for Cursor Agent flags; this page
+is only the entrypoint. Conversion rules live in the parent
+[`reference/cli-backends/SKILL.md`](../../../SKILL.md).
+
+## Discover flags from the installed CLI
+
+1. Run `agent --version` and `agent --help` in bash. The daemon spawns root
+   `agent` directly (the root binary is `agent`; older docs said
+   `cursor-agent`) — `agent -p --force --output-format stream-json <prompt>` —
+   so root help is authoritative (keychain errors happen before help on some builds).
+2. Translate what you found into `backend_options` with the parent's generic
+   conversion rules (nothing Cursor-specific is added).
+
+## Example: model selection via the generic route
+
+`backend_options` keys become long flags, inserted after the harness-owned
+flags and before the task prompt:
+
+```jsonc
+{
+  "backend": "cursor",
+  "tasks": [{
+    "task": "Implement and validate the change.",
+    "tools": [],
+    "backend_options": {
+      "model": "opus"
+    }
+  }]
+}
+// argv: --model opus
+```
+
+The flag and model vocabulary belong to the installed CLI — LingTai does
+not validate, enumerate, or simulate them. Confirm `--model` and its
+accepted values in your installed `agent --help` before relying on this; an
+unknown flag or value is the CLI's error, not the daemon's.
+
+## Source-pinned stream-json usage
+For installed `agent-cli@2026.05.28-a70ca7c`, accept usage only from `type=result`, `subtype=success`, `is_error=false` with all four non-negative integer fields: `inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`.
+`inputTokens` is already net; UI-only `cli_tokens` adds read + write as cached, preserves raw usage, ignores invalid/all-zero blocks, and counts duplicate terminal results once.
+Join model only from a preceding matching `system/init` by `session_id`; provider stays unknown because this source emits no provider identity (do not infer it from `apiKeySource`, model, backend, credentials, or environment). This is version-pinned, not a cross-release claim.
+
+## Subscription & auth
+
+Cursor account/subscription (keychain login); LingTai does not inject
+credentials — the CLI must be signed in.
+
+Official docs: https://docs.cursor.com/agent
+
+## Harness boundary
+
+Cursor declares no reserved-flag list at validation, so nothing is refused
+beyond generic key/value safety rules. Still, do not re-set harness-owned
+surfaces: `-p` (non-interactive
+print mode), `--force` (allows file modifications in print mode),
+`--output-format stream-json` (one JSON event per stdout line — the daemon's
+progress/result parser and the session-id capture depend on it), and
+`--resume` (owned by `ask` follow-ups, which replay the captured session id).
+
+Session and completion: the first session-id-shaped stream event is stored
+as `cursor_session_id`; `ask` resumes with
+`agent -p --force --resume <cursor_session_id> --output-format stream-json
+<message>` (one follow-up in flight per session). Per-run MCP injection is
+not wired for this backend yet, so no `finish` contract: success comes from
+the stream's final result event and the process exit code.
+
+`backend_options` is honored only at `emanate` time; `ask` follow-ups reuse the
+session without re-passing it.

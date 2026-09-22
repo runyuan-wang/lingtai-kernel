@@ -1,11 +1,15 @@
 """Pure FS unit tests for DaemonRunDir — no threads, no LLM mocks."""
 import json
+import multiprocessing
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
-from lingtai.core.daemon.run_dir import DaemonRunDir
+import pytest
+
+from lingtai.tools.daemon.run_dir import DaemonRunDir
 
 
 def _make_run_dir(tmp_path: Path, **overrides) -> DaemonRunDir:
@@ -16,7 +20,7 @@ def _make_run_dir(tmp_path: Path, **overrides) -> DaemonRunDir:
         parent_working_dir=parent_wd,
         handle="em-3",
         task="find todos",
-        tools=["file"],
+        tools=["shell"],
         model="mock-model",
         max_turns=30,
         timeout_s=300.0,
@@ -39,11 +43,21 @@ def test_construct_creates_folder_structure(tmp_path):
 
 
 def test_run_id_format(tmp_path):
-    """run_id is em-<N>-<YYYYMMDD-HHMMSS>-<6 hex chars>."""
+    """Direct callers without explicit run_id retain the legacy long format."""
     rd = _make_run_dir(tmp_path, handle="em-7")
     assert re.fullmatch(r"em-7-\d{8}-\d{6}-[0-9a-f]{6}", rd.run_id)
     assert rd.path.name == rd.run_id
 
+
+
+
+def test_explicit_compact_run_id_is_folder_name(tmp_path):
+    rd = _make_run_dir(tmp_path, handle="em-abcd", run_id="em-abcd")
+    assert rd.run_id == "em-abcd"
+    assert rd.path.name == "em-abcd"
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["handle"] == "em-abcd"
+    assert data["run_id"] == "em-abcd"
 
 def test_folder_lives_under_parent_daemons_dir(tmp_path):
     rd = _make_run_dir(tmp_path)
@@ -55,10 +69,11 @@ def test_initial_daemon_json_fields(tmp_path):
     data = json.loads(rd.daemon_json_path.read_text())
     assert data["handle"] == "em-3"
     assert data["run_id"] == rd.run_id
+    assert data["group_id"] is None
     assert data["parent_addr"] == "parent"
     assert data["parent_pid"] == 12345
     assert data["task"] == "find todos"
-    assert data["tools"] == ["file"]
+    assert data["tools"] == ["shell"]
     assert data["model"] == "mock-model"
     assert data["max_turns"] == 30
     assert data["timeout_s"] == 300.0
@@ -67,11 +82,44 @@ def test_initial_daemon_json_fields(tmp_path):
     assert data["turn"] == 0
     assert data["current_tool"] is None
     assert data["tool_call_count"] == 0
-    assert data["tokens"] == {"input": 0, "output": 0, "thinking": 0, "cached": 0}
+    assert data["tokens"] == {"input": 0, "output": 0, "thinking": 0, "cached": 0, "calls": 0}
     assert data["result_preview"] is None
     assert data["error"] is None
     # started_at is ISO 8601 UTC
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", data["started_at"])
+
+
+def test_daemon_json_preserves_legacy_json_bytes(tmp_path):
+    rd = _make_run_dir(tmp_path, task="\u7814\u7a76\u7075\u53f0")
+
+    raw = rd.daemon_json_path.read_bytes()
+    data = json.loads(raw)
+    assert raw == json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    assert not raw.endswith(b"\n")
+    assert "\u7814\u7a76\u7075\u53f0".encode("utf-8") in raw
+
+
+def test_daemon_jsonl_preserves_legacy_utf8_bytes(tmp_path):
+    rd = _make_run_dir(tmp_path)
+    entry = {"event": "note", "text": "\u7075\u53f0"}
+
+    rd._append_jsonl(rd.events_path, entry)
+
+    line = rd.events_path.read_text(encoding="utf-8").splitlines()[-1]
+    assert line == json.dumps(entry, ensure_ascii=False)
+    assert "\u7075\u53f0" in line
+
+
+def test_initial_daemon_json_records_group_id(tmp_path):
+    group_id = "dg-20260614-145500-abcdef"
+    rd = _make_run_dir(tmp_path, group_id=group_id)
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["group_id"] == group_id
+
+
+def test_new_group_id_format():
+    group_id = DaemonRunDir.new_group_id()
+    assert re.fullmatch(r"dg-\d{8}-\d{6}-[0-9a-f]{6}", group_id)
 
 
 def test_prompt_written_verbatim(tmp_path):
@@ -149,6 +197,24 @@ def test_bump_turn_updates_daemon_json(tmp_path):
     assert data["elapsed_s"] >= 0.0
     assert data["state"] == "running"  # unchanged
 
+
+def test_daemon_json_is_the_only_per_turn_state_artifact(tmp_path):
+    """The dispatch-ledger migration removes duplicate session_stats writes."""
+    rd = _make_run_dir(tmp_path)
+    assert rd.daemon_json_path.is_file()
+    assert not (rd.path / "session_stats.json").exists()
+
+
+def test_mark_done_keeps_authoritative_state_and_usage_in_daemon_json(tmp_path):
+    rd = _make_run_dir(tmp_path)
+    rd.append_tokens(input=10, output=4, thinking=0, cached=0)
+    rd.record_cli_tokens(input=7, output=3, cached=1, thinking=0)
+    rd.mark_done("all done")
+    state = json.loads(rd.daemon_json_path.read_text())
+    assert state["state"] == "done"
+    assert state["finished_at"] is not None
+    assert state["tokens"] == {"input": 10, "output": 4, "thinking": 0, "cached": 0, "calls": 1}
+    assert state["cli_tokens"] == {"input": 7, "output": 3, "thinking": 0, "cached": 1, "calls": 1}
 
 def test_bump_turn_appends_assistant_chat_entry(tmp_path):
     rd = _make_run_dir(tmp_path)
@@ -284,6 +350,291 @@ def test_record_cli_output_bounds_large_event_and_last_output(tmp_path):
     assert last["truncated"] is True
     assert len(last["text"]) <= rd._CLI_OUTPUT_EVENT_MAX + len("...[truncated]")
 
+
+def test_resume_claim_same_process_identity_is_busy(tmp_path, monkeypatch):
+    rd = _make_run_dir(tmp_path)
+    monkeypatch.setattr(
+        "lingtai.tools.daemon.run_dir.process_identity",
+        lambda pid: "stable-parent-identity",
+    )
+    monkeypatch.setattr(
+        "lingtai.tools.daemon.run_dir.process_identity_matches",
+        lambda pid, saved: saved == "stable-parent-identity",
+    )
+
+    first = rd.claim_resume_generation()
+    second = rd.claim_resume_generation()
+
+    assert first["status"] == "running"
+    assert first["owner_start_identity"] == "stable-parent-identity"
+    assert second == {"status": "busy", "generation": first["generation"]}
+
+
+def test_resume_claim_reused_pid_identity_becomes_stale_after_pending_lease(tmp_path, monkeypatch):
+    rd = _make_run_dir(tmp_path)
+    identities = iter(["first-incarnation", "second-incarnation"])
+    monkeypatch.setattr(
+        "lingtai.tools.daemon.run_dir.process_identity",
+        lambda pid: next(identities),
+    )
+    monkeypatch.setattr(
+        "lingtai.tools.daemon.run_dir.process_identity_matches",
+        lambda pid, saved: False,
+    )
+
+    first = rd.claim_resume_generation()
+    claimed_at = time.time()
+    monkeypatch.setattr(
+        "lingtai.tools.daemon.run_dir.time.time",
+        lambda: claimed_at + rd.PENDING_LAUNCH_LEASE_S + 1,
+    )
+    second = rd.claim_resume_generation()
+
+    assert second["status"] == "running"
+    assert second["generation"] != first["generation"]
+    assert second["owner_start_identity"] == "second-incarnation"
+    first_path = rd.path / "resume-claims" / f"resume-{first['generation']}.json"
+    first_on_disk = json.loads(first_path.read_text(encoding="utf-8"))
+    assert first_on_disk["status"] == "stale"
+    assert first_on_disk["released_at"]
+
+
+def test_pending_resume_launch_is_busy_until_lease_expiry(tmp_path, monkeypatch):
+    rd = _make_run_dir(tmp_path)
+    monkeypatch.setattr(
+        "lingtai.tools.daemon.run_dir.process_identity",
+        lambda pid: "launcher-incarnation",
+    )
+    first = rd.claim_resume_generation()
+    pending_path = rd.path / "resume-claims" / f"resume-{first['generation']}.json"
+    pending = json.loads(pending_path.read_text())
+    pending["owner_pid"] = 99999999  # simulated parent death during handoff
+    pending_path.write_text(json.dumps(pending), encoding="utf-8")
+    assert pending["status"] == "pending-launch"
+    assert rd.claim_resume_generation()["status"] == "busy"
+
+    monkeypatch.setattr(
+        "lingtai.tools.daemon.run_dir.time.time",
+        lambda: first["pending_until"] + 0.1,
+    )
+    recovered = rd.claim_resume_generation()
+    assert recovered["status"] == "running"
+    assert recovered["generation"] != first["generation"]
+
+
+def test_resume_promotion_requires_exact_generation_and_nonce(tmp_path, monkeypatch):
+    rd = _make_run_dir(tmp_path)
+    monkeypatch.setattr(
+        "lingtai.tools.daemon.run_dir.process_identity",
+        lambda pid: "owner-incarnation",
+    )
+    claim = rd.claim_resume_generation()
+    assert not rd.activate_resume_generation("wrong-generation", claim["launch_nonce"])
+    assert not rd.activate_resume_generation(claim["generation"], "wrong")
+    assert rd.activate_resume_generation(claim["generation"], claim["launch_nonce"])
+    assert not rd.release_resume_generation(
+        claim["generation"], "wrong", owner_pid=os.getpid(),
+        owner_identity="owner-incarnation",
+    )
+    assert not rd.release_resume_generation(
+        claim["generation"], claim["launch_nonce"], owner_pid=os.getpid(),
+        owner_identity="wrong-owner",
+    )
+    assert rd.release_resume_generation(
+        claim["generation"], claim["launch_nonce"], owner_pid=os.getpid(),
+        owner_identity="owner-incarnation", result_status="done",
+    )
+
+
+def _cross_process_terminal_writer(run_path: str, action: str, ready, start) -> None:
+    run_dir = DaemonRunDir.attach(Path(run_path))
+    ready.set()
+    start.wait(5)
+    if action == "done":
+        run_dir.mark_done("done from child")
+    else:
+        run_dir.mark_timeout()
+
+
+def test_cross_process_terminal_transactions_preserve_one_terminal_truth(tmp_path):
+    """Two real processes cannot overwrite each other's terminal decision."""
+    rd = _make_run_dir(tmp_path)
+    ctx = multiprocessing.get_context("spawn")
+    start = ctx.Event()
+    ready = [ctx.Event(), ctx.Event()]
+    workers = [
+        ctx.Process(target=_cross_process_terminal_writer,
+                    args=(str(rd.path), action, ready[idx], start))
+        for idx, action in enumerate(("done", "timeout"))
+    ]
+    for worker in workers:
+        worker.start()
+    assert all(event.wait(5) for event in ready)
+    start.set()
+    for worker in workers:
+        worker.join(10)
+        assert worker.exitcode == 0
+    state = json.loads(rd.daemon_json_path.read_text(encoding="utf-8"))
+    assert state["state"] in {"done", "timeout"}
+    events = [
+        json.loads(line)
+        for line in rd.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    terminal_events = [
+        event for event in events
+        if event.get("event") in {"daemon_done", "daemon_timeout"}
+    ]
+    assert len(terminal_events) == 1
+    if state["state"] == "done":
+        assert terminal_events[0]["event"] == "daemon_done"
+        assert state["result_preview"] == "done from child"
+        assert Path(state["result_path"]).read_text(encoding="utf-8") == "done from child"
+    else:
+        assert terminal_events[0]["event"] == "daemon_timeout"
+        assert state.get("result_path") is None
+        assert not rd.result_path.exists()
+
+
+@pytest.mark.parametrize(
+    "operation,setup,expected_terminal",
+    [
+        (
+            "claim",
+            lambda rd: None,
+            lambda state: (
+                state["terminal_notified"] is False
+                and isinstance(state["terminal_notification_claim"], dict)
+                and state["terminal_notification_claim"]["status"] == "pending"
+                and state["terminal_notification_claim"]["terminal_status"] == "done"
+                and state["terminal_notification_claim"]["idempotency_key"]
+                == f"daemon-terminal:{state['run_id']}"
+            ),
+        ),
+        (
+            "clear",
+            lambda rd: rd.update_state(
+                terminal_notification_claim={
+                    "status": "pending",
+                    "terminal_status": "done",
+                    "idempotency_key": "daemon-terminal:test",
+                },
+            ),
+            lambda state: (
+                state["terminal_notified"] is False
+                and state["terminal_notification_claim"] is None
+            ),
+        ),
+        (
+            "publish",
+            lambda rd: None,
+            lambda state: (
+                state["terminal_notified"] is True
+                and state["terminal_notification_claim"] is None
+                and isinstance(state["terminal_notification_receipt"], dict)
+                and state["terminal_notification_receipt"]["idempotency_key"]
+                == "daemon-terminal:test"
+            ),
+        ),
+    ],
+)
+def test_terminal_notification_operations_hold_owner_transaction(
+    tmp_path, operation, setup, expected_terminal,
+):
+    """Terminal field mutation cannot overlap a real live state writer.
+
+    Each terminal operation pauses at its first terminal-field mutation while a
+    real ``record_cli_output`` writer runs concurrently.  The fixed owner
+    transaction holds the per-run writer lock before entering that mutation, so
+    the live writer cannot serialize/read the shared state until the terminal
+    operation is released.  The old boundary (mutation before the writer lock)
+    lets the live writer serialize during the pause and fails this operation
+    boundary directly.
+    """
+    rd = _make_run_dir(tmp_path, backend="mimocode")
+    setup(rd)
+
+    terminal_name = f"terminal-{operation}"
+    writer_name = f"live-writer-{operation}"
+    terminal_write_entered = threading.Event()
+    release_terminal_write = threading.Event()
+    writer_attempted = threading.Event()
+    writer_serialized = threading.Event()
+    terminal_results: list[object] = []
+    errors: list[BaseException] = []
+
+    original_atomic = rd._atomic_write_json
+    original_safe_state = rd._safe_state
+
+    def coordinated_atomic(path, data):
+        current_name = threading.current_thread().name
+        if current_name == terminal_name and path == rd.daemon_json_path:
+            terminal_write_entered.set()
+            assert release_terminal_write.wait(timeout=5)
+        if current_name == writer_name:
+            writer_serialized.set()
+        return original_atomic(path, data)
+
+    def coordinated_safe_state(op, fn):
+        if threading.current_thread().name == writer_name:
+            writer_attempted.set()
+        return original_safe_state(op, fn)
+
+    rd._atomic_write_json = coordinated_atomic
+    rd._safe_state = coordinated_safe_state
+
+    def run_terminal():
+        try:
+            if operation == "claim":
+                result = rd.claim_terminal_notification("done")
+            elif operation == "clear":
+                result = rd.clear_terminal_notification_claim()
+            else:
+                result = rd.mark_terminal_notification_published("daemon-terminal:test")
+            terminal_results.append(result)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def run_writer():
+        try:
+            rd.record_cli_output("live progress", stream="stdout")
+        except BaseException as exc:
+            errors.append(exc)
+
+    terminal_thread = threading.Thread(target=run_terminal, name=terminal_name)
+    writer_thread = threading.Thread(target=run_writer, name=writer_name)
+    terminal_thread.start()
+    assert terminal_write_entered.wait(timeout=5)
+    writer_thread.start()
+    assert writer_attempted.wait(timeout=5)
+
+    # Under the owner transaction the writer is blocked, not merely delayed by
+    # filesystem scheduling: the terminal persistence itself is still in flight.
+    writer_overlapped = writer_serialized.wait(timeout=1)
+
+    release_terminal_write.set()
+    terminal_thread.join(timeout=5)
+    writer_thread.join(timeout=5)
+    assert not terminal_thread.is_alive()
+    assert not writer_thread.is_alive()
+    assert not errors, errors
+    assert not writer_overlapped
+    assert writer_serialized.is_set()
+    expected_result = (
+        DaemonRunDir.terminal_notification_idempotency_key(rd.run_id)
+        if operation == "claim"
+        else None
+    )
+    assert terminal_results == [expected_result]
+
+    state = json.loads(rd.daemon_json_path.read_text())
+    assert state["last_output"] == "live progress"
+    assert expected_terminal(state)
+    if operation == "publish":
+        assert state["terminal_notification_receipt"]["idempotency_key"] == (
+            "daemon-terminal:test"
+        )
+
+
 def test_append_tokens_writes_daemon_ledger(tmp_path):
     rd = _make_run_dir(tmp_path)
     rd.append_tokens(input=100, output=20, thinking=5, cached=10)
@@ -313,18 +664,52 @@ def test_append_tokens_writes_parent_ledger_tagged(tmp_path):
     assert entry["run_id"] == rd.run_id
 
 
+def test_append_tokens_mirrors_only_safe_pool_usage_extra(tmp_path):
+    rd = _make_run_dir(tmp_path)
+    rd.append_tokens(
+        input=100, output=20, thinking=5, cached=10,
+        usage_extra={
+            "codex_auth_path_sha8": "a1b2c3d4",
+            "codex_pool_source_index": 1,
+            "codex_pool_size": 2,
+            "codex_pool_weight": 1,
+            "codex_pool_model_scope": "gpt-5.6",
+            "codex_pool_source_ref": "must-not-copy",
+            "unsafe": "secret",
+            "codex_account_id_sha8": None,
+        },
+    )
+    parent_ledger = tmp_path / "parent" / "logs" / "token_ledger.jsonl"
+    rows = [
+        json.loads(rd.token_ledger_path.read_text().splitlines()[0]),
+        json.loads(parent_ledger.read_text().splitlines()[0]),
+    ]
+    for row in rows:
+        assert row["codex_auth_path_sha8"] == "a1b2c3d4"
+        assert row["codex_pool_source_index"] == 1
+        assert row["codex_pool_size"] == 2
+        assert row["codex_pool_weight"] == 1
+        assert row["codex_pool_model_scope"] == "gpt-5.6"
+        assert "codex_pool_source_ref" not in row
+        assert "codex_account_id_sha8" not in row
+        assert "unsafe" not in row
+
+
 def test_append_tokens_updates_running_totals(tmp_path):
     rd = _make_run_dir(tmp_path)
     rd.append_tokens(input=100, output=20, thinking=5, cached=10)
     rd.append_tokens(input=50, output=15, thinking=3, cached=5)
     data = json.loads(rd.daemon_json_path.read_text())
-    assert data["tokens"] == {"input": 150, "output": 35, "thinking": 8, "cached": 15}
+    assert data["tokens"] == {"input": 150, "output": 35, "thinking": 8, "cached": 15, "calls": 2}
 
 
 def test_append_tokens_skipped_when_all_zero(tmp_path):
     """Don't write a noise entry if the LLM call returned zero tokens."""
     rd = _make_run_dir(tmp_path)
-    rd.append_tokens(input=0, output=0, thinking=0, cached=0)
+    rd.append_tokens(
+        input=0, output=0, thinking=0, cached=0,
+        usage_extra={"codex_pool_size": 2, "unsafe": "must-not-copy"},
+    )
     assert not rd.token_ledger_path.exists() or rd.token_ledger_path.read_text() == ""
     parent_ledger = tmp_path / "parent" / "logs" / "token_ledger.jsonl"
     assert not parent_ledger.exists() or parent_ledger.read_text() == ""
@@ -332,7 +717,7 @@ def test_append_tokens_skipped_when_all_zero(tmp_path):
 
 def test_summing_parent_ledger_includes_daemon_spend(tmp_path):
     """sum_token_ledger on parent's ledger sums daemon and parent calls together."""
-    from lingtai_kernel.token_ledger import append_token_entry, sum_token_ledger
+    from lingtai.kernel.token_ledger import append_token_entry, sum_token_ledger
     rd = _make_run_dir(tmp_path)
     parent_ledger = tmp_path / "parent" / "logs" / "token_ledger.jsonl"
     # Parent's own call
@@ -343,6 +728,103 @@ def test_summing_parent_ledger_includes_daemon_spend(tmp_path):
     assert totals["input_tokens"] == 300
     assert totals["output_tokens"] == 60
     assert totals["api_calls"] == 2
+
+
+def test_initial_daemon_json_has_zeroed_cli_tokens(tmp_path):
+    rd = _make_run_dir(tmp_path)
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["cli_tokens"] == {
+        "input": 0, "output": 0, "thinking": 0, "cached": 0, "calls": 0,
+    }
+
+
+def test_record_cli_tokens_accumulates_in_daemon_json(tmp_path):
+    rd = _make_run_dir(tmp_path, backend="claude-p")
+    rd.record_cli_tokens(input=6950, output=4, cached=18689, thinking=0)
+    rd.record_cli_tokens(input=100, output=50, cached=200, thinking=0)
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["cli_tokens"] == {
+        "input": 7050, "output": 54, "thinking": 0, "cached": 18889, "calls": 2,
+    }
+
+
+def test_record_cli_tokens_does_not_touch_token_ledgers(tmp_path):
+    """CLI usage is UI-only — neither the daemon's nor the parent's ledger sees it."""
+    rd = _make_run_dir(tmp_path)
+    rd.record_cli_tokens(input=6950, output=4, cached=18689, thinking=0)
+    assert not rd.token_ledger_path.exists()
+    parent_ledger = tmp_path / "parent" / "logs" / "token_ledger.jsonl"
+    assert not parent_ledger.exists()
+    # The kernel `tokens` running totals stay zero too.
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["tokens"] == {"input": 0, "output": 0, "thinking": 0, "cached": 0, "calls": 0}
+
+
+def test_record_cli_tokens_backfills_missing_cli_tokens_for_old_state(tmp_path):
+    """Follow-up usage on a pre-upgrade run_dir should not crash."""
+    rd = _make_run_dir(tmp_path)
+    rd._state.pop("cli_tokens")
+    rd._atomic_write_json(rd.daemon_json_path, rd._state)
+    rd.record_cli_tokens(input=3, output=2, cached=1, thinking=0)
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["cli_tokens"] == {
+        "input": 3, "output": 2, "thinking": 0, "cached": 1, "calls": 1,
+    }
+
+
+def test_append_tokens_backfills_missing_calls_for_old_state(tmp_path):
+    """A pre-call-counter LingTai run remains appendable after upgrade."""
+    rd = _make_run_dir(tmp_path)
+    rd._state["tokens"].pop("calls")
+    rd._atomic_write_json(rd.daemon_json_path, rd._state)
+    rd.append_tokens(input=3, output=2, thinking=0, cached=1)
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["tokens"] == {
+        "input": 3, "output": 2, "thinking": 0, "cached": 1, "calls": 1,
+    }
+
+
+def test_record_cli_tokens_logs_redacted_cli_usage_event_with_raw(tmp_path):
+    rd = _make_run_dir(tmp_path)
+    api_key = "fake-api-key-for-redaction"
+    authorization = "Bearer fake-authorization-for-redaction"
+    raw = {
+        "input_tokens": 6950,
+        "cache_read_input_tokens": 15621,
+        "cache_creation_input_tokens": 3068,
+        "output_tokens": 4,
+        "api_key": api_key,
+        "metadata": {"authorization": authorization},
+    }
+    rd.record_cli_tokens(input=6950, output=4, cached=18689, thinking=0, raw=raw)
+    events_text = rd.events_path.read_text()
+    last = json.loads(events_text.splitlines()[-1])
+    assert last["event"] == "cli_usage"
+    assert last["input"] == 6950
+    assert last["output"] == 4
+    assert last["cached"] == 18689
+    assert last["thinking"] == 0
+    assert last["raw"] == {
+        "input_tokens": 6950,
+        "cache_read_input_tokens": 15621,
+        "cache_creation_input_tokens": 3068,
+        "output_tokens": 4,
+        "api_key": "<redacted>",
+        "metadata": {"authorization": "<redacted>"},
+    }
+    assert api_key not in events_text
+    assert authorization not in events_text
+    assert "ts" in last
+
+
+def test_record_cli_tokens_skips_write_when_all_zero(tmp_path):
+    rd = _make_run_dir(tmp_path)
+    before = rd.events_path.read_text()
+    rd.record_cli_tokens(input=0, output=0, cached=0, thinking=0)
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["cli_tokens"]["calls"] == 0
+    # No cli_usage event appended when there is nothing to count.
+    assert rd.events_path.read_text() == before
 
 
 def test_mark_done_writes_terminal_state(tmp_path):
@@ -491,6 +973,29 @@ def test_token_ledger_lines_parseable(tmp_path):
         assert json.loads(line)
 
 
+def test_checkpoint_inbox_backfills_pre_checkpoint_live_state(tmp_path):
+    """An already-running pre-upgrade run can queue and drain one correction."""
+    rd = _make_run_dir(tmp_path, backend="opencode")
+    for field in (
+        "checkpoint_sequence", "latest_checkpoint", "pending_checkpoint_messages"
+    ):
+        rd._state.pop(field)
+    rd._atomic_write_json(rd.daemon_json_path, rd._state)
+
+    message_id = rd.enqueue_checkpoint_message("continue with the bounded slice")
+    recorded = rd.record_checkpoint(
+        {"state": "implementing", "summary": "old live run upgraded in place"}
+    )
+
+    assert recorded["messages"] == [
+        {"id": message_id, "message": "continue with the bounded slice"}
+    ]
+    state = json.loads(rd.daemon_json_path.read_text(encoding="utf-8"))
+    assert state["checkpoint_sequence"] == 1
+    assert state["latest_checkpoint"]["summary"] == "old live run upgraded in place"
+    assert state["pending_checkpoint_messages"] == []
+
+
 def test_mark_failed_handles_pathological_str_exc(tmp_path):
     """If exc.__str__ raises, mark_failed still records terminal state."""
     class BadStr(Exception):
@@ -562,3 +1067,64 @@ def test_log_callback_failures_swallowed(tmp_path, monkeypatch):
 
     # Should not raise — secondary failure (callback exception) is silent
     rd.set_current_tool("read", {})
+
+
+# --------------------------------------------------------------------------
+# set_session_id — backend resume id persistence
+# --------------------------------------------------------------------------
+
+def test_set_session_id_writes_new_key(tmp_path):
+    rd = _make_run_dir(tmp_path)
+    assert rd.set_session_id("claude_session_id", "sess-abc") is True
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["claude_session_id"] == "sess-abc"
+
+
+def test_set_session_id_empty_value_returns_false(tmp_path):
+    rd = _make_run_dir(tmp_path)
+    # Use a non-seeded key so an empty value leaves daemon.json untouched.
+    assert rd.set_session_id("codex_session_id", "") is False
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert "codex_session_id" not in data
+    # A pre-seeded-None key (claude) is likewise not changed by an empty value.
+    assert rd.set_session_id("claude_session_id", "") is False
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["claude_session_id"] is None
+
+
+def test_set_session_id_duplicate_value_returns_false(tmp_path):
+    rd = _make_run_dir(tmp_path)
+    assert rd.set_session_id("codex_session_id", "tid-1") is True
+    # Same value again: no rewrite, returns False (callers skip logging).
+    assert rd.set_session_id("codex_session_id", "tid-1") is False
+
+
+def test_set_session_id_overwrite_true_replaces_different_value(tmp_path):
+    rd = _make_run_dir(tmp_path)
+    assert rd.set_session_id("cursor_session_id", "first", overwrite=True) is True
+    assert rd.set_session_id("cursor_session_id", "second", overwrite=True) is True
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["cursor_session_id"] == "second"
+
+
+def test_set_session_id_overwrite_false_keeps_first_value(tmp_path):
+    rd = _make_run_dir(tmp_path)
+    assert rd.set_session_id("opencode_session_id", "first", overwrite=False) is True
+    # A later id must not clobber the established resume id.
+    assert rd.set_session_id("opencode_session_id", "second", overwrite=False) is False
+    data = json.loads(rd.daemon_json_path.read_text())
+    assert data["opencode_session_id"] == "first"
+
+
+def test_set_session_id_write_failure_propagates(tmp_path, monkeypatch):
+    rd = _make_run_dir(tmp_path)
+
+    def failing_replace(src, dst):
+        raise OSError("disk full")
+    monkeypatch.setattr("os.replace", failing_replace)
+
+    # Session-id writes deliberately do NOT swallow failures (unlike _safe
+    # mutation writes) so the run can fail and be marked failed upstream.
+    import pytest
+    with pytest.raises(OSError):
+        rd.set_session_id("claude_session_id", "sess-x")

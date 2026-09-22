@@ -116,7 +116,7 @@ def test_avatar_edges(tmp_path):
             "working_dir": child_addr,
             "address": "127.0.0.1:9001",
             "mission": "do research",
-            "capabilities": ["file", "web_search"],
+            "capabilities": ["shell", "web_search"],
             "provider": "anthropic",
             "model": "claude-3",
         },
@@ -130,7 +130,7 @@ def test_avatar_edges(tmp_path):
     assert edge.child_address == child_addr
     assert edge.child_name == "child"
     assert edge.mission == "do research"
-    assert edge.capabilities == ["file", "web_search"]
+    assert edge.capabilities == ["shell", "web_search"]
     assert edge.provider == "anthropic"
 
 
@@ -353,6 +353,35 @@ def test_mail_of(tmp_path):
     assert alice_mail[0].sender == alice_addr
 
 
+@pytest.mark.parametrize("human_addr", ["../human", "dead@example.test"])
+def test_mail_of_human_sender_and_recipient(tmp_path, human_addr):
+    agent_addr = _write_manifest(tmp_path / "agent", "agent")
+    _write_mail(tmp_path / "agent", "inbox", [
+        {
+            "from": human_addr,
+            "to": [agent_addr],
+            "subject": "question",
+            "received_at": "2026-03-20T10:00:00Z",
+        },
+    ])
+    _write_mail(tmp_path / "agent", "sent", [
+        {
+            "from": agent_addr,
+            "to": [human_addr],
+            "subject": "answer",
+            "sent_at": "2026-03-20T11:00:00Z",
+        },
+    ])
+
+    net = build_network(tmp_path)
+
+    assert human_addr not in net.nodes
+    assert {(e.sender, e.recipient) for e in net.mail_of(human_addr)} == {
+        (human_addr, agent_addr),
+        (agent_addr, human_addr),
+    }
+
+
 def test_mail_of_unknown_agent(tmp_path):
     net = build_network(tmp_path)
     assert net.mail_of("unknown") == []
@@ -377,7 +406,7 @@ def test_full_network(tmp_path):
             "working_dir": worker_addr,
             "address": "127.0.0.1:8001",
             "mission": "process data",
-            "capabilities": ["file"],
+            "capabilities": ["shell"],
         },
     ])
 

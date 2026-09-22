@@ -3,8 +3,8 @@ cover the race where a notification is dismissed before it has been
 spliced into the wire chat (still queued in tc_inbox)."""
 from __future__ import annotations
 
-from lingtai_kernel.tc_inbox import TCInbox, InvoluntaryToolCall
-from lingtai_kernel.llm.interface import ToolCallBlock, ToolResultBlock
+from lingtai.kernel.tc_inbox import TCInbox, InvoluntaryToolCall
+from lingtai.kernel.llm.interface import ToolCallBlock, ToolResultBlock
 
 
 def _make_notification_item(notif_id: str, call_id: str) -> InvoluntaryToolCall:
@@ -52,21 +52,21 @@ def test_remove_by_notif_id_idempotent():
 
 
 def test_remove_by_notif_id_skips_non_notification_items():
-    """A queued item whose call is not a notification (e.g. soul.flow) must
+    """A queued item whose call is not a notification (e.g. demo.flow) must
     not match even if a caller passes a string equal to some unrelated arg."""
     inbox = TCInbox()
-    soul_item = InvoluntaryToolCall(
+    demo_item = InvoluntaryToolCall(
         call=ToolCallBlock(
-            id="call_soul",
-            name="soul",
+            id="call_demo",
+            name="demo",
             args={"action": "flow", "fire_id": "fire_xxx"},
         ),
-        result=ToolResultBlock(id="call_soul", name="soul", content="..."),
-        source="soul.flow",
+        result=ToolResultBlock(id="call_demo", name="demo", content="..."),
+        source="demo.flow",
         enqueued_at=0.0,
         coalesce=True,
         replace_in_history=True,
     )
-    inbox.enqueue(soul_item)
+    inbox.enqueue(demo_item)
     assert inbox.remove_by_notif_id("fire_xxx") is False  # fire_id is not notif_id
     assert len(inbox) == 1

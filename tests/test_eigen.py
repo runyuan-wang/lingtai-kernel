@@ -1,91 +1,19 @@
-"""Tests for eigen intrinsic — core self-management (pad + context)."""
+"""Core context lifecycle tests. Pad mutation/load moved to file/context ownership evidence."""
 from __future__ import annotations
+from lingtai.tools.registry import INTRINSICS as _TEST_INTRINSICS
 
 from unittest.mock import MagicMock
 
 import pytest
 
-from lingtai_kernel.base_agent import BaseAgent
-
-
-def make_mock_service():
-    svc = MagicMock()
-    svc.get_adapter.return_value = MagicMock()
-    svc.provider = "gemini"
-    svc.model = "gemini-test"
-    return svc
-
-
-# ---------------------------------------------------------------------------
-# Pad edit
-# ---------------------------------------------------------------------------
-
-
-def test_psyche_pad_edit(tmp_path):
-    """eigen pad edit writes to system/pad.md."""
-    agent = BaseAgent(
-        service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
-    )
-    result = agent._intrinsics["psyche"]({"object": "pad", "action": "edit", "content": "hello world"})
-    assert result["status"] == "ok"
-    pad_path = agent._working_dir / "system" / "pad.md"
-    assert pad_path.read_text() == "hello world"
-    agent.stop(timeout=1.0)
-
-
-def test_psyche_pad_edit_empty_clears(tmp_path):
-    """psyche pad edit with explicit content='' clears the pad file."""
-    agent = BaseAgent(
-        service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
-    )
-    # First write something
-    agent._intrinsics["psyche"]({"object": "pad", "action": "edit", "content": "data"})
-    # Then clear it (must pass content="" — empty args alone is rejected)
-    result = agent._intrinsics["psyche"]({"object": "pad", "action": "edit", "content": ""})
-    assert result["status"] == "ok"
-    pad_path = agent._working_dir / "system" / "pad.md"
-    assert pad_path.read_text() == ""
-    agent.stop(timeout=1.0)
-
-
-# ---------------------------------------------------------------------------
-# Pad load
-# ---------------------------------------------------------------------------
-
-
-def test_psyche_pad_load(tmp_path):
-    """eigen pad load injects into system prompt."""
-    agent = BaseAgent(
-        service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
-    )
-    agent.start()
-    try:
-        # Write pad file first
-        system_dir = agent._working_dir / "system"
-        system_dir.mkdir(exist_ok=True)
-        (system_dir / "pad.md").write_text("loaded content")
-
-        result = agent._intrinsics["psyche"]({"object": "pad", "action": "load"})
-        assert result["status"] == "ok"
-        section = agent._prompt_manager.read_section("pad")
-        assert "loaded content" in section
-    finally:
-        agent.stop()
-
-
-def test_psyche_pad_load_empty(tmp_path):
-    """eigen pad load with empty file deletes section."""
-    agent = BaseAgent(
-        service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
-    )
-    agent.start()
-    try:
-        result = agent._intrinsics["psyche"]({"object": "pad", "action": "load"})
-        assert result["status"] == "ok"
-        section = agent._prompt_manager.read_section("pad")
-        assert section is None or section.strip() == ""
-    finally:
-        agent.stop()
+from lingtai.kernel.base_agent import BaseAgent
+from tests._service_helpers import make_gemini_mock_service as make_mock_service
+from tests._molt_helpers import write_session_journal as _write_session_journal
+from tests._workdir_lease_helpers import make_test_lease
+from tests._snapshot_helpers import make_test_snapshot_port, make_test_source_revision_port
+from tests._lifecycle_clock_helpers import make_test_lifecycle_clock
+from tests._notification_store_helpers import notification_store_for
+from tests._agent_presence_helpers import make_test_presence_store
 
 
 # ---------------------------------------------------------------------------
@@ -93,9 +21,9 @@ def test_psyche_pad_load_empty(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_psyche_molt_uses_summary(tmp_path):
+def test_context_molt_uses_summary(tmp_path):
     """molt wipes context and re-injects agent's summary."""
-    from lingtai_kernel.llm.interface import ChatInterface, TextBlock
+    from lingtai.kernel.llm.interface import ChatInterface, TextBlock
 
     svc = make_mock_service()
 
@@ -110,11 +38,14 @@ def test_psyche_molt_uses_summary(tmp_path):
     svc.create_session.side_effect = fake_create_session
 
     agent = BaseAgent(
+        intrinsics=_TEST_INTRINSICS,
         service=svc, agent_name="test", working_dir=tmp_path / "test",
+        workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test"),
     )
     agent.start()
     try:
-        from lingtai_kernel.llm.interface import ToolCallBlock
+        from lingtai.kernel.llm.interface import ToolCallBlock
 
         agent._session.ensure_session()
         agent._session._chat.interface.add_user_message("Hello")
@@ -122,23 +53,36 @@ def test_psyche_molt_uses_summary(tmp_path):
             [TextBlock(text="Hi there.")],
         )
         # Simulate the assistant turn that emitted the molt — it must be
-        # in the live interface before eigen runs (the wire layer records
+        # in the live interface before context runs (the wire layer records
         # assistant tool_calls before dispatching). _context_molt locates
         # this block by tc.id and replays it into the fresh session.
+        journal_path = _write_session_journal(agent)
         molt_wire_id = "toolu_test_molt_uses_summary"
         molt_summary = "Key finding: X=42. Task: analyze Y."
         agent._session._chat.interface.add_assistant_message([
             ToolCallBlock(
                 id=molt_wire_id,
-                name="psyche",
-                args={"object": "context", "action": "molt", "summary": molt_summary},
+                name="context",
+                args={
+                    "action": "molt",
+                    "input": {
+                        "summary": molt_summary,
+                        "session_journal_path": journal_path,
+                        "keep_tool_calls": None,
+                        "keep_last": None,
+                    },
+                },
             ),
         ])
 
-        result = agent._intrinsics["psyche"]({
-            "object": "context",
+        result = agent._intrinsics["context"]({
             "action": "molt",
-            "summary": molt_summary,
+            "input": {
+                "summary": molt_summary,
+                "session_journal_path": journal_path,
+                "keep_tool_calls": None,
+                "keep_last": None,
+            },
             "_tc_id": molt_wire_id,
         })
         assert result["status"] == "ok"
@@ -150,54 +94,106 @@ def test_psyche_molt_uses_summary(tmp_path):
         assert assistant_entries
         last_calls = [b for b in assistant_entries[-1].content if isinstance(b, ToolCallBlock)]
         assert last_calls and last_calls[0].id == molt_wire_id
-        assert "X=42" in last_calls[0].args.get("summary", "")
+        # Replayed verbatim from the agent's own envelope: the briefing lives
+        # under `input`, where the migrated schema declares it.
+        assert "X=42" in last_calls[0].args["input"]["summary"]
     finally:
         agent.stop()
 
 
-def test_psyche_molt_rejects_empty_summary(tmp_path):
+def test_context_molt_rejects_empty_summary(tmp_path):
     """molt with empty summary returns error — agent must write a real briefing."""
     agent = BaseAgent(
+        intrinsics=_TEST_INTRINSICS,
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
+        workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test"),
     )
-    result = agent._intrinsics["psyche"]({
-        "object": "context", "action": "molt", "summary": "",
+    result = agent._intrinsics["context"]({
+        "action": "molt",
+        "input": {
+            "summary": "",
+            "session_journal_path": None,
+            "keep_tool_calls": None,
+            "keep_last": None,
+        },
     })
     assert "error" in result
     assert "empty" in result["error"].lower()
     agent.stop(timeout=1.0)
 
 
-def test_psyche_molt_rejects_missing_summary(tmp_path):
+def test_context_molt_rejects_missing_summary(tmp_path):
     """molt without summary arg returns error."""
     agent = BaseAgent(
+        intrinsics=_TEST_INTRINSICS,
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
+        workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test"),
     )
-    result = agent._intrinsics["psyche"]({"object": "context", "action": "molt"})
+    result = agent._intrinsics["context"]({
+        "action": "molt",
+        "input": {
+            "summary": None,
+            "session_journal_path": None,
+            "keep_tool_calls": None,
+            "keep_last": None,
+        },
+    })
     assert "error" in result
     assert "required" in result["error"].lower()
     agent.stop(timeout=1.0)
 
 
-def test_eigen_schema_has_context_molt(tmp_path):
-    """Schema exposes context/summary without strict-incompatible combinators."""
-    from lingtai_kernel.intrinsics.psyche import get_schema
+def test_eigen_schema_has_molt(tmp_path):
+    """`molt` owns `summary` in its own strict input branch.
+
+    Pre-migration the schema was deliberately combinator-free (#114) and
+    `summary` sat on the shared flat root. The LTP v2 envelope moved it into
+    the one action that consumes it, behind the composed `allOf`/`oneOf`
+    correlation.
+    """
+    from lingtai.tools.context import get_schema
     s = get_schema("en")
-    assert "context" in s["properties"]["object"]["enum"]
-    assert "summary" in s["properties"]
-    assert {"object", "action"}.issubset(set(s["required"]))
-    for keyword in ("allOf", "oneOf", "anyOf", "not"):
-        assert keyword not in s
-
-
-def test_psyche_rejects_invalid_object_action_pair(tmp_path):
-    """Runtime validation still enforces per-object actions without schema allOf."""
-    agent = BaseAgent(
-        service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
+    assert "molt" in s["properties"]["action"]["enum"]
+    # `summary` is action input, not a root field — and not the root
+    # `summarize` post-processing control, which is a separate boolean.
+    assert "summary" not in s["properties"]
+    assert s["properties"]["summarize"]["type"] == "boolean"
+    molt_branch = next(
+        cond["then"]["properties"]["input"]
+        for cond in s["allOf"]
+        if cond["if"]["properties"]["action"]["const"] == "molt"
     )
-    result = agent._intrinsics["psyche"]({"object": "context", "action": "load"})
+    assert "summary" in molt_branch["properties"]
+    assert {"action", "input", "reasoning"} == set(s["required"])
+
+
+@pytest.mark.parametrize(
+    "invalid_action",
+    [
+        pytest.param("context_load", id="former-context-action"),
+        pytest.param("bogus_edit", id="invalid-object-action"),
+        pytest.param("pad_bogus", id="invalid-pad-action"),
+    ],
+)
+def test_context_rejects_invalid_action(tmp_path, invalid_action):
+    """Former valid-object/invalid-action pairs are now unknown actions.
+
+    Under the flat LTP v2 enum there are no object/action pairs, and none of
+    these pre-migration-shaped action names is registered. Dispatch rejects
+    each as an unknown action before any handler runs.
+    """
+    agent = BaseAgent(
+        intrinsics=_TEST_INTRINSICS,
+        service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
+        workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test"),
+    )
+    result = agent._intrinsics["context"]({"action": invalid_action, "input": {}})
     assert "error" in result
-    assert "Invalid action" in result["error"]
+    assert "Unknown context action" in result["error"]
+    # The error names the real surface, including the molt operation.
     assert "molt" in result["error"]
     agent.stop(timeout=1.0)
 
@@ -209,8 +205,8 @@ def test_psyche_rejects_invalid_object_action_pair(tmp_path):
 
 def test_eigen_forget_wipes_context(tmp_path):
     """context_forget nuclear wipes the session."""
-    from lingtai_kernel.llm.interface import ChatInterface, TextBlock
-    from lingtai_kernel.intrinsics.psyche import context_forget
+    from lingtai.kernel.llm.interface import ChatInterface, TextBlock
+    from lingtai.tools.context import context_forget
 
     svc = make_mock_service()
 
@@ -225,7 +221,10 @@ def test_eigen_forget_wipes_context(tmp_path):
     svc.create_session.side_effect = fake_create_session
 
     agent = BaseAgent(
+        intrinsics=_TEST_INTRINSICS,
         service=svc, agent_name="test", working_dir=tmp_path / "test",
+        workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test"),
     )
     agent.start()
     try:
@@ -247,31 +246,23 @@ def test_eigen_forget_wipes_context(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_eigen_unknown_object(tmp_path):
+def test_eigen_is_gone_and_psyche_is_the_durable_domain_root(tmp_path):
+    """`eigen` is gone; `context` and `psyche` are the intrinsics now.
+
+    The four former domain roots (`pad`, `lingtai`, `knowledge`, `skills`) were
+    retired into the one `psyche` root with no compatibility alias.
+    """
     agent = BaseAgent(
+        intrinsics=_TEST_INTRINSICS,
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
+        workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test"),
     )
-    result = agent._intrinsics["psyche"]({"object": "bogus", "action": "edit"})
-    assert "error" in result
-    agent.stop(timeout=1.0)
-
-
-def test_eigen_unknown_action(tmp_path):
-    agent = BaseAgent(
-        service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
-    )
-    result = agent._intrinsics["psyche"]({"object": "pad", "action": "bogus"})
-    assert "error" in result
-    agent.stop(timeout=1.0)
-
-
-def test_eigen_is_intrinsic_not_pad(tmp_path):
-    """eigen replaces pad in intrinsics."""
-    agent = BaseAgent(
-        service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
-    )
+    assert "context" in agent._intrinsics
     assert "psyche" in agent._intrinsics
     assert "pad" not in agent._intrinsics
+    assert "lingtai" not in agent._intrinsics
+    assert "eigen" not in agent._intrinsics
     agent.stop(timeout=1.0)
 
 
@@ -280,10 +271,10 @@ def test_eigen_is_intrinsic_not_pad(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_eigen_name_sets_agent_name(tmp_path):
-    """eigen name action sets agent true name."""
-    agent = BaseAgent(service=make_mock_service(), working_dir=tmp_path / "test")
+    """The system name action sets the agent's true name."""
+    agent = BaseAgent(intrinsics=_TEST_INTRINSICS, service=make_mock_service(), working_dir=tmp_path / "test", workdir_lease=make_test_lease(), agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test"))
     assert agent.agent_name is None
-    result = agent._intrinsics["psyche"]({"object": "name", "action": "set", "content": "悟空"})
+    result = agent._intrinsics["system"]({"action": "name_set", "input": {"content": "悟空"}})
     assert result["status"] == "ok"
     assert result["name"] == "悟空"
     assert agent.agent_name == "悟空"
@@ -291,25 +282,25 @@ def test_eigen_name_sets_agent_name(tmp_path):
 
 
 def test_eigen_name_rejects_second_set(tmp_path):
-    """eigen name action fails if already named."""
-    agent = BaseAgent(service=make_mock_service(), working_dir=tmp_path / "test", agent_name="alice")
-    result = agent._intrinsics["psyche"]({"object": "name", "action": "set", "content": "bob"})
+    """The system name action fails if already named."""
+    agent = BaseAgent(intrinsics=_TEST_INTRINSICS, service=make_mock_service(), working_dir=tmp_path / "test", agent_name="alice", workdir_lease=make_test_lease(), agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test"))
+    result = agent._intrinsics["system"]({"action": "name_set", "input": {"content": "bob"}})
     assert "error" in result
     assert agent.agent_name == "alice"  # unchanged
     agent.stop(timeout=1.0)
 
 
 def test_eigen_name_rejects_empty(tmp_path):
-    """eigen name action fails with empty name."""
-    agent = BaseAgent(service=make_mock_service(), working_dir=tmp_path / "test")
-    result = agent._intrinsics["psyche"]({"object": "name", "action": "set", "content": ""})
+    """The system name action fails with an empty name."""
+    agent = BaseAgent(intrinsics=_TEST_INTRINSICS, service=make_mock_service(), working_dir=tmp_path / "test", workdir_lease=make_test_lease(), agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test"))
+    result = agent._intrinsics["system"]({"action": "name_set", "input": {"content": ""}})
     assert "error" in result
     assert agent.agent_name is None  # still unnamed
     agent.stop(timeout=1.0)
 
 
 # ---------------------------------------------------------------------------
-# Molt snapshots — discrete pre-molt interface dumps for past-self consultation
+# Molt snapshots — discrete pre-molt interface dumps for audit and recovery
 # ---------------------------------------------------------------------------
 
 
@@ -317,7 +308,7 @@ def _agent_with_session(tmp_path):
     """Build a BaseAgent with a mock session that uses a real ChatInterface
     so molt code can actually walk and serialize entries. Returns the agent;
     caller is responsible for stop()."""
-    from lingtai_kernel.llm.interface import ChatInterface
+    from lingtai.kernel.llm.interface import ChatInterface
 
     svc = make_mock_service()
 
@@ -332,7 +323,10 @@ def _agent_with_session(tmp_path):
     svc.create_session.side_effect = fake_create_session
 
     agent = BaseAgent(
+        intrinsics=_TEST_INTRINSICS,
         service=svc, agent_name="snapshot-test", working_dir=tmp_path / "snapshot-test",
+        workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "snapshot-test"),
     )
     agent.start()
     return agent
@@ -341,7 +335,7 @@ def _agent_with_session(tmp_path):
 def test_snapshot_written_on_agent_molt(tmp_path):
     """Agent-initiated molt drops a discrete snapshot file under history/snapshots/."""
     import json
-    from lingtai_kernel.llm.interface import TextBlock, ToolCallBlock
+    from lingtai.kernel.llm.interface import TextBlock, ToolCallBlock
 
     agent = _agent_with_session(tmp_path)
     try:
@@ -351,18 +345,33 @@ def test_snapshot_written_on_agent_molt(tmp_path):
         iface.add_assistant_message([TextBlock(text="Hi.")])
 
         # The molt's own tool_call lives in the tail entry pre-molt.
+        journal_path = _write_session_journal(agent)
         molt_id = "toolu_test_snapshot_agent"
         molt_summary = "Briefing: completed task X, next is Y."
         iface.add_assistant_message([
             ToolCallBlock(
-                id=molt_id, name="psyche",
-                args={"object": "context", "action": "molt", "summary": molt_summary},
+                id=molt_id, name="context",
+                args={
+                    "action": "molt",
+                    "input": {
+                        "summary": molt_summary,
+                        "session_journal_path": journal_path,
+                        "keep_tool_calls": None,
+                        "keep_last": None,
+                    },
+                },
             ),
         ])
 
-        result = agent._intrinsics["psyche"]({
-            "object": "context", "action": "molt",
-            "summary": molt_summary, "_tc_id": molt_id,
+        result = agent._intrinsics["context"]({
+            "action": "molt",
+            "input": {
+                "summary": molt_summary,
+                "session_journal_path": journal_path,
+                "keep_tool_calls": None,
+                "keep_last": None,
+            },
+            "_tc_id": molt_id,
         })
         assert result["status"] == "ok"
 
@@ -405,8 +414,8 @@ def test_snapshot_written_on_agent_molt(tmp_path):
 def test_snapshot_written_on_system_forget(tmp_path):
     """System-initiated context_forget also writes a snapshot, source != 'agent'."""
     import json
-    from lingtai_kernel.llm.interface import TextBlock
-    from lingtai_kernel.intrinsics.psyche import context_forget
+    from lingtai.kernel.llm.interface import TextBlock
+    from lingtai.tools.context import context_forget
 
     agent = _agent_with_session(tmp_path)
     try:
@@ -436,7 +445,7 @@ def test_snapshot_written_on_system_forget(tmp_path):
 
 def test_snapshot_filename_uses_molt_count(tmp_path):
     """Successive molts produce successive molt_count values in filenames."""
-    from lingtai_kernel.intrinsics.psyche import context_forget
+    from lingtai.tools.context import context_forget
 
     agent = _agent_with_session(tmp_path)
     try:
@@ -461,7 +470,7 @@ def test_snapshot_filename_uses_molt_count(tmp_path):
 def test_snapshot_helper_swallows_failures(tmp_path):
     """_write_molt_snapshot is best-effort — it returns None on any failure
     rather than propagating, so a broken disk can't block a molt."""
-    from lingtai_kernel.intrinsics import psyche
+    from lingtai.tools import context
 
     # Block the snapshots dir by planting a file where its parent should be.
     (tmp_path / "history").write_text("blocker — not a directory")
@@ -471,7 +480,7 @@ def test_snapshot_helper_swallows_failures(tmp_path):
     broken_agent._agent_id = "x"
     broken_agent._agent_name = "x"
 
-    result = psyche._write_molt_snapshot(
+    result = context._write_molt_snapshot(
         broken_agent, MagicMock(),
         before_tokens=100, summary="x", source="agent", molt_count=1,
     )

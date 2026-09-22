@@ -1,10 +1,15 @@
 """Tests for lingtai.services.logging."""
 import json
+from lingtai.tools.registry import INTRINSICS as _TEST_INTRINSICS
 import sqlite3
 import threading
 from pathlib import Path
 
-from lingtai_kernel.services.logging import (
+import pytest
+
+from lingtai.adapters.posix.event_journal import PosixJsonlEventJournalAdapter
+from lingtai.adapters.posix.workdir_lease import PosixWorkdirLeaseAdapter
+from lingtai.kernel.services.logging import (
     CompositeLoggingService,
     JSONLLoggingService,
     LoggingService,
@@ -13,6 +18,16 @@ from lingtai_kernel.services.logging import (
     query_sqlite_event_index,
     rebuild_sqlite_event_index,
 )
+from tests._service_helpers import make_tool_result_mock_service as make_mock_service
+from tests._snapshot_helpers import make_test_snapshot_port, make_test_source_revision_port
+from tests._lifecycle_clock_helpers import make_test_lifecycle_clock
+from tests._notification_store_helpers import notification_store_for
+from tests._agent_presence_helpers import make_test_presence_store
+
+
+def _read_durable_events(agent) -> list[dict]:
+    path = agent.working_dir / "logs" / "events.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 class TestJSONLLoggingService:
@@ -54,6 +69,31 @@ class TestJSONLLoggingService:
         svc.close()
         svc.log({"type": "test"})  # should not raise
         assert log_file.read_text().strip() == ""
+
+    def test_close_during_log_serialization_is_noop(self, tmp_path):
+        """A close() that lands after the pre-lock _closed check must not make
+        log() write to (or tell/flush) an already-closed file.
+
+        This reproduces the close/log interleaving deterministically: log()
+        serializes the event with ``default=str`` before taking the write lock,
+        so an object whose ``__str__`` closes the service closes the file inside
+        that window. Without lock-guarded close/write, log() then touches a
+        closed file and raises ValueError.
+        """
+        log_file = tmp_path / "test.jsonl"
+        svc = JSONLLoggingService(log_file)
+
+        class ClosesOnStr:
+            def __str__(self) -> str:
+                svc.close()
+                return "closed-during-serialization"
+
+        result = svc.log({"type": "test", "trigger": ClosesOnStr()})
+
+        # The service closed mid-log, so nothing should have been written and
+        # the call must report "not written" rather than raise.
+        assert result is None
+        assert log_file.read_text() == ""
 
     def test_creates_parent_dirs(self, tmp_path):
         """Parent directories are created if they don't exist."""
@@ -113,28 +153,27 @@ class TestJSONLLoggingService:
 # ---------------------------------------------------------------------------
 
 from unittest.mock import MagicMock
-from lingtai_kernel import BaseAgent, AgentState
-from lingtai_kernel.llm import ToolCall
-from lingtai_kernel.loop_guard import LoopGuard
+from lingtai.kernel import BaseAgent, AgentState
+from lingtai.kernel.llm import ToolCall
+from lingtai.kernel.loop_guard import LoopGuard
+from tests._workdir_lease_helpers import make_test_lease
 
 
-def make_mock_service():
-    svc = MagicMock()
-    svc.model = "test-model"
-    svc.make_tool_result.return_value = {"role": "tool", "content": "ok"}
-    return svc
 
 
 class TestBaseAgentLoggingIntegration:
 
     def test_tool_call_logged(self, tmp_path):
         """Executing a tool logs tool_call and tool_result events."""
-        from lingtai_kernel.tool_executor import ToolExecutor
+        from lingtai.kernel.tool_executor import ToolExecutor
 
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            event_journal=PosixJsonlEventJournalAdapter(tmp_path / "test_agent"), workdir_lease=make_test_lease(),
+        snapshot_port=make_test_snapshot_port(), agent_presence=make_test_presence_store(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         agent.add_tool("greet", schema={"type": "object", "properties": {}}, handler=lambda args: {"status": "ok"})
 
@@ -155,7 +194,7 @@ class TestBaseAgentLoggingIntegration:
         # Log file should exist in working dir
         log_file = agent.working_dir / "logs" / "events.jsonl"
         assert log_file.is_file()
-        events = agent._log_service.get_events()
+        events = _read_durable_events(agent)
         types = [e["type"] for e in events]
         assert "tool_call" in types
         assert "tool_result" in types
@@ -164,48 +203,20 @@ class TestBaseAgentLoggingIntegration:
         # Verify ts is present
         assert all("ts" in e for e in events)
 
-    def test_auto_logging_to_working_dir(self, tmp_path):
-        """Agent always creates JSONL log in working dir."""
-        from lingtai_kernel.tool_executor import ToolExecutor
-
-        agent = BaseAgent(
-            service=make_mock_service(),
-            agent_name="test",
-            working_dir=tmp_path / "test_agent",
-        )
-        agent.add_tool("greet", schema={"type": "object", "properties": {}}, handler=lambda args: {"status": "ok"})
-
-        guard = LoopGuard()
-        errors = []
-        tc = ToolCall(name="greet", args={})
-        executor = ToolExecutor(
-            dispatch_fn=agent._dispatch_tool,
-            make_tool_result_fn=lambda name, result, **kw: agent.service.make_tool_result(
-                name, result, provider=agent._config.provider, **kw
-            ),
-            guard=guard,
-            known_tools=set(agent._intrinsics) | set(agent._tool_handlers),
-            logger_fn=agent._log,
-        )
-        executor.execute([tc], collected_errors=errors)
-
-        # Log file should exist in working dir
-        log_file = agent.working_dir / "logs" / "events.jsonl"
-        assert log_file.is_file()
-        events = agent._log_service.get_events()
-        types = [e["type"] for e in events]
-        assert "tool_call" in types
 
     def test_state_change_logged(self, tmp_path):
         """State transitions are logged."""
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            event_journal=PosixJsonlEventJournalAdapter(tmp_path / "test_agent"), workdir_lease=make_test_lease(),
+        snapshot_port=make_test_snapshot_port(), agent_presence=make_test_presence_store(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         agent._set_state(AgentState.ACTIVE, reason="test")
 
-        events = agent._log_service.get_events()
+        events = _read_durable_events(agent)
         state_events = [e for e in events if e["type"] == "agent_state"]
         assert len(state_events) >= 1
 
@@ -241,17 +252,6 @@ class TestSQLiteEventIndex:
         rows = query_sqlite_event_index(tmp_path, "SELECT type FROM events WHERE type='after_close'")
         assert rows == []
 
-    def test_sqlite_sidecar_fail_open(self, tmp_path):
-        log_file = tmp_path / "events.jsonl"
-        index = SQLiteEventIndex(tmp_path / "log.sqlite")
-        index.disable("simulated")
-        svc = CompositeLoggingService(JSONLLoggingService(log_file), sqlite_index=index)
-
-        svc.log({"type": "test", "ts": 1})
-        svc.close()
-
-        assert json.loads(log_file.read_text().strip())["type"] == "test"
-        assert index.disabled_reason == "simulated"
 
     def test_sqlite_sidecar_coerces_invalid_timestamp(self, tmp_path):
         log_file = tmp_path / "events.jsonl"
@@ -314,7 +314,7 @@ class TestSQLiteEventIndex:
             encoding="utf-8",
         )
 
-        result = rebuild_sqlite_event_index(tmp_path)
+        result = rebuild_sqlite_event_index(tmp_path, workdir_lease=PosixWorkdirLeaseAdapter(tmp_path))
         assert result["status"] == "ok"
         assert result["event_count"] == 2
 
@@ -322,8 +322,10 @@ class TestSQLiteEventIndex:
         assert doctor["status"] == "ok"
         assert doctor["event_count"] == 2
         assert doctor["chat_entry_count"] == 0
+        assert doctor["token_entry_count"] == 0
         assert doctor["schema_current"] is True
         assert 2 in doctor["schema_versions"]
+        assert 3 in doctor["schema_versions"]
 
         rows = query_sqlite_event_index(tmp_path, "SELECT type, agent_address, agent_name_snapshot, json_extract(fields_json, '$.x') AS x FROM events ORDER BY ts")
         assert rows == [
@@ -336,12 +338,15 @@ class TestSQLiteEventIndex:
 
     def test_base_agent_creates_sqlite_sidecar(self, tmp_path):
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            event_journal=PosixJsonlEventJournalAdapter(tmp_path / "test_agent"), workdir_lease=make_test_lease(),
+        snapshot_port=make_test_snapshot_port(), agent_presence=make_test_presence_store(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         agent._log("custom", value=123)
-        agent._log_service.close()
+        agent._event_journal.close()
 
         sqlite_file = agent.working_dir / "logs" / "log.sqlite"
         assert sqlite_file.is_file()
@@ -367,21 +372,19 @@ class TestSQLiteEventIndex:
         assert result["status"] == "missing"
         assert not (logs / "log.sqlite").exists()
 
-    def test_doctor_existing_sqlite_does_not_create_wal_or_mutate_mtime(self, tmp_path):
+    def test_doctor_existing_sqlite_does_not_mutate_mtime(self, tmp_path):
         logs = tmp_path / "logs"
         logs.mkdir()
         (logs / "events.jsonl").write_text(json.dumps({"type": "alpha", "ts": 1}) + "\n", encoding="utf-8")
-        rebuild_sqlite_event_index(tmp_path)
+        rebuild_sqlite_event_index(tmp_path, workdir_lease=PosixWorkdirLeaseAdapter(tmp_path))
         sqlite_file = logs / "log.sqlite"
         before_mtime = sqlite_file.stat().st_mtime_ns
-        for suffix in ("-wal", "-shm"):
-            (logs / ("log.sqlite" + suffix)).unlink(missing_ok=True)
+        assert not (logs / "log.sqlite-wal").exists()
+        assert not (logs / "log.sqlite-shm").exists()
 
         result = doctor_sqlite_event_index(tmp_path)
         assert result["status"] == "ok"
         assert sqlite_file.stat().st_mtime_ns == before_mtime
-        assert not (logs / "log.sqlite-wal").exists()
-        assert not (logs / "log.sqlite-shm").exists()
 
 
     def test_read_only_query_sees_live_wal_rows(self, tmp_path):
@@ -397,6 +400,30 @@ class TestSQLiteEventIndex:
             assert doctor["event_count"] == 1
         finally:
             index.close()
+
+    def test_read_only_reader_sees_later_keep_open_false_writer_commit(self, tmp_path):
+        sqlite_file = tmp_path / "logs" / "log.sqlite"
+        writer = SQLiteEventIndex(sqlite_file, keep_open=False)
+        writer.log_event({"type": "before", "ts": 1})
+        writer.close()
+
+        assert not sqlite_file.with_name("log.sqlite-wal").exists()
+        assert not sqlite_file.with_name("log.sqlite-shm").exists()
+
+        reader = SQLiteEventIndex(sqlite_file, ensure=False)
+        try:
+            assert reader.query("SELECT type FROM events ORDER BY ts") == [{"type": "before"}]
+
+            later_writer = SQLiteEventIndex(sqlite_file, keep_open=False)
+            later_writer.log_event({"type": "after", "ts": 2})
+            later_writer.close()
+
+            assert reader.query("SELECT type FROM events ORDER BY ts") == [
+                {"type": "before"},
+                {"type": "after"},
+            ]
+        finally:
+            reader.close()
 
     def test_query_accepts_read_only_cte_and_explain(self, tmp_path):
         index = SQLiteEventIndex(tmp_path / "logs" / "log.sqlite")
@@ -416,7 +443,7 @@ class TestSQLiteEventIndex:
     def test_rebuild_missing_agent_dir_does_not_materialize_path(self, tmp_path):
         missing = tmp_path / "missing-agent"
         try:
-            rebuild_sqlite_event_index(missing)
+            rebuild_sqlite_event_index(missing, workdir_lease=PosixWorkdirLeaseAdapter(missing))
             assert False, "missing agent dir should fail before lock setup"
         except FileNotFoundError as exc:
             assert "agent directory not found" in str(exc)
@@ -446,7 +473,7 @@ class TestSQLiteEventIndex:
             encoding="utf-8",
         )
 
-        result = rebuild_sqlite_event_index(tmp_path)
+        result = rebuild_sqlite_event_index(tmp_path, workdir_lease=PosixWorkdirLeaseAdapter(tmp_path))
         assert result["event_count"] == 2
         assert result["chat_entry_count"] == 3
         assert result["source_count"] == 5
@@ -485,7 +512,7 @@ class TestSQLiteEventIndex:
             encoding="utf-8",
         )
 
-        result = rebuild_sqlite_event_index(tmp_path)
+        result = rebuild_sqlite_event_index(tmp_path, workdir_lease=PosixWorkdirLeaseAdapter(tmp_path))
         assert result["event_count"] == 0
         assert result["chat_entry_count"] == 2
 
@@ -539,9 +566,90 @@ class TestSQLiteEventIndex:
         doctor = doctor_sqlite_event_index(tmp_path)
         assert doctor["schema_current"] is True
         assert 2 in doctor["schema_versions"]
+        assert 3 in doctor["schema_versions"]
         rows = query_sqlite_event_index(tmp_path, "SELECT type, source_kind FROM events")
         assert rows == [{"type": "old", "source_kind": None}]
         assert query_sqlite_event_index(tmp_path, "SELECT COUNT(*) AS n FROM chat_entries") == [{"n": 0}]
+        assert query_sqlite_event_index(tmp_path, "SELECT COUNT(*) AS n FROM token_entries") == [{"n": 0}]
+
+    def test_rebuild_indexes_token_ledger_sources(self, tmp_path):
+        logs = tmp_path / "logs"
+        daemon_logs = tmp_path / "daemons" / "em-1-20260531-030000-abcdef" / "logs"
+        logs.mkdir(parents=True)
+        daemon_logs.mkdir(parents=True)
+        (logs / "token_ledger.jsonl").write_text(
+            json.dumps({
+                "ts": "2026-05-31T03:00:00Z",
+                "input": 100,
+                "output": 20,
+                "thinking": 5,
+                "cached": 40,
+                "source": "main",
+                "api_call_id": "api_agent",
+                "model": "gpt-agent",
+                "endpoint": "https://agent.example",
+            }) + "\n",
+            encoding="utf-8",
+        )
+        (daemon_logs / "token_ledger.jsonl").write_text(
+            json.dumps({
+                "ts": "2026-05-31T03:01:00Z",
+                "input": 11,
+                "output": 4,
+                "thinking": 0,
+                "cached": 3,
+                "source": "daemon",
+                "em_id": "em-1",
+                "run_id": "em-1-20260531-030000-abcdef",
+                "api_call_id": "api_daemon",
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        result = rebuild_sqlite_event_index(tmp_path, workdir_lease=PosixWorkdirLeaseAdapter(tmp_path))
+        assert result["event_count"] == 0
+        assert result["chat_entry_count"] == 0
+        assert result["token_entry_count"] == 2
+        assert result["source_count"] == 2
+
+        rows = query_sqlite_event_index(
+            tmp_path,
+            """
+            SELECT input_tokens, output_tokens, thinking_tokens, cached_tokens,
+                   source, api_call_id, model, endpoint, source_kind, scope, run_id
+            FROM token_entries ORDER BY ts
+            """,
+        )
+        assert rows == [
+            {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "thinking_tokens": 5,
+                "cached_tokens": 40,
+                "source": "main",
+                "api_call_id": "api_agent",
+                "model": "gpt-agent",
+                "endpoint": "https://agent.example",
+                "source_kind": "agent_token_ledger",
+                "scope": "agent",
+                "run_id": None,
+            },
+            {
+                "input_tokens": 11,
+                "output_tokens": 4,
+                "thinking_tokens": 0,
+                "cached_tokens": 3,
+                "source": "daemon",
+                "api_call_id": "api_daemon",
+                "model": None,
+                "endpoint": None,
+                "source_kind": "daemon_token_ledger",
+                "scope": "daemon",
+                "run_id": "em-1-20260531-030000-abcdef",
+            },
+        ]
+        doctor = doctor_sqlite_event_index(tmp_path)
+        assert doctor["token_entry_count"] == 2
 
     def test_rebuild_preserves_runtime_rows_without_duplicates(self, tmp_path):
         log_file = tmp_path / "logs" / "events.jsonl"
@@ -555,7 +663,7 @@ class TestSQLiteEventIndex:
         svc.close()
 
         assert query_sqlite_event_index(tmp_path, "SELECT COUNT(*) AS n FROM events") == [{"n": 2}]
-        result = rebuild_sqlite_event_index(tmp_path)
+        result = rebuild_sqlite_event_index(tmp_path, workdir_lease=PosixWorkdirLeaseAdapter(tmp_path))
         assert result["event_count"] == 2
         rows = query_sqlite_event_index(tmp_path, "SELECT type FROM events ORDER BY ts")
         assert rows == [{"type": "first"}, {"type": "second"}]
@@ -569,7 +677,7 @@ class TestSQLiteEventIndex:
             encoding="utf-8",
         )
 
-        result = rebuild_sqlite_event_index(tmp_path)
+        result = rebuild_sqlite_event_index(tmp_path, workdir_lease=PosixWorkdirLeaseAdapter(tmp_path))
         assert result["event_count"] == 2
         rows = query_sqlite_event_index(
             tmp_path,
@@ -600,19 +708,72 @@ class TestSQLiteEventIndex:
         ]
         assert index.disabled_reason == "simulated"
 
-    def test_rebuild_requires_offline_agent_lock(self, tmp_path):
-        from lingtai_kernel.workdir import WorkingDir
-
+    def test_rebuild_requires_offline_agent_lease(self, tmp_path):
         logs = tmp_path / "logs"
         logs.mkdir()
         (logs / "events.jsonl").write_text(json.dumps({"type": "alpha", "ts": 1}) + "\n", encoding="utf-8")
-        lock = WorkingDir(tmp_path)
-        lock.acquire_lock(timeout=0)
+        # A live agent holds the workdir lease; the rebuild's own lease must
+        # contend and fail immediately (timeout=0) rather than corrupt state.
+        held = PosixWorkdirLeaseAdapter(tmp_path)
+        held.acquire(0)
         try:
-            try:
-                rebuild_sqlite_event_index(tmp_path)
-                assert False, "rebuild should require offline lock"
-            except RuntimeError as exc:
-                assert "stopped/offline" in str(exc)
+            with pytest.raises(RuntimeError) as excinfo:
+                rebuild_sqlite_event_index(tmp_path, workdir_lease=PosixWorkdirLeaseAdapter(tmp_path))
+            # Pin the exact CLI-visible wrapper wording. The historical phrase is
+            # "could not acquire rebuild lock ..." — preserved as a user-facing
+            # string even though the internal architecture term is now "lease".
+            resolved = tmp_path.resolve()
+            message = str(excinfo.value)
+            assert message == (
+                "sqlite log rebuild requires the agent to be stopped/offline; "
+                f"could not acquire rebuild lock for {resolved}: "
+                f"Working directory '{resolved}' is already in use by another agent. "
+                "Each agent needs its own directory."
+            )
         finally:
-            lock.release_lock()
+            held.release()
+
+    def _seed_rebuild_sources(self, tmp_path):
+        logs = tmp_path / "logs"
+        logs.mkdir()
+        (logs / "events.jsonl").write_text(
+            json.dumps({"type": "alpha", "ts": 1}) + "\n", encoding="utf-8"
+        )
+
+    def test_rebuild_releases_lease_on_post_acquire_setup_failure(self, tmp_path, monkeypatch):
+        """A failure in post-acquire setup (temp-dir creation) must still release
+        the lease exactly once — the acquire is not stranded outside a finally."""
+        import lingtai.kernel.services.logging as logging_mod
+        from tests._workdir_lease_helpers import RecordingWorkdirLease
+
+        self._seed_rebuild_sources(tmp_path)
+
+        def boom(*args, **kwargs):
+            raise OSError("disk full")
+
+        # mkdtemp runs after acquisition but before the rebuild's own try-block —
+        # the exact hole the reviewer probed (acquires:[0] releases:0).
+        monkeypatch.setattr(logging_mod.tempfile, "mkdtemp", boom)
+        lease = RecordingWorkdirLease()
+        with pytest.raises(OSError, match="disk full"):
+            rebuild_sqlite_event_index(tmp_path, workdir_lease=lease)
+        assert lease.acquires == [0]
+        assert lease.releases == 1  # released despite the setup failure
+
+    def test_rebuild_releases_lease_on_in_rebuild_failure(self, tmp_path, monkeypatch):
+        """A failure during the rebuild itself must release the lease exactly once."""
+        import lingtai.kernel.services.logging as logging_mod
+        from tests._workdir_lease_helpers import RecordingWorkdirLease
+
+        self._seed_rebuild_sources(tmp_path)
+
+        class BoomIndex:
+            def __init__(self, *args, **kwargs):
+                raise sqlite3.DatabaseError("rebuild exploded")
+
+        monkeypatch.setattr(logging_mod, "SQLiteEventIndex", BoomIndex)
+        lease = RecordingWorkdirLease()
+        with pytest.raises(sqlite3.DatabaseError, match="rebuild exploded"):
+            rebuild_sqlite_event_index(tmp_path, workdir_lease=lease)
+        assert lease.acquires == [0]
+        assert lease.releases == 1

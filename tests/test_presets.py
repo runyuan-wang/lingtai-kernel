@@ -6,9 +6,6 @@ from pathlib import Path
 import pytest
 
 from lingtai.presets import (
-    discover_presets,
-    discover_presets_in_dirs,
-    load_preset,
     default_presets_path,
     expand_inherit,
     home_shortened,
@@ -17,6 +14,14 @@ from lingtai.presets import (
     resolve_preset_name,
     resolve_allowed_presets,
     TIER_VALUES,
+)
+# The preset library's migration-capable entry points now require an injected
+# workspace runner/loader (no production default); these test wrappers supply
+# the production POSIX composition so behavior assertions stay unchanged.
+from tests._migration_workspace_helpers import (
+    discover_presets,
+    discover_presets_in_dirs,
+    load_preset,
 )
 
 
@@ -113,7 +118,7 @@ def _valid_preset(name: str = "test") -> dict:
         "manifest": {
             "llm": {"provider": "deepseek", "model": "deepseek-v4-flash",
                     "api_key": None, "api_key_env": "DEEPSEEK_API_KEY"},
-            "capabilities": {"file": {}, "email": {}},
+            "capabilities": {"shell": {}, "email": {}},
         },
     }
 
@@ -179,7 +184,7 @@ def test_load_preset_jsonc_strips_comments(tmp_path):
       "description": {"summary": "tests JSONC"},
       "manifest": {
         "llm": {"provider": "x", "model": "y"},
-        "capabilities": {"file": {}},   // trailing comma here
+        "capabilities": {"shell": {}},   // trailing comma here
       },
     }'''
     p = tmp_path / "withcomments.jsonc"
@@ -269,14 +274,35 @@ def test_load_preset_relocates_legacy_root_context_limit(tmp_path):
     assert on_disk["manifest"]["llm"]["context_limit"] == 32768
 
 
-def test_load_preset_rejects_context_limit_at_manifest_root(tmp_path):
-    """Ambiguous preset (both locations populated) is skipped by migration
-    and rejected by the validator with a pointer to the canonical location.
-    """
-    from lingtai_kernel.migrate.migrate import reset_process_cache
+def test_load_preset_drops_duplicate_legacy_root_context_limit(tmp_path):
+    """Both locations with the same value are accepted in memory."""
+    from lingtai.kernel.migrate.migrate import reset_process_cache
     reset_process_cache()
     p = {
         "name": "dup",
+        "description": _DESC,
+        "manifest": {
+            "llm": {"provider": "x", "model": "y", "context_limit": 32768},
+            "capabilities": {},
+            "context_limit": 32768,
+        },
+    }
+    f = tmp_path / "dup.json"
+    f.write_text(json.dumps(p))
+
+    loaded = load_preset(str(f))
+
+    assert preset_context_limit(loaded["manifest"]) == 32768
+    assert "context_limit" not in loaded["manifest"]
+
+
+def test_load_preset_conflicting_legacy_root_context_limit_preserves_llm(tmp_path):
+    """When both locations disagree, canonical manifest.llm wins."""
+    from lingtai.kernel.migrate.migrate import reset_process_cache
+    reset_process_cache()
+    p = {
+        "name": "dup",
+        "description": _DESC,
         "manifest": {
             "llm": {"provider": "x", "model": "y", "context_limit": 16384},
             "capabilities": {},
@@ -285,8 +311,12 @@ def test_load_preset_rejects_context_limit_at_manifest_root(tmp_path):
     }
     f = tmp_path / "dup.json"
     f.write_text(json.dumps(p))
-    with pytest.raises(ValueError, match="manifest.llm"):
-        load_preset(str(f))
+
+    loaded = load_preset(str(f))
+
+    assert preset_context_limit(loaded["manifest"]) == 16384
+    assert loaded["manifest"]["llm"]["context_limit"] == 16384
+    assert "context_limit" not in loaded["manifest"]
 
 
 def test_load_preset_rejects_non_integer_context_limit(tmp_path):
@@ -301,6 +331,139 @@ def test_load_preset_rejects_non_integer_context_limit(tmp_path):
     f.write_text(json.dumps(p))
     with pytest.raises(ValueError, match="integer"):
         load_preset(str(f))
+
+
+@pytest.mark.parametrize("value", ["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+def test_load_preset_accepts_thinking_values(tmp_path, value):
+    p = {
+        "name": "thinking",
+        "description": _DESC,
+        "manifest": {
+            "llm": {"provider": "codex", "model": "gpt-5.5", "thinking": value},
+            "capabilities": {},
+        },
+    }
+    f = tmp_path / "thinking.json"
+    f.write_text(json.dumps(p))
+
+    loaded = load_preset(str(f))
+
+    assert loaded["manifest"]["llm"]["thinking"] == value
+
+
+@pytest.mark.parametrize("value", ["default", "ultra", 1, None])
+def test_load_preset_rejects_invalid_thinking(tmp_path, value):
+    p = {
+        "name": "bad",
+        "description": _DESC,
+        "manifest": {
+            "llm": {"provider": "codex", "model": "gpt-5.5", "thinking": value},
+            "capabilities": {},
+        },
+    }
+    f = tmp_path / "bad.json"
+    f.write_text(json.dumps(p))
+
+    with pytest.raises(ValueError, match="manifest.llm.thinking"):
+        load_preset(str(f))
+
+
+@pytest.mark.parametrize("value", ["high"])
+def test_load_preset_accepts_thinking_for_anthropic(tmp_path, value):
+    """The Anthropic adapter maps thinking to a budget, so the level is real."""
+    p = {
+        "name": "anthropic-thinking",
+        "description": _DESC,
+        "manifest": {
+            "llm": {"provider": "anthropic", "model": "claude", "thinking": value},
+            "capabilities": {},
+        },
+    }
+    f = tmp_path / "anthropic-thinking.json"
+    f.write_text(json.dumps(p))
+
+    loaded = load_preset(str(f))
+
+    assert loaded["manifest"]["llm"]["thinking"] == value
+
+
+@pytest.mark.parametrize(
+    "llm",
+    [
+        # Custom OpenAI-compatible on either wire — Responses sends
+        # reasoning.effort, Chat Completions sends reasoning_effort.
+        {"provider": "custom", "model": "m", "api_compat": "openai"},
+        {
+            "provider": "custom",
+            "model": "m",
+            "api_compat": "openai",
+            "wire_api": "chat_completions",
+        },
+        # Built-in OpenAI-wire providers, with api_compat left implicit.
+        {"provider": "openai", "model": "m", "wire_api": "responses"},
+        {"provider": "openai", "model": "m"},
+        {"provider": "deepseek", "model": "deepseek-reasoner"},
+    ],
+)
+def test_load_preset_accepts_thinking_for_openai_compatible(tmp_path, llm):
+    llm["thinking"] = "high"
+    p = {
+        "name": "openai-compatible",
+        "description": _DESC,
+        "manifest": {"llm": llm, "capabilities": {}},
+    }
+    f = tmp_path / "openai-compatible.json"
+    f.write_text(json.dumps(p))
+
+    loaded = load_preset(str(f))
+
+    assert loaded["manifest"]["llm"]["thinking"] == "high"
+
+
+@pytest.mark.parametrize(
+    "llm",
+    [
+        {"provider": "gemini", "model": "m"},
+        {"provider": "minimax", "model": "m"},
+        {
+            "provider": "custom",
+            "model": "m",
+            "api_compat": "gemini",
+            "wire_api": "auto",
+        },
+    ],
+)
+def test_load_preset_rejects_thinking_outside_thinking_capable_scope(tmp_path, llm):
+    llm["thinking"] = "high"
+    p = {
+        "name": "bad-scope",
+        "description": _DESC,
+        "manifest": {"llm": llm, "capabilities": {}},
+    }
+    f = tmp_path / "bad-scope.json"
+    f.write_text(json.dumps(p))
+
+    with pytest.raises(ValueError, match="thinking-capable providers"):
+        load_preset(str(f))
+
+
+@pytest.mark.parametrize("provider", ["codex-pool", "codex_pool"])
+def test_load_preset_accepts_thinking_for_codex_pool(tmp_path, provider):
+    """A saved/builtin-style codex-pool preset may carry thinking."""
+    p = {
+        "name": "pool",
+        "description": _DESC,
+        "manifest": {
+            "llm": {"provider": provider, "model": "gpt-5.5", "thinking": "xhigh"},
+            "capabilities": {},
+        },
+    }
+    f = tmp_path / "pool.json"
+    f.write_text(json.dumps(p))
+
+    loaded = load_preset(str(f))
+
+    assert loaded["manifest"]["llm"]["thinking"] == "xhigh"
 
 
 def test_preset_context_limit_reads_from_llm_block():
@@ -329,13 +492,13 @@ def test_expand_inherit_resolves_to_main_llm():
     caps = {
         "web_search": {"provider": "inherit"},
         "vision":     {"provider": "inherit"},
-        "file":       {},
+        "shell":      {},
     }
     expand_inherit(caps, main_llm)
     assert caps["web_search"]["provider"] == "gemini"
     assert caps["web_search"]["api_key_env"] == "GEMINI_API_KEY"
     assert caps["vision"]["provider"] == "gemini"
-    assert caps["file"] == {}
+    assert caps["shell"] == {}
 
 
 def test_expand_inherit_does_not_inherit_model():
@@ -379,6 +542,33 @@ def test_expand_inherit_propagates_api_compat():
     expand_inherit(caps, main_llm)
     assert caps["vision"]["api_compat"] == "anthropic"
     assert caps["vision"]["base_url"] == "http://127.0.0.1:34891"
+
+
+def test_expand_inherit_propagates_wire_api():
+    # An OpenAI-compatible capability that explicitly selects the Responses or
+    # Chat Completions wire must keep that selection on the fallback — otherwise
+    # a custom base URL silently drops back to Chat Completions.
+    main_llm = {
+        "provider": "custom",
+        "api_compat": "openai",
+        "wire_api": "responses",
+        "model": "GLM-5.1",
+        "api_key_env": "CUSTOM_6_API_KEY",
+        "base_url": "https://openrouter.example/v1",
+    }
+    caps = {"vision": {"provider": "inherit"}}
+    expand_inherit(caps, main_llm)
+    assert caps["vision"]["wire_api"] == "responses"
+    assert caps["vision"]["api_compat"] == "openai"
+
+
+def test_expand_inherit_omits_wire_api_when_main_llm_unset():
+    # When the main LLM does not select a wire, the capability must not gain a
+    # fabricated ``wire_api=None`` entry that downstream code might misread.
+    main_llm = {"provider": "custom", "api_compat": "openai"}
+    caps = {"vision": {"provider": "inherit"}}
+    expand_inherit(caps, main_llm)
+    assert "wire_api" not in caps["vision"]
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +677,49 @@ def test_resolve_allowed_presets_skips_non_string_entries(tmp_path):
     }}
     result = resolve_allowed_presets(manifest, tmp_path)
     assert result == [abs_a]
+
+
+# ---------------------------------------------------------------------------
+# _preset_ref_in — shared normalized membership primitive
+# ---------------------------------------------------------------------------
+
+def test_preset_ref_in_tilde_and_absolute_are_equivalent(tmp_path, monkeypatch):
+    from lingtai.kernel.presets import _preset_ref_in
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    abs_path = str((home / "presets" / "alpha.json").resolve())
+    tilde = "~/presets/alpha.json"
+    assert _preset_ref_in(tilde, [abs_path])
+    assert _preset_ref_in(abs_path, [tilde])
+    assert _preset_ref_in(tilde, [tilde])
+
+
+def test_preset_ref_in_working_dir_relative_matches_absolute(tmp_path):
+    from lingtai.kernel.presets import _preset_ref_in
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    abs_path = str((wd / "presets" / "beta.json").resolve())
+    assert _preset_ref_in("./presets/beta.json", [abs_path], working_dir=wd)
+    assert _preset_ref_in(abs_path, ["./presets/beta.json"], working_dir=wd)
+
+
+def test_preset_ref_in_unrelated_path_denies(tmp_path):
+    from lingtai.kernel.presets import _preset_ref_in
+    assert not _preset_ref_in("~/presets/alpha.json", ["/other/foo.json"])
+
+
+def test_preset_ref_in_empty_or_non_string_request_denies():
+    from lingtai.kernel.presets import _preset_ref_in
+    assert not _preset_ref_in("", ["~/presets/alpha.json"])
+    assert not _preset_ref_in(None, ["~/presets/alpha.json"])
+
+
+def test_preset_ref_in_malformed_refs_denies():
+    from lingtai.kernel.presets import _preset_ref_in
+    assert not _preset_ref_in("~/presets/alpha.json", None)
+    assert not _preset_ref_in("~/presets/alpha.json", "not-a-list")
+    assert not _preset_ref_in("~/presets/alpha.json", {})
 
 
 # ---------------------------------------------------------------------------
@@ -674,7 +907,7 @@ def test_tier_vocabulary_is_numeric_one_through_five():
 # pin that documented behavior so it stays explicit rather than surprising, and
 # guard the skills.paths carve-out against regressions.
 
-from lingtai.presets import materialize_active_preset
+from tests._migration_workspace_helpers import materialize_active_preset
 
 
 def _preset_content(name, llm, capabilities):

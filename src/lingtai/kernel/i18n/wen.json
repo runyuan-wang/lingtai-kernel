@@ -1,0 +1,8 @@
+{
+  "system.current_time": "[此时：{time} | 上下文：{ctx}]",
+  "system.context_breakdown": "{pct} (系统 {sys} + 对话 {ctx})",
+  "system.context_unknown": "未知",
+  "system.mail_bounce": "[系统] 书信未达：{error}\n  收者：{address}\n  题：{subject}",
+  "system.stuck_revive": "[系统] 灵识于 {ts} 失联。汝所调之器：{err_desc}。正在重连。",
+  "system.refresh_successful": "[system] 更衣已成。器用与配置俱已重载。可续前事。"
+}

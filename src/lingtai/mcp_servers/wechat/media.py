@@ -1,0 +1,677 @@
+"""Media download/upload helpers for WeChat addon."""
+from __future__ import annotations
+
+import base64
+import hashlib
+import logging
+import platform
+import secrets
+import ssl
+import sys
+from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, urlsplit
+
+import httpcore
+import httpx
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+from . import api
+from .types import (
+    CDNMedia, UploadMediaType, MessageItemType,
+    ImageItem, VoiceItem, FileItem, VideoItem, MessageItem,
+)
+
+
+CDN_UPLOAD_TIMEOUT_SECONDS = 120.0
+CDN_UPLOAD_MAX_ATTEMPTS = 3
+
+
+def _official_cdn_upload_url(
+    cdn_base_url: str, upload_param: str, filekey: str,
+) -> str:
+    """Build the official Tencent v1.0.3 static CDN upload URL."""
+    encode_uri_component_safe = "-_.!~*'()"
+    return (
+        f"{cdn_base_url.rstrip('/')}/upload?encrypted_query_param="
+        f"{quote(upload_param, safe=encode_uri_component_safe)}&filekey="
+        f"{quote(filekey, safe=encode_uri_component_safe)}"
+    )
+
+
+@dataclass
+class UploadedMediaInfo:
+    """The full result of a CDN upload, carrying everything sendMessage needs.
+
+    `upload_media` returns this so non-image media (video, file) can populate
+    their type-specific size fields — OpenClaw sets `video_item.video_size` to
+    the ciphertext byte count and `file_item.len` to the plaintext byte count,
+    in addition to `image_item.mid_size`. Without those, the WeChat client may
+    accept the message but fail to render or download the attachment.
+    """
+
+    cdn_media: CDNMedia
+    media_type: UploadMediaType
+    raw_size: int          # plaintext byte count
+    ciphertext_size: int   # AES-128-ECB + PKCS#7 byte count
+    filekey: str
+
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class MediaUploadDiagnostic:
+    """Safe, structured context for a failed outbound media operation.
+
+    Upload URLs are pre-signed and may contain credentials in their query
+    strings. Keep only the public origin and a sanitized exception summary in
+    the diagnostic; never include the URL, token, recipient, or local path.
+    """
+
+    stage: str
+    endpoint: str | None
+    error_type: str
+    error_kind: str
+    error: str
+    runtime: dict[str, str]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "endpoint": self.endpoint,
+            "error_type": self.error_type,
+            "error_kind": self.error_kind,
+            "error": self.error,
+            "runtime": dict(self.runtime),
+        }
+
+
+class MediaUploadError(RuntimeError):
+    """A media-path failure with an actionable, secret-free diagnostic."""
+
+    def __init__(self, diagnostic: MediaUploadDiagnostic) -> None:
+        self.diagnostic = diagnostic
+        super().__init__(self._format_message())
+
+    @property
+    def stage(self) -> str:
+        return self.diagnostic.stage
+
+    def _format_message(self) -> str:
+        endpoint = self.diagnostic.endpoint or "unknown endpoint"
+        return (
+            f"WeChat media upload failed at {self.stage} "
+            f"({endpoint}): {self.diagnostic.error}"
+        )
+
+    def as_result(self) -> dict[str, Any]:
+        """Return a tool result without leaking transport secrets."""
+        message = str(self)
+        return {
+            "status": "failed",
+            "error_code": "MEDIA_UPLOAD_FAILED",
+            "error": message,
+            "message": message,
+            "stage": self.stage,
+            "media_upload": self.diagnostic.as_dict(),
+        }
+
+
+def _package_version(distribution: str) -> str:
+    try:
+        return version(distribution)
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def _runtime_diagnostics() -> dict[str, str]:
+    """Return useful runtime versions without host paths or secrets."""
+    return {
+        "python": sys.version.split()[0],
+        "openssl": ssl.OPENSSL_VERSION,
+        "platform": f"{platform.system()} {platform.release()} {platform.machine()}".strip(),
+        "httpx": _package_version("httpx"),
+        "httpcore": _package_version("httpcore"),
+    }
+
+
+def _safe_endpoint(url: str | None) -> str | None:
+    """Reduce a URL to scheme/host/port; discard paths and query credentials."""
+    if not url:
+        return None
+    try:
+        parsed = urlsplit(url)
+        if not parsed.scheme or not parsed.hostname:
+            return None
+        host = parsed.hostname
+        port = parsed.port
+        if port is not None and not (
+            (parsed.scheme.lower() == "https" and port == 443)
+            or (parsed.scheme.lower() == "http" and port == 80)
+        ):
+            host = f"{host}:{port}"
+        return f"{parsed.scheme.lower()}://{host}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _exception_chain(exc: BaseException):
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _is_tls_handshake_error(exc: BaseException) -> bool:
+    """Recognize TLS failures wrapped by httpx/httpcore transport errors."""
+    markers = (
+        "ssl", "tls", "handshake", "certificate verify", "wrong version number",
+    )
+    for item in _exception_chain(exc):
+        if isinstance(item, ssl.SSLError):
+            return True
+        if isinstance(item, (httpx.ConnectError, httpcore.ConnectError)):
+            if any(marker in str(item).lower() for marker in markers):
+                return True
+        if any(marker in str(item).lower() for marker in markers):
+            return True
+    return False
+
+
+def _safe_exception_text(exc: BaseException) -> str:
+    """Sanitize exception text that may contain a pre-signed request URL."""
+    text = str(exc).strip() or type(exc).__name__
+    for marker in ("http://", "https://"):
+        while marker in text:
+            start = text.find(marker)
+            end = len(text)
+            for delimiter in ("'", '"', " ", ")", "]"):
+                candidate = text.find(delimiter, start)
+                if candidate >= 0:
+                    end = min(end, candidate)
+            text = text[:start] + "<redacted-url>" + text[end:]
+    return text[:240]
+
+
+def media_upload_error(
+    stage: str,
+    endpoint: str | None,
+    exc: BaseException,
+) -> MediaUploadError:
+    if _is_tls_handshake_error(exc):
+        kind = "tls_handshake"
+    elif isinstance(exc, httpx.HTTPStatusError):
+        kind = "http_status"
+    elif isinstance(exc, httpx.TimeoutException):
+        kind = "timeout"
+    else:
+        kind = "transport"
+    return MediaUploadError(
+        MediaUploadDiagnostic(
+            stage=stage,
+            endpoint=_safe_endpoint(endpoint),
+            error_type=type(exc).__name__,
+            error_kind=kind,
+            error=_safe_exception_text(exc),
+            runtime=_runtime_diagnostics(),
+        )
+    )
+
+
+# ── Magic-byte validation ──────────────────────────────────────────────────
+#
+# WeChat attachments sometimes arrive under a normal-looking name/extension
+# (".pdf", ".zip", ".jpg") while the bytes saved under wechat/media/ are
+# encrypted / cache / private-container data rather than the real exported
+# file. Downstream agents then fail late in PDF/ZIP/vision tooling with
+# confusing errors. We validate the saved bytes against the declared
+# extension's magic bytes right after download and surface a structured
+# warning so the agent can ask the user to re-export ("Save As") instead of
+# repeatedly running parsers on unusable bytes. The raw bytes are always
+# preserved on disk for inspection — we only annotate, never delete.
+
+# Declared extension → list of acceptable leading-byte signatures.
+# Signatures are matched at the start of the file (RIFF/WEBP needs a windowed
+# check, handled below).
+_MAGIC_SIGNATURES: dict[str, list[bytes]] = {
+    ".pdf": [b"%PDF-"],
+    ".zip": [
+        b"PK\x03\x04",  # normal local file header
+        b"PK\x05\x06",  # empty archive (end-of-central-directory only)
+        b"PK\x07\x08",  # spanned archive marker
+    ],
+    ".png": [b"\x89PNG\r\n\x1a\n"],
+    ".jpg": [b"\xff\xd8\xff"],
+    ".jpeg": [b"\xff\xd8\xff"],
+    ".gif": [b"GIF87a", b"GIF89a"],
+    ".bmp": [b"BM"],
+    # .webp is a RIFF container: "RIFF" .... "WEBP"; checked specially.
+    ".webp": [b"RIFF"],
+}
+
+# How many bytes we need to read to cover the longest signature + WEBP window.
+_MAGIC_READ_LEN = 32
+
+_RECOVERY_HINT = (
+    "This attachment's bytes do not match its '{ext}' extension — it is "
+    "likely WeChat/QQ cache, encrypted, or private-container data rather "
+    "than the real exported file. Do not run PDF/ZIP/image parsers on it. "
+    "Ask the sender to open WeChat and use right-click / long-press → "
+    "\"Save As\" to export the original file, or send it via a cloud-drive "
+    "link / original file upload."
+)
+
+
+@dataclass
+class MediaValidation:
+    """Result of validating saved attachment bytes against the declared
+    extension's magic bytes.
+
+    status:
+      - "ok":       bytes match the declared type's signature.
+      - "mismatch": a signature is known for the extension but the bytes
+                    don't match it — likely cache/encrypted/private data.
+      - "unknown":  no signature is known for this extension (or no
+                    extension), so no judgement is made. Never a warning.
+    """
+
+    status: str
+    declared_ext: str
+    path: str
+    warning: str | None = None
+    hint: str | None = None
+
+    def render_suffix(self) -> str:
+        """Compact inline annotation for the conversation body. Empty unless
+        this is a mismatch the agent should be warned about."""
+        if self.status != "mismatch":
+            return ""
+        return f" ⚠ WARNING: {self.warning} {self.hint}"
+
+
+_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")
+
+
+def _matches_signature(head: bytes, ext: str) -> bool:
+    sigs = _MAGIC_SIGNATURES.get(ext, [])
+    if ext == ".webp":
+        # RIFF container with a "WEBP" form type at offset 8.
+        return head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+    return any(head.startswith(sig) for sig in sigs)
+
+
+def _matches_any_image_signature(head: bytes) -> bool:
+    return any(_matches_signature(head, ext) for ext in _IMAGE_EXTS)
+
+
+def _read_magic_head(path: Path) -> bytes | None:
+    try:
+        with path.open("rb") as fh:
+            return fh.read(_MAGIC_READ_LEN)
+    except OSError as e:
+        log.warning("validate_media_bytes: cannot read %s: %s", path, e)
+        return None
+
+
+def validate_image_bytes(file_path: str | Path) -> MediaValidation:
+    """Validate an inbound WeChat IMAGE download as any known image type.
+
+    WeChat IMAGE payloads are saved under generated ``.jpg`` names because the
+    protocol item does not reliably carry the original extension. Valid PNG,
+    WebP, GIF, or BMP bytes must therefore not be rejected merely because the
+    fabricated filename ends with ``.jpg``. This generic image check still flags
+    cache/encrypted/private-container bytes that are not any recognized image.
+    """
+    path = Path(file_path)
+    head = _read_magic_head(path)
+    if head is None:
+        return MediaValidation(status="unknown", declared_ext="image", path=str(path))
+    if _matches_any_image_signature(head):
+        return MediaValidation(status="ok", declared_ext="image", path=str(path))
+
+    warning = (
+        f"saved '{path.name}' is not a recognized image file "
+        "(magic bytes do not match known image signatures)"
+    )
+    return MediaValidation(
+        status="mismatch",
+        declared_ext="image",
+        path=str(path),
+        warning=warning,
+        hint=_RECOVERY_HINT.format(ext="image"),
+    )
+
+
+def validate_media_bytes(file_path: str | Path) -> MediaValidation:
+    """Validate a saved media file's bytes against its declared extension.
+
+    Returns a MediaValidation. Never raises for content reasons — a missing
+    or unreadable file is reported as "unknown" so validation can never break
+    the download path itself.
+    """
+    path = Path(file_path)
+    ext = path.suffix.lower()
+
+    if ext not in _MAGIC_SIGNATURES:
+        return MediaValidation(status="unknown", declared_ext=ext, path=str(path))
+
+    head = _read_magic_head(path)
+    if head is None:
+        return MediaValidation(status="unknown", declared_ext=ext, path=str(path))
+
+    if _matches_signature(head, ext):
+        return MediaValidation(status="ok", declared_ext=ext, path=str(path))
+
+    kind = ext.lstrip(".")
+    warning = (
+        f"saved '{path.name}' is not a valid {kind} file "
+        f"(magic bytes do not match {ext})"
+    )
+    return MediaValidation(
+        status="mismatch",
+        declared_ext=ext,
+        path=str(path),
+        warning=warning,
+        hint=_RECOVERY_HINT.format(ext=ext),
+    )
+
+
+# Extension → UploadMediaType mapping
+_UPLOAD_TYPE_MAP = {
+    ".jpg": UploadMediaType.IMAGE,
+    ".jpeg": UploadMediaType.IMAGE,
+    ".png": UploadMediaType.IMAGE,
+    ".gif": UploadMediaType.IMAGE,
+    ".webp": UploadMediaType.IMAGE,
+    ".bmp": UploadMediaType.IMAGE,
+    ".mp4": UploadMediaType.VIDEO,
+    ".avi": UploadMediaType.VIDEO,
+    ".mov": UploadMediaType.VIDEO,
+    ".mkv": UploadMediaType.VIDEO,
+    ".wav": UploadMediaType.VOICE,
+    ".mp3": UploadMediaType.VOICE,
+    ".ogg": UploadMediaType.VOICE,
+    ".silk": UploadMediaType.VOICE,
+    ".amr": UploadMediaType.VOICE,
+}
+
+# UploadMediaType → MessageItemType mapping
+_ITEM_TYPE_MAP = {
+    UploadMediaType.IMAGE: MessageItemType.IMAGE,
+    UploadMediaType.VIDEO: MessageItemType.VIDEO,
+    UploadMediaType.VOICE: MessageItemType.VOICE,
+    UploadMediaType.FILE: MessageItemType.FILE,
+}
+
+
+async def download_media(
+    cdn_media: CDNMedia,
+    dest_dir: str | Path,
+    filename: str = "media",
+) -> str:
+    """Download media from CDN. Returns local file path."""
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    url = cdn_media.full_url
+    if not url:
+        raise ValueError("CDN media has no full_url")
+
+    # Sanitize: use basename only to prevent path traversal via sender-controlled filenames
+    safe_name = Path(filename).name or "file"
+    dest_path = dest_dir / safe_name
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, timeout=60.0)
+        resp.raise_for_status()
+        dest_path.write_bytes(resp.content)
+
+    return str(dest_path)
+
+
+def decode_voice(silk_path: str | Path, out_path: str | Path) -> str:
+    """Decode Silk audio to WAV. Returns output path.
+
+    Requires the `pilk` package: pip install pilk
+    """
+    try:
+        import pilk
+    except ImportError:
+        log.warning("pilk not installed — cannot decode Silk voice. pip install pilk")
+        return str(silk_path)
+
+    silk_path = str(silk_path)
+    out_path = str(out_path)
+    pilk.decode(silk_path, out_path)
+    return out_path
+
+
+def detect_upload_type(file_path: str | Path) -> UploadMediaType:
+    """Detect UploadMediaType from file extension. Defaults to FILE."""
+    ext = Path(file_path).suffix.lower()
+    return _UPLOAD_TYPE_MAP.get(ext, UploadMediaType.FILE)
+
+
+def _pkcs7_pad(data: bytes, block: int = 16) -> bytes:
+    pad = block - (len(data) % block)
+    return data + bytes([pad]) * pad
+
+
+def _aes128_ecb_encrypt(data: bytes, key: bytes) -> bytes:
+    cipher = Cipher(algorithms.AES(key), modes.ECB())
+    enc = cipher.encryptor()
+    return enc.update(_pkcs7_pad(data, 16)) + enc.finalize()
+
+
+def _encrypted_size(raw_size: int, block: int = 16) -> int:
+    # PKCS#7 always appends at least one block when already aligned.
+    return raw_size + (block - (raw_size % block))
+
+
+async def upload_media(
+    file_path: str | Path,
+    base_url: str,
+    token: str,
+    to_user_id: str,
+    *,
+    cdn_base_url: str = api.CDN_BASE_URL,
+) -> UploadedMediaInfo:
+    """Upload a file to WeChat CDN.
+
+    Returns an UploadedMediaInfo carrying the CDNMedia reference plus the
+    raw/ciphertext sizes and filekey that non-image media (video, file)
+    need to populate their type-specific size fields downstream.
+
+    Mirrors Hermes/OpenClaw: iLink expects getuploadurl to receive raw size,
+    raw MD5, AES key, and padded ciphertext size; the CDN upload body is
+    AES-128-ECB encrypted with PKCS#7 padding and posted with HTTP POST
+    (not PUT); sendMessage then references encrypt_query_param + aes_key +
+    encrypt_type=1. Earlier versions of this addon used plaintext PUT, which
+    iLink would accept (HTTP 200) but produce an image the WeChat client
+    could not decrypt/open.
+
+    The final download parameter MUST come from the CDN's `x-encrypted-param`
+    response header (or, as a documented fallback, a JSON body containing
+    `encrypt_query_param` / `download_param`). Falling back to the
+    pre-upload `upload_param` or to the locally-generated `filekey` would
+    silently recreate the prior "sendMessage returns ok but WeChat client
+    can't open the image" false-positive — those values are NOT the
+    download parameter and the WeChat client cannot decrypt the payload
+    with them. So we raise instead.
+    """
+    file_path = Path(file_path)
+    if not file_path.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    data = file_path.read_bytes()
+    md5 = hashlib.md5(data).hexdigest()
+    media_type = detect_upload_type(file_path)
+    aeskey = secrets.token_bytes(16)
+    aeskey_hex = aeskey.hex()
+    ciphertext = _aes128_ecb_encrypt(data, aeskey)
+    filekey = secrets.token_hex(16)
+
+    # Get upload URL. filesize is ciphertext size, rawsize is plaintext size.
+    # Hermes/OpenClaw include filekey + no_need_thumb; without filekey iLink
+    # may return HTTP 200 but omit upload_full_url.
+    try:
+        upload_resp = await api.get_upload_url(
+            base_url, token,
+            media_type=int(media_type),
+            to_user_id=to_user_id,
+            rawsize=len(data),
+            rawfilemd5=md5,
+            filesize=len(ciphertext),
+            aeskey=aeskey_hex,
+            filekey=filekey,
+            no_need_thumb=True,
+        )
+    except Exception as exc:
+        raise media_upload_error("get_upload_url_failed", base_url, exc) from exc
+
+    # Official Tencent v1.0.3 constructs the upload URL from upload_param + a
+    # configured CDN base. Keep the dynamic upload_full_url only as fallback
+    # when upload_param is absent.
+    raw_upload_param = getattr(upload_resp, "upload_param", None)
+    upload_full_url = getattr(upload_resp, "upload_full_url", "")
+    if raw_upload_param:
+        upload_url = _official_cdn_upload_url(
+            cdn_base_url, str(raw_upload_param), filekey,
+        )
+    elif upload_full_url:
+        upload_url = upload_full_url
+    else:
+        raise media_upload_error(
+            "get_upload_url_failed",
+            base_url,
+            RuntimeError("server did not return an upload URL"),
+        )
+
+    # Upload encrypted bytes to CDN. OpenClaw uses POST (not PUT) and reads
+    # the final download encrypted_query_param from the x-encrypted-param
+    # response header. Some CDN responses also embed it in a JSON body.
+    # Retry only this encrypted CDN POST (transport/HTTP 429/5xx/HTTP 200
+    # missing metadata), at most three immediate attempts, never the whole
+    # surrounding text+media send.
+    download_param: str | None = None
+    last_error: BaseException | None = None
+    for attempt in range(1, CDN_UPLOAD_MAX_ATTEMPTS + 1):
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    upload_url,
+                    content=ciphertext,
+                    headers={"Content-Type": "application/octet-stream"},
+                    timeout=CDN_UPLOAD_TIMEOUT_SECONDS,
+                )
+                resp.raise_for_status()
+                raw = resp.text
+        except httpx.HTTPStatusError as exc:
+            retryable = exc.response.status_code == 429 or exc.response.status_code >= 500
+            if attempt < CDN_UPLOAD_MAX_ATTEMPTS and retryable:
+                last_error = exc
+                continue
+            error = media_upload_error("cdn_upload_http_failed", upload_url, exc)
+            if error.diagnostic.error_kind == "tls_handshake":
+                error = media_upload_error("cdn_tls_handshake_failed", upload_url, exc)
+            raise error from exc
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            if attempt < CDN_UPLOAD_MAX_ATTEMPTS:
+                last_error = exc
+                continue
+            error = media_upload_error("cdn_upload_http_failed", upload_url, exc)
+            if error.diagnostic.error_kind == "tls_handshake":
+                error = media_upload_error("cdn_tls_handshake_failed", upload_url, exc)
+            raise error from exc
+        except Exception as exc:
+            error = media_upload_error("cdn_upload_http_failed", upload_url, exc)
+            if error.diagnostic.error_kind == "tls_handshake":
+                error = media_upload_error("cdn_tls_handshake_failed", upload_url, exc)
+            raise error from exc
+
+        header_param = resp.headers.get("x-encrypted-param")
+        json_param: str | None = None
+        if raw and raw.strip().startswith("{"):
+            try:
+                body = resp.json()
+                json_param = (
+                    body.get("encrypt_query_param")
+                    or body.get("download_param")
+                )
+            except Exception:
+                json_param = None
+
+        download_param = header_param or json_param
+        if download_param:
+            break
+        # HTTP 200 without usable metadata: not a usable completion; retry.
+        last_error = RuntimeError(
+            "response missing x-encrypted-param header and "
+            "encrypt_query_param / download_param JSON field"
+        )
+
+    if not download_param:
+        raise media_upload_error(
+            "cdn_response_metadata_missing",
+            upload_url,
+            last_error or RuntimeError("no usable CDN response"),
+        )
+
+    cdn_media = CDNMedia(
+        encrypt_query_param=download_param,
+        # OpenClaw sends media.aes_key as base64(32-char hex string), not
+        # base64(raw 16 bytes). The WeChat client decrypts the CDN payload
+        # using this exact form; the raw-bytes form looks valid but renders
+        # as an un-openable image.
+        aes_key=base64.b64encode(aeskey_hex.encode("ascii")).decode("ascii"),
+        encrypt_type=1,
+    )
+    return UploadedMediaInfo(
+        cdn_media=cdn_media,
+        media_type=media_type,
+        raw_size=len(data),
+        ciphertext_size=len(ciphertext),
+        filekey=filekey,
+    )
+
+
+def make_media_item(info: UploadedMediaInfo, file_path: Path) -> MessageItem:
+    """Create a MessageItem for sending uploaded media.
+
+    For each media type, sets the OpenClaw/Hermes size fields that the
+    WeChat client requires to render/download the attachment:
+
+    - image: ``image_item.mid_size = ciphertext byte count``
+    - video: ``video_item.video_size = ciphertext byte count``
+    - file:  ``file_item.len = str(plaintext byte count)``
+    - voice: no extra size field documented in OpenClaw outbound; the
+      iLink schema does include ``playtime`` and ``encode_type`` if you
+      have them, but outbound voice send is not part of the validated
+      path. The MessageItem still carries the encrypted CDN reference,
+      so a downstream client with looser validation may render it.
+    """
+    item_type = _ITEM_TYPE_MAP.get(info.media_type, MessageItemType.FILE)
+    item = MessageItem(type=int(item_type))
+    if item_type == MessageItemType.IMAGE:
+        item.image_item = ImageItem(
+            media=info.cdn_media,
+            mid_size=info.ciphertext_size,
+        )
+    elif item_type == MessageItemType.VIDEO:
+        item.video_item = VideoItem(
+            media=info.cdn_media,
+            video_size=info.ciphertext_size,
+        )
+    elif item_type == MessageItemType.VOICE:
+        item.voice_item = VoiceItem(media=info.cdn_media)
+    else:
+        item.file_item = FileItem(
+            media=info.cdn_media,
+            file_name=file_path.name,
+            len=str(info.raw_size),
+        )
+
+    return item

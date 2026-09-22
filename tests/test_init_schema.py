@@ -1,6 +1,6 @@
 import json
 import pytest
-from lingtai.init_schema import validate_init
+from lingtai.init_schema import _check_type, validate_init
 
 
 def _valid_init() -> dict:
@@ -18,17 +18,11 @@ def _valid_init() -> dict:
             "capabilities": {},
             "soul": {"delay": 120},
             "stamina": 3600,
-            "context_limit": None,
-            "molt_pressure": 0.8,
-            "molt_prompt": "",
             "max_turns": 50,
             "admin": {"karma": True},
-            "streaming": False,
         },
-        "principle": "",
-        "covenant": "",
         "pad": "",
-        "prompt": "",
+        "lingtai": "",
         "soul": "",
     }
 
@@ -39,8 +33,8 @@ def test_valid_init_passes():
 
 def test_missing_top_level_key():
     data = _valid_init()
-    del data["covenant"]
-    with pytest.raises(ValueError, match="covenant"):
+    del data["pad"]
+    with pytest.raises(ValueError, match="pad"):
         validate_init(data)
 
 
@@ -61,10 +55,8 @@ def test_minimal_init_passes():
                 "model": "claude-sonnet-4-20250514",
             },
         },
-        "principle": "",
-        "covenant": "",
         "pad": "",
-        "prompt": "",
+        "lingtai": "",
         "soul": "",
     }
     validate_init(data)  # should not raise
@@ -77,39 +69,156 @@ def test_missing_llm_field():
         validate_init(data)
 
 
-def test_wrong_type_top_level():
+@pytest.mark.parametrize(
+    "key",
+    [
+        "base_prompt", "base_prompt_file",
+        "covenant", "covenant_file",
+        "comment", "comment_file",
+    ],
+)
+def test_legacy_psyche_prompt_inputs_are_known_but_inert(key):
     data = _valid_init()
-    data["covenant"] = 123
-    with pytest.raises(ValueError, match="covenant.*str"):
+    data[key] = {"not": "type-checked or honored"}
+
+    warnings = validate_init(data)
+
+    assert all(key not in warning for warning in warnings)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("one hour", id="wrong-type"),
+        pytest.param(True, id="bool"),
+    ],
+)
+def test_legacy_manifest_stamina_wrong_type_is_ignored(value):
+    data = _valid_init()
+    data["manifest"]["stamina"] = value
+    warnings = validate_init(data)  # legacy ignored field
+    assert all("stamina" not in warning for warning in warnings)
+
+
+def test_summarize_notification_threshold_rejects_negative():
+    data = _valid_init()
+    data["manifest"]["summarize_notification_threshold"] = -1
+    with pytest.raises(ValueError, match="summarize_notification_threshold"):
         validate_init(data)
 
 
-def test_wrong_type_manifest_field():
+def test_summarize_notification_threshold_rejects_bool():
     data = _valid_init()
-    data["manifest"]["stamina"] = "one hour"
-    with pytest.raises(ValueError, match="manifest.stamina.*(int|float|number)"):
+    data["manifest"]["summarize_notification_threshold"] = True
+    with pytest.raises(ValueError, match="summarize_notification_threshold.*bool"):
         validate_init(data)
+
+
+def test_summarize_notification_threshold_allows_zero():
+    data = _valid_init()
+    data["manifest"]["summarize_notification_threshold"] = 0
+    validate_init(data)  # 0 intentionally disables large-result notifications.
+
+
+@pytest.mark.parametrize("legacy_value", [500_000, 0, -5, True, "500000", None])
+def test_cache_miss_budget_is_schema_unknown_legacy_data(legacy_value):
+    data = _valid_init()
+    data["manifest"]["cache_miss_budget"] = legacy_value
+
+    warnings = validate_init(data)
+
+    assert "unknown field: manifest.cache_miss_budget" in warnings
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("context_limit", "not-an-int"), ("max_rpm", object()),
+        ("streaming", "yes"), ("aed_timeout", -1),
+        ("max_aed_attempts", 0), ("snapshot_interval", False),
+        ("activeness", 3),
+    ],
+)
+def test_ordinary_runtime_manifest_fields_are_legacy_ignored(field, value):
+    data = _valid_init()
+    data["manifest"][field] = value
+    warnings = validate_init(data)
+    assert not any(field in warning for warning in warnings)
+
+
+@pytest.mark.parametrize("value", [[], ["shell"], ["", "plugin", "web"]])
+def test_manifest_disable_accepts_only_string_lists(value):
+    data = _valid_init()
+    data["manifest"]["disable"] = value
+
+    assert validate_init(data) == []
+    assert data["manifest"]["disable"] is value
+
+
+@pytest.mark.parametrize("value", [None, "shell", {"shell": True}, ("shell",)])
+def test_manifest_disable_rejects_non_lists(value):
+    data = _valid_init()
+    data["manifest"]["disable"] = value
+
+    with pytest.raises(ValueError, match=r"^manifest\.disable: expected list"):
+        validate_init(data)
+
+
+@pytest.mark.parametrize(
+    "value,index,type_name",
+    [
+        (["shell", 1], 1, "int"),
+        ([False], 0, "bool"),
+        (["web", None], 1, "NoneType"),
+        ([["nested"]], 0, "list"),
+    ],
+)
+def test_manifest_disable_rejects_every_non_string_entry(value, index, type_name):
+    data = _valid_init()
+    data["manifest"]["disable"] = value
+
+    with pytest.raises(
+        ValueError,
+        match=rf"^manifest\.disable\[{index}\]: expected str, got {type_name}$",
+    ):
+        validate_init(data)
+
+
+def test_compact_threshold_rejects_bool_via_check_type():
+    data = _valid_init()
+    data["manifest"]["llm"]["compact_threshold"] = True
+    with pytest.raises(ValueError, match=r"manifest\.llm\.compact_threshold.*bool"):
+        validate_init(data)
+
+
+def test_check_type_bool_allowed_when_listed():
+    # Escape hatch: a field that explicitly accepts bool | int is not rejected.
+    _check_type(True, (int, bool), "x")  # should not raise
+    _check_type(3, (int, bool), "x")  # should not raise
+
+
+def test_max_turns_is_legacy_ignored():
+    """max_turns is recognized-and-ignored: build_agent_config deliberately
+    ignores it (tool-loop safety is kernel-owned), so the schema must not
+    advertise it as a live typed knob (issue #736)."""
+    from lingtai.init_schema import MANIFEST_LEGACY_IGNORED, MANIFEST_OPTIONAL
+
+    assert "max_turns" in MANIFEST_LEGACY_IGNORED
+    assert "max_turns" not in MANIFEST_OPTIONAL
+
+    data = _valid_init()  # already contains max_turns: 50
+    warnings = validate_init(data)
+    assert not any("max_turns" in w for w in warnings)
+
+    # A stale non-int value is tolerated — nothing reads it.
+    data["manifest"]["max_turns"] = "999"
+    validate_init(data)
 
 
 def test_wrong_type_capabilities():
     data = _valid_init()
-    data["manifest"]["capabilities"] = ["file", "bash"]
+    data["manifest"]["capabilities"] = ["shell", "bash"]
     with pytest.raises(ValueError, match="manifest.capabilities.*object"):
-        validate_init(data)
-
-
-def test_wrong_type_streaming():
-    data = _valid_init()
-    data["manifest"]["streaming"] = "yes"
-    with pytest.raises(ValueError, match="manifest.streaming.*bool"):
-        validate_init(data)
-
-
-def test_bool_rejected_for_numeric_field():
-    """bool is a subclass of int in Python — must be rejected for numeric fields."""
-    data = _valid_init()
-    data["manifest"]["stamina"] = True
-    with pytest.raises(ValueError, match="manifest.stamina.*number.*bool"):
         validate_init(data)
 
 
@@ -142,6 +251,268 @@ def test_api_key_env_wrong_type():
     data["manifest"]["llm"]["api_key_env"] = 123
     with pytest.raises(ValueError, match="api_key_env.*str"):
         validate_init(data)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("api_key_evn", "ANTHROPIC_API_KEY"),
+        ("base-url", "https://example.test/v1"),
+        ("context_limit", 200_000),
+        ("max_rpm", 60),
+    ],
+)
+def test_unknown_manifest_llm_fields_warn(key, value):
+    data = _valid_init()
+    data["manifest"]["llm"][key] = value
+
+    warnings = validate_init(data)
+
+    assert f"unknown field in manifest.llm: {key}" in warnings
+
+
+def test_legacy_manifest_soul_block_is_tolerated_without_warning():
+    """``manifest.soul`` belongs to the removed Soul subsystem: any shape an
+    older agent wrote still validates, silently, and is never type-checked."""
+    data = _valid_init()
+    data["manifest"]["soul"]["voice_promt"] = "speak plainly"
+    data["manifest"]["soul"]["delay"] = "not-a-number"
+
+    assert validate_init(data) == []
+
+    data["manifest"]["soul"] = "inner"
+    assert validate_init(data) == []
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("api_compat", "anthropic"),
+        ("default_headers", {"x-test": "1"}),
+        ("codex_session_anchor", "/agents/alice/init.json"),
+        ("codex_thread_salt", "alice"),
+        ("codex_auth_path", "/tokens/alice/codex-auth.json"),
+        ("codex_auth_pool_path", "/tokens/codex-pool.json"),
+        ("codex_base_urls", ["https://codex-a.example.test/v1"]),
+        ("service_tier", "fast"),
+    ],
+)
+def test_known_manifest_llm_pass_through_fields_do_not_warn(key, value):
+    data = _valid_init()
+    data["manifest"]["llm"][key] = value
+
+    warnings = validate_init(data)
+
+    assert all(f"unknown field in manifest.llm: {key}" != w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "OPENAI",
+        7,
+        [],
+        {},
+        {1.5: [True, None, {"nested": (2.5, "finite")}]},
+    ],
+)
+def test_api_compat_preserves_finite_compatibility_values(value):
+    data = _valid_init()
+    data["manifest"]["llm"]["api_compat"] = value
+
+    assert validate_init(data) == []
+    assert data["manifest"]["llm"]["api_compat"] is value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(float("nan"), id="scalar-nan"),
+        pytest.param(float("inf"), id="scalar-positive-infinity"),
+        pytest.param(float("-inf"), id="scalar-negative-infinity"),
+        pytest.param(["finite", {"nested": float("nan")}], id="nested-dict-value"),
+        pytest.param({"nested": (0, float("inf"))}, id="nested-tuple-value"),
+        pytest.param({float("-inf"): "nested-key"}, id="dict-key"),
+    ],
+)
+def test_api_compat_rejects_non_finite_values_at_every_depth(value):
+    data = _valid_init()
+    data["manifest"]["llm"]["api_compat"] = value
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"^manifest\.llm\.api_compat: expected recursively "
+            r"JSON-finite value$"
+        ),
+    ):
+        validate_init(data)
+
+
+def test_api_compat_finite_walk_is_depth_safe():
+    value: object = "openai"
+    for _ in range(2_000):
+        value = [value]
+    data = _valid_init()
+    data["manifest"]["llm"]["api_compat"] = value
+
+    assert validate_init(data) == []
+
+
+@pytest.mark.parametrize("value", ["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+def test_llm_thinking_valid_values(value):
+    data = _valid_init()
+    data["manifest"]["llm"]["provider"] = "codex"
+    data["manifest"]["llm"]["thinking"] = value
+    validate_init(data)
+
+
+@pytest.mark.parametrize("value", ["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+def test_llm_thinking_valid_for_custom_openai_responses(value):
+    data = _valid_init()
+    data["manifest"]["llm"].update(
+        {
+            "provider": "custom",
+            "api_compat": "openai",
+            "wire_api": "responses",
+            "thinking": value,
+        }
+    )
+
+    validate_init(data)
+
+
+@pytest.mark.parametrize("value", ["low", "high", "max"])
+def test_llm_thinking_valid_for_deepseek_responses(value):
+    """DeepSeek owns its effort surface: Responses serves exactly low|high|max.
+
+    This route previously inherited the generic "any kernel level on an
+    OpenAI-compatible Responses wire" rule, which advertised tiers DeepSeek's
+    Responses guide does not document (and which that endpoint may silently
+    ignore). The exact per-model/per-wire set is pinned in
+    tests/test_deepseek_reasoning_effort.py.
+    """
+    data = _valid_init()
+    data["manifest"]["llm"].update(
+        {
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+            "api_compat": "openai",
+            "wire_api": "responses",
+            "thinking": value,
+        }
+    )
+    validate_init(data)
+
+@pytest.mark.parametrize("value", ["default", "ultra", 1, None])
+def test_llm_thinking_invalid_for_custom_openai_responses(value):
+    data = _valid_init()
+    data["manifest"]["llm"].update(
+        {
+            "provider": "custom",
+            "api_compat": "openai",
+            "wire_api": "responses",
+            "thinking": value,
+        }
+    )
+
+    with pytest.raises(ValueError, match="manifest.llm.thinking"):
+        validate_init(data)
+
+
+@pytest.mark.parametrize("value", ["default", "ultra", 1, None])
+def test_llm_thinking_invalid_values(value):
+    data = _valid_init()
+    data["manifest"]["llm"]["provider"] = "codex"
+    data["manifest"]["llm"]["thinking"] = value
+    with pytest.raises(ValueError, match="manifest.llm.thinking"):
+        validate_init(data)
+
+
+@pytest.mark.parametrize("value", ["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+def test_llm_thinking_valid_for_anthropic(value):
+    # The Anthropic adapter maps thinking to an extended-thinking budget.
+    data = _valid_init()
+    data["manifest"]["llm"]["provider"] = "anthropic"
+    data["manifest"]["llm"]["thinking"] = value
+    validate_init(data)
+
+
+@pytest.mark.parametrize("value", ["default", "ultra", 1, None])
+def test_llm_thinking_invalid_for_anthropic(value):
+    data = _valid_init()
+    data["manifest"]["llm"]["provider"] = "anthropic"
+    data["manifest"]["llm"]["thinking"] = value
+    with pytest.raises(ValueError, match="manifest.llm.thinking"):
+        validate_init(data)
+
+
+@pytest.mark.parametrize(
+    "llm_patch",
+    [
+        # Custom OpenAI-compatible on either wire — Responses sends
+        # reasoning.effort, Chat Completions sends reasoning_effort.
+        {"provider": "custom", "api_compat": "openai"},
+        {
+            "provider": "custom",
+            "api_compat": "openai",
+            "wire_api": "chat_completions",
+        },
+        # Built-in OpenAI-wire providers, with api_compat left implicit.
+        {"provider": "openai", "wire_api": "responses"},
+        {"provider": "openai"},
+        # DeepSeek owns its effort contract; a real served model is required
+        # (policy fail-closed per model/wire; covered deeply in
+        # test_deepseek_reasoning_effort.py).
+        {"provider": "deepseek", "model": "deepseek-v4-flash"},
+    ],
+)
+def test_llm_thinking_accepted_for_openai_compatible(llm_patch):
+    data = _valid_init()
+    data["manifest"]["llm"].update(llm_patch)
+    data["manifest"]["llm"]["thinking"] = "high"
+
+    validate_init(data)
+
+
+@pytest.mark.parametrize(
+    "llm_patch",
+    [
+        {"provider": "gemini"},
+        {"provider": "minimax"},
+        {
+            "provider": "custom",
+            "api_compat": "gemini",
+            "wire_api": "auto",
+        },
+    ],
+)
+def test_llm_thinking_rejected_outside_thinking_capable_scope(llm_patch):
+    data = _valid_init()
+    data["manifest"]["llm"].update(llm_patch)
+    data["manifest"]["llm"]["thinking"] = "high"
+
+    with pytest.raises(ValueError, match="thinking-capable providers"):
+        validate_init(data)
+
+
+@pytest.mark.parametrize("provider", ["codex-pool", "codex_pool"])
+def test_llm_thinking_accepted_for_codex_pool(provider):
+    """codex-pool reuses the Codex adapter, so thinking is Codex-compatible."""
+    data = _valid_init()
+    data["manifest"]["llm"]["provider"] = provider
+    data["manifest"]["llm"]["thinking"] = "xhigh"
+    validate_init(data)
+
+
+def test_llm_thinking_known_field_does_not_warn():
+    data = _valid_init()
+    data["manifest"]["llm"]["provider"] = "codex"
+    data["manifest"]["llm"]["thinking"] = "high"
+
+    warnings = validate_init(data)
+
+    assert "unknown field in manifest.llm: thinking" not in warnings
 
 
 # --- addons (list of curated MCP names; mcp capability handles the rest) ---
@@ -190,7 +561,7 @@ def test_mcp_section_dict_valid():
         "imap": {
             "type": "stdio",
             "command": "/usr/bin/python",
-            "args": ["-m", "lingtai_imap"],
+            "args": ["-m", "lingtai.mcp_servers.imap"],
         },
     }
     validate_init(data)
@@ -203,76 +574,18 @@ def test_mcp_section_wrong_type_rejected():
         validate_init(data)
 
 
-def test_time_awareness_field_valid_bool():
-    from lingtai.init_schema import validate_init
-
-    data = {
-        "manifest": {
-            "llm": {"provider": "minimax", "model": "x"},
-            "time_awareness": False,
-        },
-        "covenant": "hi",
-        "prompt": "hello",
-        "pad": "",
-        "soul": "",
-        "principle": "",
-    }
+@pytest.mark.parametrize("field", ["time_awareness", "timezone_awareness"])
+def test_time_awareness_field_valid_bool(field):
+    data = _valid_init()
+    data["manifest"][field] = False
     warnings = validate_init(data)
-    assert all("time_awareness" not in w for w in warnings)
+    assert all(field not in warning for warning in warnings)
 
 
-def test_time_awareness_field_wrong_type_raises():
-    import pytest
-    from lingtai.init_schema import validate_init
-
-    data = {
-        "manifest": {
-            "llm": {"provider": "minimax", "model": "x"},
-            "time_awareness": "yes",
-        },
-        "covenant": "hi",
-        "prompt": "hello",
-        "pad": "",
-        "soul": "",
-        "principle": "",
-    }
-    with pytest.raises(ValueError):
-        validate_init(data)
-
-
-def test_timezone_awareness_field_valid_bool():
-    from lingtai.init_schema import validate_init
-
-    data = {
-        "manifest": {
-            "llm": {"provider": "minimax", "model": "x"},
-            "timezone_awareness": False,
-        },
-        "covenant": "hi",
-        "prompt": "hello",
-        "pad": "",
-        "soul": "",
-        "principle": "",
-    }
-    warnings = validate_init(data)
-    assert all("timezone_awareness" not in w for w in warnings)
-
-
-def test_timezone_awareness_field_wrong_type_raises():
-    import pytest
-    from lingtai.init_schema import validate_init
-
-    data = {
-        "manifest": {
-            "llm": {"provider": "minimax", "model": "x"},
-            "timezone_awareness": "yes",
-        },
-        "covenant": "hi",
-        "prompt": "hello",
-        "pad": "",
-        "soul": "",
-        "principle": "",
-    }
+@pytest.mark.parametrize("field", ["time_awareness", "timezone_awareness"])
+def test_time_awareness_field_wrong_type_raises(field):
+    data = _valid_init()
+    data["manifest"][field] = "yes"
     with pytest.raises(ValueError):
         validate_init(data)
 
@@ -310,14 +623,88 @@ def test_manifest_required_fields_all_in_known():
 def test_manifest_known_fields_all_typed():
     """Every field in MANIFEST_KNOWN must appear in either MANIFEST_REQUIRED
     or MANIFEST_OPTIONAL, otherwise a user-supplied value passes without
-    any type check."""
-    from lingtai.init_schema import MANIFEST_OPTIONAL, MANIFEST_REQUIRED, MANIFEST_KNOWN
+    any type check.
+
+    Exception: MANIFEST_LEGACY_IGNORED fields are intentionally untyped —
+    they are recognized-and-ignored (tolerated on old init.json, never
+    honored), so type-checking them would be meaningless."""
+    from lingtai.init_schema import (
+        MANIFEST_OPTIONAL,
+        MANIFEST_REQUIRED,
+        MANIFEST_KNOWN,
+        MANIFEST_LEGACY_IGNORED,
+    )
     typed = set(MANIFEST_OPTIONAL) | set(MANIFEST_REQUIRED)
-    untyped = MANIFEST_KNOWN - typed
+    untyped = MANIFEST_KNOWN - typed - MANIFEST_LEGACY_IGNORED
     assert not untyped, (
         f"Fields in MANIFEST_KNOWN but not type-checked (missing from "
         f"MANIFEST_OPTIONAL or MANIFEST_REQUIRED): {sorted(untyped)}"
     )
+
+
+def test_hydrator_manifest_keys_are_schema_known():
+    """The hydrator (build_agent_config) and the validation schema must not
+    drift: every manifest key the hydrator reads must be schema-known AND
+    type-checked, so a honored field can never validate with only an
+    'unknown field' warning while its value goes unchecked (issue #736)."""
+    import ast
+    import inspect
+
+    from lingtai.agent import build_agent_config
+    from lingtai.init_schema import (
+        MANIFEST_KNOWN,
+        MANIFEST_OPTIONAL,
+        MANIFEST_REQUIRED,
+    )
+
+    tree = ast.parse(inspect.getsource(build_agent_config))
+    keys = {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "manifest"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    }
+    # Guard against silent no-ops: if build_agent_config stops reading keys
+    # via manifest.get(...), this test must fail loudly, not match nothing.
+    assert keys, (
+        "build_agent_config no longer reads manifest keys via manifest.get — "
+        "update this drift guard"
+    )
+    assert keys <= MANIFEST_KNOWN, (
+        f"hydrator reads manifest keys unknown to init_schema: "
+        f"{sorted(keys - MANIFEST_KNOWN)}"
+    )
+    typed = set(MANIFEST_OPTIONAL) | set(MANIFEST_REQUIRED)
+    assert keys <= typed, (
+        f"hydrator reads manifest keys that are not type-checked: "
+        f"{sorted(keys - typed)}"
+    )
+
+
+def test_legacy_molt_fields_tolerated_but_ignored():
+    """Stale init.json molt_notice/molt_pressure/molt_urgency/molt_prompt fields
+    must not break validation (no error, no 'unknown field' warning) — they are
+    recognized-and-ignored now that molt thresholds are kernel-fixed and the
+    context.molt message is hardcoded in meta_block.build_molt_context."""
+    from lingtai.init_schema import MANIFEST_LEGACY_IGNORED
+
+    data = _valid_init()
+    # Legacy values, including a deliberately out-of-range / wrong-feeling one,
+    # must be tolerated since they are no longer honored or type-checked.
+    data["manifest"]["molt_notice"] = 0.3
+    data["manifest"]["molt_pressure"] = 0.8
+    data["manifest"]["molt_urgency"] = 0.99
+    data["manifest"]["molt_prompt"] = "ignored custom message"
+    warnings = validate_init(data)  # must not raise
+    for field in MANIFEST_LEGACY_IGNORED:
+        assert not any(field in w for w in warnings), (
+            f"legacy field {field} should be silently tolerated, got warnings: {warnings}"
+        )
 
 
 def test_top_optional_fields_all_in_known():
@@ -328,6 +715,47 @@ def test_top_optional_fields_all_in_known():
         f"Fields in TOP_OPTIONAL but not in TOP_KNOWN "
         f"(would trigger unknown-field warning): {sorted(missing)}"
     )
+
+
+def test_llm_known_fields_compose_from_schema_sets():
+    from lingtai.init_schema import (
+        LLM_KNOWN,
+        LLM_OPTIONAL,
+        LLM_PASS_THROUGH_KNOWN,
+        LLM_REQUIRED,
+        LLM_SPECIAL_KNOWN,
+    )
+
+    expected = (
+        set(LLM_REQUIRED)
+        | set(LLM_OPTIONAL)
+        | LLM_SPECIAL_KNOWN
+        | LLM_PASS_THROUGH_KNOWN
+    )
+    assert LLM_KNOWN == expected
+
+
+def test_manifest_soul_is_legacy_ignored_not_optional():
+    from lingtai import init_schema
+
+    assert "soul" in init_schema.MANIFEST_LEGACY_IGNORED
+    assert "soul" not in init_schema.MANIFEST_OPTIONAL
+    assert not hasattr(init_schema, "SOUL_OPTIONAL")
+    assert not hasattr(init_schema, "SOUL_KNOWN")
+
+
+def test_provider_default_manifest_llm_keys_are_known():
+    from lingtai.init_schema import LLM_KNOWN, LLM_OPTIONAL
+    from lingtai.llm import service as llm_service
+
+    pass_through = set(llm_service._PROVIDER_DEFAULTS_PASS_THROUGH_KEYS) | {
+        "default_headers"
+    }
+    preserve_none = set(llm_service._PROVIDER_DEFAULTS_PRESERVE_NONE_KEYS)
+
+    assert pass_through <= LLM_KNOWN
+    assert preserve_none <= set(LLM_OPTIONAL)
+    assert preserve_none <= LLM_KNOWN
 
 
 def test_manifest_accepts_pseudo_agent_subscriptions():
@@ -512,16 +940,48 @@ def test_preset_block_old_path_field_warns_as_unknown():
     assert any("unknown field in manifest.preset: path" in w for w in warnings)
 
 
-def test_preset_block_unmigrated_init_points_at_m029():
-    """When an init.json predates m029 (has `path` but no `allowed`),
-    the schema error must point the operator at the migration so they
-    don't have to guess what to do."""
+def test_preset_block_unmigrated_init_points_at_canonical_agent_edit():
+    """A legacy preset path gets explicit Agent-edit guidance, never migration advice."""
     data = _valid_init()
     data["manifest"]["preset"] = {
         "active": "minimax",
         "default": "minimax",
         "path": "~/.lingtai-tui/presets",
     }
-    with pytest.raises(ValueError, match="m029") as exc_info:
+    with pytest.raises(ValueError, match="not rewritten automatically") as exc_info:
         validate_init(data)
-    assert "lingtai-tui" in str(exc_info.value)
+    assert "manifest.preset.allowed" in str(exc_info.value)
+
+def test_lingtai_seed_is_optional() -> None:
+    data = _valid_init()
+    data.pop("lingtai")
+
+    assert validate_init(data) == []
+
+
+def test_lingtai_seed_type_checked_when_present() -> None:
+    data = _valid_init()
+    data["lingtai"] = 123
+
+    with pytest.raises(ValueError, match="lingtai: expected str"):
+        validate_init(data)
+
+
+def test_legacy_prompt_is_not_reintroduced_as_lingtai_alias() -> None:
+    data = _valid_init()
+    data.pop("lingtai")
+    data["prompt"] = "legacy seed"
+
+    warnings = validate_init(data)
+
+    assert "unknown top-level field: prompt" in warnings
+
+
+def test_deepseek_wire_api_responses_allowed():
+    """wire_api=responses is accepted for the deepseek provider (Responses opt-in)."""
+    data = _valid_init()
+    data["manifest"]["llm"]["provider"] = "deepseek"
+    data["manifest"]["llm"]["model"] = "deepseek-v4-flash"
+    data["manifest"]["llm"]["base_url"] = "https://api.deepseek.com"
+    data["manifest"]["llm"]["wire_api"] = "responses"
+    validate_init(data)  # should not raise

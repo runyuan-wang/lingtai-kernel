@@ -1,24 +1,22 @@
-"""Tests for context compaction in LLMService.check_and_compact().
+"""Tests for ChatInterface compaction primitives and context-pressure metadata.
 
-Exercises the full compaction pipeline:
-  1. estimate_context_tokens() detects context > threshold
-  2. find_compaction_boundary() splits at the right turn
-  3. format_for_summary() produces text for the summarizer
-  4. The new ChatInterface has: system + summary + ack + recent turns
+Covers:
+  1. find_compaction_boundary() — turn-aware boundary detection
+  2. format_for_summary() — text extraction for summarizers
+  3. estimate_context_tokens() — context-size estimation
+  4. Context-pressure metadata in BaseAgent._handle_request
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-from lingtai_kernel.llm.interface import (
+from lingtai.kernel.llm.interface import (
     ChatInterface,
     TextBlock,
     ToolCallBlock,
     ToolResultBlock,
 )
-from lingtai_kernel.llm.base import ChatSession, FunctionSchema
-from lingtai.llm.service import LLMService
 
 
 # ---------------------------------------------------------------------------
@@ -75,28 +73,6 @@ def _build_conversation_with_tools(
         )
 
     return iface
-
-
-class FakeChatSession(ChatSession):
-    """Minimal ChatSession for testing compaction logic."""
-
-    def __init__(self, interface: ChatInterface, ctx_window: int = 0):
-        self._interface = interface
-        self._context_window_val = ctx_window
-        self._model = "test-model"
-        self._agent_type = "test"
-        self._tracked = True
-        self.session_id = "test-session"
-
-    @property
-    def interface(self) -> ChatInterface:
-        return self._interface
-
-    def send(self, message):
-        raise NotImplementedError
-
-    def context_window(self) -> int:
-        return self._context_window_val
 
 
 # ---------------------------------------------------------------------------
@@ -179,28 +155,49 @@ class TestEstimateContextTokens:
         estimate = iface.estimate_context_tokens()
         assert estimate > 100  # 1000 chars / ~8 = ~125 tokens (Gemini) or ~4 = ~250 tokens (tiktoken)
 
+    def test_counts_tool_result_metadata_sidecar(self):
+        """Metadata sidecars must count toward the estimate (issue #1013).
+
+        Wire converters project ``ToolResultBlock.metadata`` into the
+        provider payload, so omitting it makes the estimate understate the
+        stateless-replay request size and can let /clear report a low
+        context usage while the next request overflows.
+        """
+
+        def _build(metadata: dict | None) -> ChatInterface:
+            iface = ChatInterface()
+            iface.add_system("You are a helpful assistant.")
+            iface.add_user_message("search")
+            iface.add_assistant_message(
+                [ToolCallBlock(id="call_1", name="search", args={"q": "x"})],
+            )
+            iface.add_tool_results(
+                [
+                    ToolResultBlock(
+                        id="call_1",
+                        name="search",
+                        content="small result",
+                        metadata=metadata or {},
+                    )
+                ]
+            )
+            return iface
+
+        plain = _build(None)
+        with_meta = _build({"agent_meta": {"guidance": "g" * 2000}})
+        assert plain.estimate_context_tokens() > 0
+        # The metadata-bearing history must estimate strictly larger than the
+        # identical history without the sidecar.
+        assert with_meta.estimate_context_tokens() > plain.estimate_context_tokens()
+
 
 # ---------------------------------------------------------------------------
-# Tests — LLMService.check_and_compact() integration
+# Tests — Context-pressure metadata in BaseAgent._handle_request
 # ---------------------------------------------------------------------------
 
 
-
-# TestCheckAndCompact removed — check_and_compact was replaced by molt (eigen intrinsic).
-# Compaction is now handled by SessionManager internally, not via LLMService method.
-
-
-
-# get_context_limit tests removed — context window is now caller-provided.
-
-
-# ---------------------------------------------------------------------------
-# Tests — Compaction pressure system in BaseAgent._handle_request
-# ---------------------------------------------------------------------------
-
-
-def _make_agent_with_psyche(tmp_path):
-    """Create an Agent with psyche capability and mocked LLM service."""
+def _make_agent_with_context(tmp_path):
+    """Create an Agent with the context intrinsic and mocked LLM service."""
     from lingtai.agent import Agent
 
     svc = MagicMock()
@@ -209,15 +206,17 @@ def _make_agent_with_psyche(tmp_path):
     svc.model = "gemini-test"
     return Agent(
         service=svc, agent_name="test", working_dir=tmp_path / "test",
-        capabilities=["psyche"],
+        capabilities=["context"],
     )
 
 
-def test_compaction_warning_published_above_threshold(tmp_path):
-    """Above the molt_pressure threshold, the kernel publishes a
-    notification to .notification/molt.json rather than inlining a
-    [system] block in user content."""
-    agent = _make_agent_with_psyche(tmp_path)
+def test_compaction_pressure_not_published_as_notification(tmp_path):
+    """Above the molt_pressure threshold, the kernel no longer publishes a
+    dismissible ``.notification/molt.json`` warning. Context pressure is
+    agent state and is surfaced under ``_meta.agent_meta.agent_state.context.molt``
+    (see ``meta_block.build_molt_context``); ``_check_molt_pressure`` only
+    clears any stale legacy ``molt`` notification and never publishes."""
+    agent = _make_agent_with_context(tmp_path)
     agent.start()
     try:
         # Stamp a real int context_limit so build_meta() doesn't fall through
@@ -239,19 +238,18 @@ def test_compaction_warning_published_above_threshold(tmp_path):
 
         agent._session.send = capture_send
 
-        from lingtai_kernel.message import _make_message, MSG_REQUEST
+        from lingtai.kernel.message import _make_message, MSG_REQUEST
         msg = _make_message(MSG_REQUEST, sender="test", content="do something")
         agent._handle_request(msg)
 
-        # User content is NOT mutated — the molt warning routes through
-        # .notification/molt.json instead.
+        # User content is NOT mutated with an inlined [system] block.
         assert len(sent_content) > 0
         assert not any("[system]" in c for c in sent_content)
 
+        # The legacy molt pressure notification is NOT published anymore.
         notif_path = agent._working_dir / ".notification" / "molt.json"
-        assert notif_path.is_file(), "above-threshold molt should publish a notification"
-        import json
-        notif = json.loads(notif_path.read_text())
-        assert "molt" in json.dumps(notif).lower()
+        assert not notif_path.is_file(), (
+            "context pressure must not be published as .notification/molt.json"
+        )
     finally:
         agent.stop()

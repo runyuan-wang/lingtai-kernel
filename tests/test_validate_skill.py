@@ -9,12 +9,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import pytest
-
 # The validator lives outside the package tree; import it directly.
-_SCRIPTS = Path(__file__).resolve().parents[1] / "src" / "lingtai" / "core" / "skills" / "manual" / "scripts"
+_SCRIPTS = Path(__file__).resolve().parents[1] / "src" / "lingtai" / "tools" / "skills" / "manual" / "scripts"
 sys.path.insert(0, str(_SCRIPTS))
-from validate import _parse_frontmatter, validate_frontmatter  # noqa: E402
+from validate import _parse_frontmatter, validate_frontmatter, validate_skill  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +154,12 @@ class TestValidateFrontmatterMultiline:
         assert not passed
         assert any("Missing 'description'" in m for m in msgs)
 
+    def test_vision_manual_passes_repository_validator(self):
+        """The shipped vision manual must pass the repository validator directly."""
+        root = Path(__file__).resolve().parents[1]
+        manual = root / "src" / "lingtai" / "tools" / "vision" / "manual"
+        assert validate_skill(str(manual))
+
     def test_name_as_number_does_not_crash(self, tmp_path):
         """Non-string YAML scalar names should be handled gracefully."""
         skill_dir = tmp_path / "skills" / "num-name"
@@ -223,14 +227,13 @@ class TestNestedReferenceValidation:
         passed_child, _ = validate_frontmatter(child_dir)
         assert passed_child
 
-    def test_nested_child_short_description_warns(self, tmp_path):
-        child_dir = tmp_path / "reference" / "tiny"
-        child_dir.mkdir(parents=True)
-        (child_dir / "SKILL.md").write_text(
+        short_child_dir = parent_dir / "reference" / "tiny"
+        short_child_dir.mkdir()
+        (short_child_dir / "SKILL.md").write_text(
             "---\nname: tiny\ndescription: short\n---\n\nBody.\n",
             encoding="utf-8",
         )
-        passed, msgs = validate_frontmatter(child_dir)
-        assert passed
-        short_warnings = [m for m in msgs if "very short" in m]
+        passed_short, short_msgs = validate_frontmatter(short_child_dir)
+        assert passed_short
+        short_warnings = [m for m in short_msgs if "very short" in m]
         assert len(short_warnings) == 1

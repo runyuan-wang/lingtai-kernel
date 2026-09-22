@@ -1,0 +1,8 @@
+{
+  "system.current_time": "[此时：{time} | 上下文：{ctx}]",
+  "system.context_breakdown": "{pct} (系统 {sys} + 对话 {ctx})",
+  "system.context_unknown": "未知",
+  "system.mail_bounce": "[系统] 消息投递失败：{error}\n  收件人：{address}\n  主题：{subject}",
+  "system.stuck_revive": "[系统] LLM 调用于 {ts} 失败。最近错误：{err_desc}。正在重试。",
+  "system.refresh_successful": "[system] 沐浴成功。工具与配置已重新加载。可以继续。"
+}

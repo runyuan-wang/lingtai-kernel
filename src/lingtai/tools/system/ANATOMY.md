@@ -1,0 +1,194 @@
+---
+related_files:
+  - src/lingtai/tools/ANATOMY.md
+  - src/lingtai/tools/system/CONTRACT.md
+  - src/lingtai/tools/system/BEHAVIORS.md
+  - src/lingtai/tools/system/__init__.py
+  - src/lingtai/tools/system/plugin.py
+  - src/lingtai/tools/system/settings.py
+  - src/lingtai/kernel/tool_plugin/ANATOMY.md
+  - src/lingtai/adapters/tool_plugin_host.py
+  - src/lingtai/agent.py
+  - src/lingtai/tools/system/karma.py
+  - src/lingtai/tools/system/preset.py
+  - src/lingtai/tools/system/schema.py
+  - src/lingtai/tools/system/summarize.py
+  - src/lingtai/tools/system/name.py
+  - src/lingtai/kernel/base_agent/lifecycle.py
+  - src/lingtai/tools/context/ANATOMY.md
+  - src/lingtai/tools/context/CONTRACT.md
+  - src/lingtai/tools/system/glossary-en.md
+  - src/lingtai/tools/system/glossary-zh.md
+  - src/lingtai/tools/system/glossary-wen.md
+  - src/lingtai/tools/tool_family/ANATOMY.md
+  - src/lingtai/tools/tool_family/CONTRACT.md
+  - src/lingtai/kernel/tool_result_summary.py
+  - src/lingtai/kernel/malloc_relief.py
+  - src/lingtai/kernel/tool_executor.py
+  - src/lingtai/kernel/meta_block.py
+  - src/lingtai/init_schema.py
+  - ENVIRONMENT_VARIABLES.md
+  - src/lingtai/intrinsic_skills/system-manual/SKILL.md
+  - src/lingtai/intrinsic_skills/system-manual/reference/migration-guide/SKILL.md
+  - src/lingtai/intrinsic_skills/system-manual/reference/migration-guide/reference/project-move/SKILL.md
+  - src/lingtai/intrinsic_skills/system-manual/reference/migration-guide/reference/agent-name-move/SKILL.md
+  - src/lingtai/intrinsic_skills/system-manual/reference/migration-guide/scripts/change_name.py
+  - src/lingtai/intrinsic_skills/system-manual/reference/settings-inventory/SKILL.md
+  - src/lingtai/cli.py
+  - src/lingtai/tools/context/BEHAVIORS.md
+  - src/lingtai/tools/context/manual/SKILL.md
+  - tests/test_how_to_change_name.py
+  - tests/test_how_to_change_name_e2e.py
+  - tests/test_cli.py
+  - tests/test_tool_family_system_migration.py
+  - tests/test_meta_block.py
+  - tests/test_init_reader.py
+  - tests/test_system_sleep_alarm.py
+  - tests/test_system_declared_plugin.py
+maintenance: |
+  Keep related_files as repo-relative paths to real files. Include neighboring
+  ANATOMY.md files so the anatomy graph stays connected rather than isolated;
+  anatomy links must be bidirectional. If you create a new ANATOMY.md, copy this
+  maintenance field. If you notice drift between this anatomy and the code,
+  report it. See lingtai-dev-guide for details.
+  Capability mentions in any document require explicit bidirectional
+  related_files mapping to the implementing code (see root ## Maintenance).
+---
+# intrinsics/system
+
+System intrinsic — runtime, lifecycle, identity, and the read-only kernel-level settings catch-all. Provides the agent with refresh (hot-reload config/presets), karma-gated lifecycle actions on other agents (sleep, lull, suspend, cpr, interrupt, clear, nirvana), preset listing, and the agent's true name/nickname. It is an **LTP v2 family** (`src/lingtai/tools/CONTRACT.md`): one model-facing root `system` with eleven fixed operational children followed by the generic reserved `settings` and `manual` children, each owning its own strict `input` object. Every retained operational action value, its semantics, receipts, privilege gates, and errors are unchanged, and the children consume no additional model tool slots.
+
+**System is an official declared host plugin.** `plugin.py` owns the static
+operational action tuple. `__init__.py::DECLARATION` is constructed before any
+Agent, derives the reserved `settings` action from its explicit boolean opt-in
+and the reserved `manual` action from its `system-manual` destination,
+and binds only a `workdir`, `system_runtime`, and `identity` host façade. The
+normal mounted path is `_bind(host)`: it creates `_SystemHandlerHost(host)` from
+the granted ports, passes that bridge plus `host.workdir` to `_build_family()`,
+and captures the resulting family in the registrar-mounted
+`BoundToolPlugin.handler`; no Agent enters that family. `karma.py::sleep_use_case`
+owns the pending-attention/refusal/force policy, receipt, audit events, the
+one-shot `delay` alarm ordering, and the ASLEEP transition through a narrow
+`SystemSleepPort`. `AgentSystemRuntimeAdapter` in
+`adapters/tool_plugin_host.py` exposes exactly that evidence/effects vocabulary
+(`sleep_attention_fingerprints`, `transition_to_asleep`, `sleep_alarm_lock`,
+`arm_sleep_alarm`, `language`, `log`) and repeats no policy; the mounted bridge
+hands it to the use case as `_system_sleep_port`, and the direct route wraps
+its Agent-like subject in the translation-only `_DirectSleepPort`.
+`system` is registered with `official_plugin` in `tools/registry.py`, so
+`BaseAgent._boot_official_intrinsics()` calls this module's `boot(agent)` to
+claim/mount System once on construction and on every refresh.
+The retained direct `handle(agent, args)` path is
+compatibility-only: it passes the Agent-like subject directly to
+`_build_family()` and dispatches immediately; normal Agent model dispatch never
+uses it. `tests/test_system_declared_plugin.py` is the compact vertical proof
+of declaration, mount, identity, mounted runtime sleep, and packaged manual.
+
+Physical address/workdir rename remains an operator-only System migration route,
+not a `name_set`/`name_nickname` action: the common procedure lives in the
+migration router, helper detail in its nested Agent-name/Project-move references,
+the POSIX transaction in `change_name.py`, the incomplete-target launch gate in
+`src/lingtai/cli.py`, and the executable acceptance scenario in
+[`context/BEHAVIORS.md` L006](../context/BEHAVIORS.md#behavior-l006).
+
+**System owns no public context-hygiene action.** The former `system(action='summarize')` moved to `context`, which split it into `context(action='summarize')` (record-only) and `context(action='rebuild')` (full prompt reconstruction, summary application, then provider replay) — see [`../context/ANATOMY.md`](../context/ANATOMY.md). `summarize.py` remains in this package as the **private engine** those two actions call, and as the source of `SUMMARIZE_MARKER`/`mark_pending_summaries_done` for the kernel's forced-rebuild path; it is not reachable as a `system` action. Conversely, `name.py` arrived here from the dissolved `psyche` family, because naming is runtime identity state this family owns. **System no longer owns any notification verb** — voluntary notification reads and generic dismiss moved to the standalone `notification` tool (sibling package `tools/notification/`, actions `check`/`dismiss_channel`/`dismiss_event`/`dismiss_ref`/`manual`). The system module remains the **conceptual home** of the notification *producer* surface, though — it re-exports `publish_notification` / `clear_notification` from the kernel-root `notifications.py` so any in-process producer (intrinsic, capability, or wired-in MCP server) submits through one canonical entry point.
+
+> **Maintenance:** see the `lingtai-kernel-anatomy` skill. **Coding agents** update this file in the same commit as code changes. **LingTai agents** report drift as issues.
+
+## Components
+
+- `__init__.py` — Package surface, static declared-host binding, family composition, and legacy direct adapter. Re-exports all public API for backward compatibility. Contains:
+  - `get_description` (re-exported from `schema.py`) — tool registration prose.
+  - `DECLARATION`, `_bind()`, and `_SystemHandlerHost` — System's static declaration and its normal mounted-handler route. `_bind()` creates the private compatibility-shaped bridge from only the granted `workdir`, `system_runtime`, and `identity` ports, calls `_build_family(bridge, host.workdir)`, and returns a `BoundToolPlugin` whose handler closes over that family; it never receives an Agent.
+  - `get_schema()` — the composed model-facing family schema. It is built here, not in `schema.py`, because composition belongs next to the child registry it is generated from; it overwrites the generic composer's neutral `action` description with system's own `ACTION_ENUM_DESCRIPTION`.
+  - `_ACTION_HANDLERS` — the one canonical operational action→handler registry (eleven entries; reserved `settings` and `manual` are absent). Each handler keeps its historical `(agent, args)` signature and its module home. `summarize` is absent from this registry — that public action left for `context` — while `name_set`/`name_nickname` are present, bound to `name.py`.
+  - `_build_children()` — builds the eleven operational `ChildTool`s from declaration-derived action/schema data and appends the declaration-owned `system-manual` child; `ToolFamily` injects the provider-bound `settings` child immediately before it. `subject=None` yields schema-only children; normal mounting supplies the port-only `_SystemHandlerHost` bridge and `host.workdir` as the settings/manual source, while direct compatibility supplies the caller's Agent-like subject for both.
+  - `_FAMILY` — the module-level schema-only `ToolFamily`. Building it at import time is also the registry's duplicate/reserved-name collision check: a collision raises `ToolFamilyError` at import rather than shipping silently. It never dispatches.
+  - `_build_family()` — builds a family for its supplied subject and optional workdir/manual source, binding the read-only `system_settings_provider()` to that exact workdir. Its normal mounted call is `_build_family(bridge, host.workdir)`, where `bridge` is the port-only `_SystemHandlerHost` made by `_bind()`; that one family is retained by the per-Agent mounted `BoundToolPlugin.handler`. Its compatibility call is `_build_family(agent, agent)` from `handle(agent, args)`, which constructs a fresh family and dispatches immediately against the caller's Agent-like subject. System is an intrinsic *module*, not a per-Agent manager object, so there is no instance to cache a family on; `_bind()` owns one family per mount, while only the direct compatibility route constructs one per call, and neither is stored in module state when one process serves several agents.
+  - `_strip_nulls()` — drops explicit nulls so "absent" and "null" mean the same downstream, preserving the pre-existing handlers' `args.get(...)` defaulting exactly (notably `refresh`'s preset/revert conflict check and `clear`'s fallback to the caller's own name).
+  - `_adapt_manual_result()` — Host/presentation adapter flattening the reserved child's canonical `content`/`structuredContent` result back to system's pinned flat `status`/`manual`/`manual_path` (+ `error`) shape. Runs strictly *after* dispatch, never inside the child — the no-double-wrap rule.
+  - **No notification/dismiss verb.** The generic notification dismiss (formerly `_dismiss`) moved to the standalone `notification` tool. `large_tool_result` reminder events prefer a successful `context(action="summarize")` of the matching `tool_call_id`, which calls `notifications.clear_large_result_reminders` to remove the matching `large_tool_result:{tool_call_id}` event automatically. The notification tool's dismiss verbs (`dismiss_channel`/`dismiss_event`/`dismiss_ref`) may also acknowledge and remove those reminders as an escape hatch for stale or pre-molt refs that can no longer be summarized.
+  - **`publish_notification` / `clear_notification`** (re-exported from `lingtai.kernel.notifications` as `submit` / `clear`) — canonical producer entry point. Importable as `from lingtai.kernel.notifications import submit as publish_notification, clear as clear_notification` (the tool itself now lives at `lingtai.tools.system`). The system module owns the notification surface conceptually; the implementation lives at the kernel root so non-intrinsic callers (and external scripts) can import it without going through the intrinsic surface.
+  - All handler functions re-exported from sub-modules for backward compatibility.
+  - `_dispatch()` — the System-specific dispatch adapter used by both the mounted handler and the legacy direct adapter. Envelope validation belongs to `ToolFamily.handle`, which validates `action` before child lookup, type-checks and strips root `summarize`, rejects unknown root fields, and rejects `input` keys outside the selected action's own declared schema *before* any handler runs — so a cross-action smuggle such as `action='sleep', input={'address': ...}` fails with no signal file written. `_dispatch()` drops the kernel-injected `_tc_id` (`base_agent._dispatch_tool` adds it to every intrinsic's args), adapts a dispatched `manual` result, and normalizes the generic `ACTION_REQUIRED` envelope failure back to system's pre-migration `{"status": "error", "message": "Unknown system action: <x>"}` verbatim. No notification/dismiss fast path remains — voluntary reads and dismiss live on the standalone `notification` tool, and those verbs stay unknown actions.
+  - `handle(agent, args)` — compatibility-only direct in-process entry point. It calls `_dispatch(_build_family(agent, agent), args)` for the supplied Agent-like subject; normal `Agent` model dispatch invokes the registrar-mounted handler created by `_bind()` instead and never enters this adapter.
+
+- `preset.py` — Preset management and refresh.
+  - `_preset_ref_in()` (`preset.py:9-36`) — normalized membership test for preset path strings (~/foo vs absolute).
+  - `_check_context_fits()` (`preset.py:39-76`) — verify agent's current context fits within target preset's context_limit.
+  - `_refresh()` (`preset.py:79-199`) — stop, reload config + MCP servers, restart. Handles preset swap (named or revert) with authorization gate and context-limit guard. **Empty-string normalization:** `args.get('preset')` returning `''` or whitespace-only is treated as absent (`preset_name = None`) before any conflict/swap logic; this protects against tool-call providers that serialize optional string fields as `""` instead of omitting them — without normalization, an empty string would fall into the allowed-list gate and surface as `"preset '' is not in this agent's allowed list"`. The `preset='' + revert_preset=True` combination is consequently treated as a plain revert (no conflict). **MCP retry hook (issue #34):** before calling `agent._perform_refresh()`, invokes `agent._retry_failed_mcps()` if the Agent subclass defines it. Failures are logged and swallowed so a flaky MCP cannot block refresh itself. Lets the documented "fix config → refresh" recovery path work in-process.
+  - `_presets()` (`preset.py:202-282`) — list available presets with LLM connectivity probing.
+
+- `karma.py` — Karma-gated lifecycle actions.
+  - `_KARMA_ACTIONS` / `_NIRVANA_ACTIONS` (`karma.py:20-21`) — gate mapping sets.
+  - `_check_karma_gate()` (`karma.py:211-228`) — authorization gate: validates karma/nirvana admin flags, resolves target address, rejects self-targeting.
+  - `SystemSleepPort` / `sleep_use_case()` (`karma.py:24-132`) — the single
+  System-owned pending-attention/refusal/force decision, receipt, audit,
+  one-shot `delay` alarm ordering, and ASLEEP transition; a supplied finite
+  positive `delay` is validated first and armed only after the refusal/force
+  gate, under the port's heartbeat-shared lock, atomically replacing
+  `<workdir>/.alarm` before ASLEEP; omitted/null delay retains the prior
+  plain-sleep behavior and leaves any alarm untouched. `_DirectSleepPort`
+  (`karma.py:135-182`) is compatibility translation only.
+  - `_sleep()` (`karma.py:231-247`) — maps the public args onto
+  `sleep_use_case`, selecting the mounted bridge's granted
+  `_system_sleep_port` or wrapping a direct Agent-like subject in
+  `_DirectSleepPort`.
+  - `_lull()` (`karma.py:250-261`) — put another agent to sleep.
+  - `_suspend()` (`karma.py:264-275`) — suspend another agent.
+  - `_cpr()` (`karma.py:278-296`) — resuscitate a suspended agent.
+  - `_interrupt()` (`karma.py:299-309`) — interrupt a running agent's current turn.
+  - `_clear()` (`karma.py:312-331`) — force a full molt on another agent.
+  - `_nirvana()` (`karma.py:334-358`) — permanently destroy an agent's working directory.
+
+- *(removed)* `notification.py` — the agent-facing generic dismiss submodule was **deleted**. Its `_dismiss` verb (and the voluntary notification-read fast path) moved to the standalone `notification` tool (sibling package `tools/notification/`), whose atomic actions `dismiss_channel`/`dismiss_event`/`dismiss_ref` delegate to the kernel-root `notifications.dismiss_channel`. There are **no** `system` compatibility aliases. `system/__init__.py` no longer imports or re-exports `_dismiss`.
+  - Producer-side notification submission still lives in `notifications.py` at the kernel root and is re-exported by this package's `__init__.py` as `publish_notification` / `clear_notification`. See root `ANATOMY.md` "Notifications" for the full architecture and dismissal taxonomy.
+
+- `summarize.py` — Agent-authored context summarization. **Private engine only.** The public actions that drive it are `context(action='summarize')` (record-only) and `context(action='rebuild')` (the context-owned full reconstruction wrapper), which import `_summarize` and pin its `rebuild` discriminator; the kernel's forced-rebuild path imports `SUMMARIZE_MARKER` and `mark_pending_summaries_done` from here. No `system` action reaches this module. The `rebuild` boolean described below is the surviving *internal* parameter, not a model-visible field — see [`../context/ANATOMY.md`](../context/ANATOMY.md).
+  - `SUMMARIZE_MARKER` (`summarize.py:13`) — stable string marker (`"lingtai_agent_summarized_result"`) stamped on every replacement block so idempotency checks and future passes can detect them without heuristics.
+  - `_is_already_summarized()` (`summarize.py:17`) — returns True iff a ToolResultBlock's content is already a summarize replacement.
+  - `_find_tool_result_block()` (`summarize.py:22`) — walks live `ChatInterface._entries` and returns the `(entry, block_index, block)` triple for a given `tool_call_id`, or `(None, -1, None)` when not found.
+  - `_summarize()` (`summarize.py:51`) — main handler. For each item, finds the matching `ToolResultBlock`, validates it (not already summarized, not a daemon result), mutates `block.content` in place with the compact replacement dict, logs `tool_result_summarized`, and calls `agent._save_chat_history(ledger_source="summarize")` after all successful mutations. After persisting, it calls `notifications.clear_large_result_reminders(agent, summarized_ids)` so each successfully summarized `tool_call_id` clears its matching `large_tool_result:{tool_call_id}` system reminder automatically — the preferred discharge path. The notification tool's dismiss verbs can acknowledge and remove these reminders when summarization is no longer possible. The result dict carries `cleared_reminders` (list of cleared ref_ids). Returns per-item success/failure with reasons. Passing `notification_threshold_chars` returns an error (`reason: runtime_threshold_change_not_supported`) — the threshold is config-only. Each replacement marker carries an explicit `status` field (`SUMMARY_STATUS_PENDING`/`SUMMARY_STATUS_DONE`): ordinary summarize writes `status: pending`; it flips to `done` when the summaries are actually applied to provider context. A boolean `rebuild` arg (default false) controls provider-context rebuild: `rebuild=true` with items records summaries (pending) then captures the pending batch's applied totals, flips those markers to `done` via `mark_pending_summaries_done()`, and calls `chat.request_history_rebuild(reason="summarize_rebuild_only")`; `rebuild=true` with no items does the same over the already-pending markers (`_pure_rebuild_result()`); `rebuild=false` with no items is an invalid no-op (`reason: missing_items`). The old public `rebuild_only`/`dry_run` params are removed (the internal `summarize_rebuild_only` epoch-reset label is unchanged). The success `reconstruction` comment has exactly two categories keyed on `rebuild`: **summarize-only** (`mode: summarize`, carries `pending_summary_totals`) and **rebuild** (`mode: rebuild`, carries `applied_summary_totals` + `marked_done`); both carry a `context` usage/tokens/window snapshot (`_current_context_snapshot()`). Marker `status` — NOT mere marker presence or any adapter-private id set — is the source of truth: pending totals (`_summary_totals_over_pending()`) scan only `status: pending` markers, so already-applied (`done`) markers and legacy markers with no status are excluded; a summarize-only call naturally includes its own just-recorded pending markers plus any earlier still-pending ones. The summarize-only comment's forced-rebuild wording is conditional on the pending total (>0 → the 1.0 boundary applies them, or rebuild now; ==0 → the forced rebuild has nothing to apply, so summarize more or molt). The hard boundary is **1.0** (`CONTEXT_PRESSURE_FORCED_REBUILD_RATIO`, back-compat alias `CONTEXT_PRESSURE_RECONSTRUCTION_RATIO`): at context usage >= 1.0 the runtime forces a provider-context rebuild/fresh replay on the next request REGARDLESS of whether pending summaries exist — but only **once per continuous >= 1.0 episode** (`CodexResponsesSession._hb_rebuild_fired` latches the one-shot, shared by the pre-request boundary check and the immediate `on_history_summarized` release; it re-arms only after a later provider usage drops strictly below 1.0); `summarize` is the only historical tool-result body replacement a rebuild applies — the fresh replay otherwise preserves each historical timely-transient holder and does not strip its `agent_meta`/`guidance` or `notifications`/`notification_guidance` keys via the shared converters (`lingtai/llm/interface_converters.py`), on every provider, without rewriting recorded history (only the LATEST holder per family is current state; older holders are historical traces). That forced rebuild flips pending markers `done` via a small session hook (`CodexResponsesSession._reset_ws_epoch("summarize_delayed")` → `mark_pending_summaries_done(self._interface)`) and ALWAYS attaches one unified `_meta.agent_meta.agent_state.events.reconstruction.warning` (built by `render_forced_rebuild_warning()`: before→after tokens/usage, proactive-0.85-rebuild advice, and the conditional "if still above 0.75, molt" instruction — no high/low branching). If that one forced rebuild does NOT clear the overflow (post-rebuild provider usage still strictly > 1.0, once observed), the adapter's `context_overflow_status()` drives a persistent `_meta.agent_meta.agent_state.context.molt` line (`render_forced_rebuild_failed_warning()`): `100% context Forced Rebuild Failed to Bring Usage Below 100%. … (xxx %) Molt IMMEDIATELY!!`, restamped on every result until usage drops below 1.0.
+
+- `name.py` — The agent's true name and nickname. Moved here verbatim from the dissolved `psyche` family; the action names, the single `content` field, success payloads, and error strings are exactly what they were.
+  - `_name_set()` (`name.py:20`) — sets the true name (真名). Refuses an empty name, and refuses a second set (`agent.set_name` raises `RuntimeError` once `agent_name` exists), so the true name is genuinely one-time.
+  - `_name_nickname()` (`name.py:32`) — sets or clears the mutable nickname (别名); empty `content` clears it to `None`.
+  - Both delegate to the BaseAgent identity Port (`kernel/base_agent/identity.py`), which updates live in-memory identity, writes `.agent.json` via `_build_manifest`, and rewrites the protected prompt `identity` section. Neither is init/config editing, and neither touches the agent's address or working directory — the physical rename is the operator migration workflow in `system-manual`.
+
+- `settings.py` — the read-only owner for both `settings/system.json` runtime policy and the complete System catch-all inventory implementing [B009](BEHAVIORS.md#behavior-b009). `resolve_cache_miss_budget` preserves live valid env > exact closed-v1/v2 file > fixed `2_000_000`; `_parse_runtime_policy_v2` / `read_runtime_policy_document` parse the closed presence-aware v2 document; `resolve_runtime_policy(working_dir)` returns the seven ordinary values and provenance as env > v2 > fixed default; `resolve_notification_max_chars` exposes only the v2 file layer of the notification cap. The bound `SettingsProvider` reuses those canonical runtime resolvers, fresh-reads remaining effective init/preset inputs, applies provider normalization using resolved policy, and calls existing environment resolvers to return stable unique five-field rows without constructing a client. Legacy init/preset copies of ordinary runtime-policy fields are explicit compatibility exclusions, not SHOW sources. Prompt/credential/header/auth/path material is fully redacted, unsafe current truth fails the whole SHOW, and the module owns no mutation handler or shared registry framework.
+- `agent.py::Agent.resolve_cache_miss_budget` / `resolve_runtime_policy` / `resolve_notification_max_chars` — lazy outer composition hooks. `_setup_from_init` resolves one policy per setup and applies it to the service rebuild, `build_agent_config(..., runtime_policy=)`, `SessionManager.streaming`, and the guarded snapshot-enable transition; kernel metadata/caps consume only returned scalars without importing ToolPlugin modules.
+- `cli.py::build_llm_service` / `build_agent` — resolve the same policy once at boot (after `env_file` loading) so the first service and constructor streaming flag match later refresh state.
+- `kernel/meta_block.py::_resolve_cache_miss_budget` — validates the outer positive scalar, falls back to fixed `2_000_000` for a bare/failing stub, and shares one immutable result between telemetry and the Context guard.
+
+- `schema.py` — Schema **data** only. It deliberately defines no `get_schema()`: the model-facing schema is composed from the data below by `__init__.py`, next to the child registry it is generated from.
+  - `ACTION_ORDER` (`schema.py:53`) — the single source for the operational plus manual schema data. Exactly `("refresh", "sleep", "lull", "interrupt", "suspend", "cpr", "clear", "nirvana", "presets", "name_set", "name_nickname", "manual")` — every lifecycle/preset action keeps its pre-migration position; `summarize` was removed (it left for `context`) and the two name actions were appended before `manual`. The declaration's explicit opt-in mechanically inserts `settings` immediately before `manual`; no hand-authored settings schema or handler appears here. No `notification`/`dismiss`.
+  - `INPUT_SCHEMAS` (`schema.py:182-198`) — each action's own strict closed `input_schema`. The surviving pre-migration flat sibling fields live in the actions that actually read them: `reason` (refresh/sleep and the six address verbs), `address` (the six address verbs), `preset`/`revert_preset` (refresh), and `content` (the two name actions); `presets` and `manual` take the canonical strict-empty input. `sleep.delay` is the provider-compatible required-nullable optional number with `exclusiveMinimum: 0` and no maximum; `_strip_nulls` makes null ordinary sleep while the handler rejects bool/nonfinite/nonpositive direct values. `items`/`rebuild` are declared by **no** action here — they left with the summarize action and are now `context`'s. Optional fields use the provider-compatible nullable representation, which `__init__.py::_strip_nulls` reverses before the handlers run. `manual` references the exported `tool_family.manual.MANUAL_INPUT_SCHEMA` literal rather than restating it, so the schema-only and dispatching families cannot drift.
+  - `_address_input_schema()` (`schema.py:83-102`) — generates the identical two-field shape the six address-taking verbs share, returning a fresh dict per call so no two children share a mutable schema container.
+  - `ACTION_ENUM_DESCRIPTION` (`schema.py:203-227`) — the concise per-action prose the model reads to choose an action; it preserves the action semantics while routing operational depth to `system-manual`.
+  - `get_description()` (`schema.py:230-240`) — the tool registration prose: the three privilege classes, the envelope call shape, the notification-tool and `context`-hygiene pointers, and the root-`summarize` guidance profile.
+  - Two fields are **not** a straight carry-over of the pre-migration *schema*: `sleep.force` was always read by `karma._sleep` (the kernel#112 escape hatch) but never advertised, and a strict child input must declare every key its handler accepts or dispatch would reject a call that succeeds today — declaring it surfaces existing behavior rather than adding any. `notification_threshold_chars` stays absent at both envelope levels (threshold is config-only via init.json + refresh); the private `summarize._summarize` engine's loud runtime-mutation refusal is retained as the inner layer for direct in-process callers that bypass the envelope.
+
+## Connections
+
+- **Inbound:** Normal tool dispatch (via `base_agent._dispatch_tool`) invokes the registrar-mounted `BoundToolPlugin.handler` created by `_bind()`, which closes over `_build_family(bridge, host.workdir)` and reaches `_dispatch()` through the port-only bridge. The dispatcher injects the transport-only `_tc_id` into every intrinsic's args; `_dispatch()` drops it at this package's Host boundary rather than widening the generic envelope's admitted root fields. `handle(agent, args)` remains only for direct in-process compatibility callers and instead constructs `_build_family(agent, agent)`.
+- **Outbound (composition):** `__init__.py` imports the generic `ChildTool`/`ToolFamily` infra and `build_manual_child` from `tools/tool_family/` to compose the model-facing schema and dispatch, while `settings.py` supplies the family-owned `SettingRow` provider. System is that package's eleventh consumer and its second intrinsic (after the since-removed `soul`); Notification is a declared official family rather than an intrinsic. System follows the same module-level shape: a schema-only family at import time, a port-bridge family retained per mounted registration, and a direct Agent-like family built per compatibility call. Adopting the infra is optional and partial adoption is conforming — see `src/lingtai/tools/tool_family/CONTRACT.md`.
+- **Outbound (kernel allowlist):** `kernel/tool_result_summary.py::_LTP_V2_MIGRATED_FAMILIES` lists `system`, so the root `summarize` boolean this family advertises to the model is actually honored by the central summarizer. A family adopting the envelope without joining that allowlist would advertise a control the kernel silently ignores.
+- **Inbound (cross-module):** `base_agent/messaging.py` writes system events through the injected `NotificationStorePort.compare_update_channel` and consumes policy evidence from the result. The generic dismiss verb lives on the standalone `notification` tool (delegating to kernel-root `notifications.dismiss_channel`); `system` does not expose it. `summarize.py:SUMMARIZE_MARKER` and `_is_already_summarized` are re-exported from `__init__.py` for external callers.
+- **Tool-result metadata**: Tool result metadata is the umbrella for formal blocks nested under a single `_meta` envelope: immutable per-result `_meta.tool_meta` plus one complete current `_meta.agent_meta` final-carrier snapshot containing nested `agent_state`, `notifications`, and `guidance`; only the newest holder is current/actionable, while older payload copies remain historical traces. The old `_tool_result_metadata` compatibility block is intentionally removed; large-result follow-up is surfaced through `_meta.agent_meta.agent_state.current_tool_result_chars` (a ranked summarize-candidate list, see below) rather than a provider-visible metadata field or a pushed notification.
+- **Large-result ranking (replaces the removed `large_tool_result` notification):** Large tool results no longer raise a `large_tool_result` system notification. The two former producers — `base_agent/__init__.py:_maybe_notify_large_tool_result()` (per-result hook) and `base_agent/messaging.py:_rescan_large_tool_results()` (turn-boundary rescan) — are retained as inert no-ops (the hook seam and the turn-boundary housekeeping trio are unchanged; the total-length gate, the `_pending_large_result_*` helpers, and `LARGE_RESULT_TOTAL_LEN_GATE` were deleted). Instead, `meta_block.current_tool_result_chars()` ranks the largest formal results in live context and stamps them onto `_meta.agent_meta.agent_state.current_tool_result_chars` (on the complete current `_meta.agent_meta` snapshot attached to the eligible final carrier): `total_chars`, `threshold` (the `_summarize_notification_threshold` hint size, default 3000, config-only via `manifest.summarize_notification_threshold` in init.json + refresh), `over_threshold_count`, and `top_results` (id, tool_name, chars; top 5 over 1000 chars, no preview). `_meta`/notification/guidance scaffolding is excluded by `formal_tool_result_visible_len`. The agent reads `top_results`, digests what it needs, then calls `context(action="summarize")` for the chosen `tool_call_id`s. The threshold still drives the `tool_meta.comment.overflow` hint in `ToolExecutor` and is config-only (passing `notification_threshold_chars` to `context(action="summarize")` returns an error). **Legacy compatibility:** any `large_tool_result` event persisted before this change (or pre-molt) is still dismissible via the `notification` tool, and a successful `context(action="summarize")` of its `tool_call_id` still auto-clears it via `notifications.clear_large_result_reminders`.
+- **Outbound:** Depends on `...notifications` for Core submit/clear/dismiss policy and on the agent’s required Notification Store for snapshots/fingerprints; also uses `...i18n`, `...handshake`, `...state`, `...presets`, and `...preset_connectivity`.
+- **Data flow:** Karma actions write signal files (`.sleep`, `.suspend`, `.interrupt`, `.clear`) into target agent working directories. A delayed self-sleep writes `<workdir>/.alarm`; lifecycle publishes the due event through the ordinary notification path. Preset swap reads/writes `init.json`. `settings.py` resolves live cache budget and ordinary runtime policy from env / `settings/system.json` / fixed defaults, then fresh-reads only the remaining effective init/preset inputs and existing environment resolvers to project the complete five-field catch-all inventory. Legacy init/preset copies of ordinary runtime-policy fields never become current values; `system/manifest.resolved.json` is never authority. Notification caps consume only the outer v2 file hook after Core's env read. No settings path is written by SHOW.
+
+## Key invariants
+
+- System has one family settings file, `settings/system.json`, with no per-action file. Closed v1 remains exactly `{schema_version: 1, cache_miss_budget: positive-int}`. Closed v2 accepts only `context_limit`, `max_rpm`, `streaming`, `aed_timeout`, `max_aed_attempts`, `snapshot_interval`, `activeness`, `cache_miss_budget`, and `notification_max_chars`; one invalid/unknown/duplicate field rejects the whole document. The seven ordinary rows resolve as valid env > v2 > fixed default and are applied consistently at boot/refresh; legacy init copies are ignored.
+- The declaration plus provider opts System into SHOW even when the file is absent. SHOW includes runtime-policy values, effective non-policy root/manifest/LLM inputs, and kernel environment controls without another ToolPlugin owner, including global `runtime.tool_batch_memory_relief`. Existing File/Shell/manual procedures are the only change routes; `configurable` grants no mutation; sensitive values are fully redacted. Concrete ToolPlugin domains, dead compatibility fields, build/test controls, and handoff identities remain excluded.
+- `_dispatch()` uses the explicit declaration-derived handler table rather than `globals().get()`, so mounted and compatibility dispatch work correctly across sub-modules.
+- `system` has **no** agent-callable `notification` or `dismiss` action; voluntary notification reads and dismiss live on the standalone `notification` tool. (The kernel still synthesizes a notification-delivery tool-call pair for IDLE/ASLEEP delivery — now shaped as `notification(action="check")` (no longer `system(action="notification")`), so the synthetic pair is byte-shape-identical to a voluntary `notification` check. That synthesis is `base_agent` plumbing, not a `system` intrinsic action. Such synthesized reads carry `_synthesized: True` in both the JSON body and the `ToolResultBlock.synthesized` flag, and the canonical live payload (`_meta.agent_meta.notifications.attention` / `_meta.agent_meta.guidance.transient`) is stamped on by the turn loop's `attach_active_notifications` post-hook — guaranteeing one live notification payload in conversation history at any moment.)
+- Karma gate checks resolve addresses through `_check_karma_gate()` which validates admin flags before any filesystem mutation.
+- Generic notification dismiss is **not** a `system` verb — it lives on the standalone `notification` tool (delegating to kernel-root `notifications.dismiss_channel`). Its dismissal-taxonomy invariants (guarded producer channels refusing without `force`, protected source-of-truth channels refusing even with `force`, `post-molt` requiring a non-empty `reason`, `large_tool_result` acknowledge/remove handling) are documented at root `ANATOMY.md` "Notifications" and in `tools/notification/ANATOMY.md`.
+- Preset swap has two guards: authorization (allowed list) and context-fit (current tokens ≤ target context_limit).
+- Producer notification writes (`publish_notification`) are atomic (`tmp + rename` inside `notifications.publish`) — readers never see a half-written file.
+- `summarize` mutates only `ToolResultBlock.content` in the live `ChatInterface._entries` — entry order, role, id, name, synthesized flag, and `tool_call`/`tool_result` pairing are untouched. The durable `logs/events.jsonl` is never modified by `summarize`; the full original remains retrievable by `tool_call_id`.
+- `_is_already_summarized()` detects the `SUMMARIZE_MARKER` sentinel to make re-summarization a per-item error rather than silently overwriting a prior summary.
+- Large-result notification fires only for main-agent tool results; spill manifests (already capped) are excluded via `is_spill_manifest()`.

@@ -13,7 +13,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from lingtai_kernel.llm.interface import ChatInterface, TextBlock, ToolCallBlock
+from lingtai.kernel.llm.interface import (
+    ChatInterface,
+    TextBlock,
+    ToolCallBlock,
+    ToolResultBlock,
+)
+
+
+from tests._molt_helpers import write_session_journal as _write_session_journal
 
 
 # ---------------------------------------------------------------------------
@@ -41,13 +49,13 @@ def _make_mock_service():
 
 
 def _make_agent(tmp_path):
-    """Create an Agent with psyche capability and a working mock session."""
+    """Create an Agent with the context intrinsic and a working mock session."""
     from lingtai.agent import Agent
 
     svc = _make_mock_service()
     agent = Agent(
         service=svc, agent_name="test", working_dir=tmp_path / "test",
-        capabilities=["psyche"],
+        capabilities=["context"],
     )
     return agent
 
@@ -76,7 +84,7 @@ def _add_molt_call(agent, summary="Test summary"):
     iface = agent._chat.interface
     molt_block = ToolCallBlock(
         id=tc_id,
-        name="psyche",
+        name="context",
         args={
             "object": "context",
             "action": "molt",
@@ -102,7 +110,7 @@ class TestContextMoltKeepLast:
 
     def test_keep_last_default_preserves_20(self, tmp_path):
         """Default (no keep_last): keeps last 20 entries (default)."""
-        from lingtai_kernel.intrinsics.psyche._molt import _context_molt
+        from lingtai.tools.context._molt import _context_molt
 
         agent = _make_agent(tmp_path)
         agent.start()
@@ -116,9 +124,11 @@ class TestContextMoltKeepLast:
             ])
             tc_id = _add_molt_call(agent)
 
+            journal_path = _write_session_journal(agent)
             result = _context_molt(agent, {
                 "summary": "Test summary",
                 "_tc_id": tc_id,
+                "session_journal_path": journal_path,
             })
 
             assert result["status"] == "ok"
@@ -135,7 +145,7 @@ class TestContextMoltKeepLast:
 
     def test_keep_last_zero_archives_all(self, tmp_path):
         """keep_last=0 explicitly disables keeping, archives all."""
-        from lingtai_kernel.intrinsics.psyche._molt import _context_molt
+        from lingtai.tools.context._molt import _context_molt
 
         agent = _make_agent(tmp_path)
         agent.start()
@@ -149,10 +159,12 @@ class TestContextMoltKeepLast:
             ])
             tc_id = _add_molt_call(agent)
 
+            journal_path = _write_session_journal(agent)
             result = _context_molt(agent, {
                 "summary": "Test summary",
                 "_tc_id": tc_id,
                 "keep_last": 0,
+                "session_journal_path": journal_path,
             })
 
             assert result["status"] == "ok"
@@ -164,7 +176,7 @@ class TestContextMoltKeepLast:
             # Only the replayed molt call
             assert len(non_system) == 1
             assert any(
-                isinstance(b, ToolCallBlock) and b.name == "psyche"
+                isinstance(b, ToolCallBlock) and b.name == "context"
                 for b in non_system[0].content
             )
         finally:
@@ -172,7 +184,7 @@ class TestContextMoltKeepLast:
 
     def test_keep_last_preserves_entries(self, tmp_path):
         """keep_last=2 preserves the last 2 conversation entries."""
-        from lingtai_kernel.intrinsics.psyche._molt import _context_molt
+        from lingtai.tools.context._molt import _context_molt
 
         agent = _make_agent(tmp_path)
         agent.start()
@@ -186,10 +198,12 @@ class TestContextMoltKeepLast:
             ])
             tc_id = _add_molt_call(agent)
 
+            journal_path = _write_session_journal(agent)
             result = _context_molt(agent, {
                 "summary": "Test summary",
                 "_tc_id": tc_id,
                 "keep_last": 2,
+                "session_journal_path": journal_path,
             })
 
             assert result["status"] == "ok"
@@ -218,7 +232,7 @@ class TestContextMoltKeepLast:
 
     def test_keep_last_larger_than_total(self, tmp_path):
         """keep_last > total entries: preserves all non-system entries (excluding molt call)."""
-        from lingtai_kernel.intrinsics.psyche._molt import _context_molt
+        from lingtai.tools.context._molt import _context_molt
 
         agent = _make_agent(tmp_path)
         agent.start()
@@ -232,10 +246,12 @@ class TestContextMoltKeepLast:
 
             # 3 non-system entries (user, assistant, molt-call), but molt-call
             # is excluded from keep_last (replayed separately), so keep all 2
+            journal_path = _write_session_journal(agent)
             result = _context_molt(agent, {
                 "summary": "Test summary",
                 "_tc_id": tc_id,
                 "keep_last": 100,
+                "session_journal_path": journal_path,
             })
 
             assert result["status"] == "ok"
@@ -260,8 +276,8 @@ class TestContextMoltKeepLast:
 
     def test_keep_last_deduplicates_with_keep_tool_calls(self, tmp_path):
         """Entries already in keep_tool_calls are removed from keep_last."""
-        from lingtai_kernel.intrinsics.psyche._molt import _context_molt
-        from lingtai_kernel.llm.interface import ToolResultBlock
+        from lingtai.tools.context._molt import _context_molt
+        from lingtai.kernel.llm.interface import ToolResultBlock
 
         agent = _make_agent(tmp_path)
         agent.start()
@@ -293,11 +309,13 @@ class TestContextMoltKeepLast:
 
             # keep_last=100 to keep everything, keep_tool_calls names the
             # same tool pair — the overlapping entries should be deduplicated.
+            journal_path = _write_session_journal(agent)
             result = _context_molt(agent, {
                 "summary": "Test summary",
                 "_tc_id": tc_id,
                 "keep_last": 100,
                 "keep_tool_calls": [lt_id],
+                "session_journal_path": journal_path,
             })
 
             assert result["status"] == "ok"
@@ -326,7 +344,7 @@ class TestContextMoltKeepLast:
 
     def test_keep_last_invalid_type_rejected(self, tmp_path):
         """Non-integer keep_last is rejected."""
-        from lingtai_kernel.intrinsics.psyche._molt import _context_molt
+        from lingtai.tools.context._molt import _context_molt
 
         agent = _make_agent(tmp_path)
         agent.start()
@@ -335,10 +353,12 @@ class TestContextMoltKeepLast:
             _populate_conversation(agent, [("user", "Hi")])
             tc_id = _add_molt_call(agent)
 
+            journal_path = _write_session_journal(agent)
             result = _context_molt(agent, {
                 "summary": "Test summary",
                 "_tc_id": tc_id,
                 "keep_last": "twenty",
+                "session_journal_path": journal_path,
             })
 
             assert "error" in result
@@ -348,7 +368,7 @@ class TestContextMoltKeepLast:
 
     def test_keep_last_negative_rejected(self, tmp_path):
         """Negative keep_last is rejected."""
-        from lingtai_kernel.intrinsics.psyche._molt import _context_molt
+        from lingtai.tools.context._molt import _context_molt
 
         agent = _make_agent(tmp_path)
         agent.start()
@@ -357,10 +377,12 @@ class TestContextMoltKeepLast:
             _populate_conversation(agent, [("user", "Hi")])
             tc_id = _add_molt_call(agent)
 
+            journal_path = _write_session_journal(agent)
             result = _context_molt(agent, {
                 "summary": "Test summary",
                 "_tc_id": tc_id,
                 "keep_last": -5,
+                "session_journal_path": journal_path,
             })
 
             assert "error" in result
@@ -370,8 +392,8 @@ class TestContextMoltKeepLast:
 
     def test_keep_last_with_keep_tool_calls(self, tmp_path):
         """keep_last and keep_tool_calls can be used together."""
-        from lingtai_kernel.intrinsics.psyche._molt import _context_molt
-        from lingtai_kernel.llm.interface import ToolResultBlock
+        from lingtai.tools.context._molt import _context_molt
+        from lingtai.kernel.llm.interface import ToolResultBlock
 
         agent = _make_agent(tmp_path)
         agent.start()
@@ -402,11 +424,13 @@ class TestContextMoltKeepLast:
 
             tc_id = _add_molt_call(agent)
 
+            journal_path = _write_session_journal(agent)
             result = _context_molt(agent, {
                 "summary": "Test summary",
                 "_tc_id": tc_id,
                 "keep_last": 2,  # keep last 2 entries
                 "keep_tool_calls": [lt_id],  # also keep the tool pair
+                "session_journal_path": journal_path,
             })
 
             assert result["status"] == "ok"
@@ -426,7 +450,7 @@ class TestContextForgetKeepLast:
 
     def test_context_forget_default_no_keep(self, tmp_path):
         """Default context_forget archives everything (no keep_last)."""
-        from lingtai_kernel.intrinsics.psyche._molt import context_forget
+        from lingtai.tools.context._molt import context_forget
 
         agent = _make_agent(tmp_path)
         agent.start()
@@ -445,7 +469,7 @@ class TestContextForgetKeepLast:
 
     def test_context_forget_with_keep_last(self, tmp_path):
         """context_forget with keep_last preserves recent entries."""
-        from lingtai_kernel.intrinsics.psyche._molt import context_forget
+        from lingtai.tools.context._molt import context_forget
 
         agent = _make_agent(tmp_path)
         agent.start()
@@ -483,7 +507,7 @@ class TestContextForgetKeepLast:
 
     def test_context_forget_no_task_snapshot_saved_field(self, tmp_path):
         """context_forget no longer includes task_snapshot_saved in result."""
-        from lingtai_kernel.intrinsics.psyche._molt import context_forget
+        from lingtai.tools.context._molt import context_forget
 
         agent = _make_agent(tmp_path)
         agent.start()
@@ -496,3 +520,124 @@ class TestContextForgetKeepLast:
             assert "task_snapshot_saved" not in result
         finally:
             agent.stop()
+
+
+# ---------------------------------------------------------------------------
+# Atomic keep_last batch selection regressions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("keep_last", "expected_indices"),
+    [
+        (6, [1, 2, 3, 4, 5, 6]),  # cut before the single-call batch
+        (5, [1, 2, 3, 4, 5, 6]),  # cut between its call and result
+        (4, [3, 4, 5, 6]),        # cut after the single-call batch
+        (3, [4, 5, 6]),            # cut before the parallel batch
+        (2, [4, 5, 6]),            # cut between its calls and results
+        (1, [6]),                  # cut after the parallel batch
+    ],
+)
+def test_keep_last_suffix_retains_tool_batches_atomically(keep_last, expected_indices):
+    """A suffix cut never retains only part of a single or parallel tool batch."""
+    from lingtai.tools.context._molt import _select_keep_last_entries
+
+    iface = ChatInterface()
+    iface.add_system("system")
+    iface.add_user_message("old")                         # 0
+    iface.add_assistant_message([                         # 1
+        ToolCallBlock(id="single-call", name="lookup", args={}),
+    ])
+    iface.add_tool_results([                               # 2
+        ToolResultBlock(id="single-call", name="lookup", content="single-result"),
+    ])
+    iface.add_user_message("between")                     # 3
+    iface.add_assistant_message([                         # 4
+        ToolCallBlock(id="parallel-a", name="lookup", args={}),
+        ToolCallBlock(id="parallel-b", name="lookup", args={}),
+    ])
+    iface.add_tool_results([                               # 5
+        ToolResultBlock(id="parallel-b", name="lookup", content="parallel-b-result"),
+        ToolResultBlock(id="parallel-a", name="lookup", content="parallel-a-result"),
+    ])
+    iface.add_user_message("after")                       # 6
+
+    entries = [entry for entry in iface.entries if entry.role != "system"]
+    selected = _select_keep_last_entries(entries, keep_last)
+    assert [entry.id for entry in selected] == [entries[i].id for i in expected_indices]
+
+
+def test_ordinary_molt_replays_atomic_keep_last_batch(tmp_path):
+    """The ordinary molt call site uses the shared atomic suffix selector."""
+    from lingtai.tools.context._molt import _context_molt
+
+    agent = _make_agent(tmp_path)
+    agent.start()
+    try:
+        _ensure_session(agent)
+        iface = agent._chat.interface
+        iface.add_user_message("before")
+        iface.add_assistant_message([
+            ToolCallBlock(id="ordinary-call", name="lookup", args={}),
+        ])
+        iface.add_tool_results([
+            ToolResultBlock(id="ordinary-call", name="lookup", content="result"),
+        ])
+        iface.add_user_message("after")
+        tc_id = _add_molt_call(agent)
+
+        result = _context_molt(agent, {
+            "summary": "summary",
+            "_tc_id": tc_id,
+            "keep_last": 2,
+            "session_journal_path": _write_session_journal(agent),
+        })
+
+        assert result["status"] == "ok"
+        assert result["kept_last"] == 3
+        replayed = agent._chat.interface
+        assert sum(
+            isinstance(block, ToolCallBlock) and block.id == "ordinary-call"
+            for entry in replayed.entries for block in entry.content
+        ) == 1
+        assert sum(
+            isinstance(block, ToolResultBlock) and block.id == "ordinary-call"
+            for entry in replayed.entries for block in entry.content
+        ) == 1
+    finally:
+        agent.stop()
+
+
+def test_forced_context_forget_replays_atomic_keep_last_batch(tmp_path):
+    """Forced context_forget shares the same atomic suffix selector."""
+    from lingtai.tools.context._molt import context_forget
+
+    agent = _make_agent(tmp_path)
+    agent.start()
+    try:
+        _ensure_session(agent)
+        iface = agent._chat.interface
+        iface.add_user_message("before")
+        iface.add_assistant_message([
+            ToolCallBlock(id="forced-call", name="lookup", args={}),
+        ])
+        iface.add_tool_results([
+            ToolResultBlock(id="forced-call", name="lookup", content="result"),
+        ])
+        iface.add_user_message("after")
+
+        result = context_forget(agent, source="admin", keep_last=2)
+
+        assert result["status"] == "ok"
+        assert result["kept_last"] == 3
+        replayed = agent._chat.interface
+        assert sum(
+            isinstance(block, ToolCallBlock) and block.id == "forced-call"
+            for entry in replayed.entries for block in entry.content
+        ) == 1
+        assert sum(
+            isinstance(block, ToolResultBlock) and block.id == "forced-call"
+            for entry in replayed.entries for block in entry.content
+        ) == 1
+    finally:
+        agent.stop()

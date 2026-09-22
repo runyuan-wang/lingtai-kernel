@@ -1,15 +1,16 @@
 [build-system]
-# ``wheel`` is required because setup.py overrides ``bdist_wheel`` to mark
-# the wheel as platform-specific when the bundled Rust sidecar binary is
-# present. See setup.py for the build-time bundle / fallback logic.
+# Pure-Python project: the build is fully described here, with no setup.py
+# hooks. ``wheel`` stays pinned for the setuptools<70 ``bdist_wheel`` path.
 requires = ["setuptools>=68.0", "wheel>=0.41"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "lingtai"
-version = "0.11.2"
+version = "1.0.8"
 description = "Generic research agent with intrinsic tools and MCP-compatible extension interface"
 readme = "README.md"
+# Architecture-specific macOS Python limits are expressed by the uv resolution
+# environments below; Requires-Python retains the project's global code baseline.
 requires-python = ">=3.11"
 license = "Apache-2.0"
 classifiers = [
@@ -22,46 +23,161 @@ dependencies = [
     "openai>=1.0",
     "anthropic>=0.40",
     "google-genai>=1.0",
-    "mcp>=1.0",
+    # Official MCP Python SDK v2 (protocol 2026-07-28). The supported range is
+    # the SDK's own published compatibility window; the wheel exact-pins
+    # `mcp-types`, so never pin that separately here.
+    "mcp>=2,<3",
+    # Direct, not transitive: `services/mcp.py` imports httpx2 to build the
+    # AsyncClient the v2 Streamable HTTP transport requires. Floor matches the
+    # official SDK v2 declaration.
+    "httpx2>=2.5.0",
     "ddgs>=7.0",
     "trafilatura>=2.0",
     "filelock>=3.0",
     "pyyaml>=6.0",
-    # Curated MCP servers (formerly bundled in lingtai.addons; v0.7.3 split
-    # into separate sibling repos and PyPI packages). Required so
-    # `pip install lingtai` ships the same capability surface as previous
-    # releases. See lingtai-anatomy reference/mcp-protocol.md for the
-    # catalog → registry → activation chain that wires them up.
-    "lingtai-imap>=0.1.0",
-    "lingtai-telegram>=0.1.0",
-    "lingtai-feishu>=0.1.0",
-    "lingtai-wechat>=0.1.0",
-    "lingtai-whatsapp>=0.1.0",
+    "packaging>=24.0",
+    # Curated MCP server implementations live in this distribution under
+    # `lingtai.mcp_servers.*` so the catalog can launch them with `python -m`
+    # without separate PyPI wheels. Keep their third-party runtime dependencies
+    # here.
+    "imapclient>=3.0.0",
+    "msal>=1.37.0",
+    "lark-channel-sdk>=1.2,<2",
+    "cryptography>=42.0.0",
+    "qrcode>=7.4.0",
+    "faster-whisper>=1.0.0",
+    # Published PEP 508 metadata must remain safe for pip/packaging evaluators on
+    # every OS. Keep release comparisons out of these public markers; uv-local
+    # constraints below select the exact wheel for each supported macOS cell.
+    "onnxruntime>=1.23.2,<1.29; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "onnxruntime==1.23.2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+]
+
+[tool.uv]
+# These entries are disjoint. The project Requires-Python lower bound intersects
+# the non-Darwin branch, so it still means Python >=3.11 there.
+environments = [
+    "sys_platform != 'darwin'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64' and platform_release >= '23' and python_version >= '3.11' and python_version < '3.15'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64' and platform_release >= '22' and platform_release < '23' and python_version >= '3.11' and python_version < '3.14'",
+    "sys_platform == 'darwin' and platform_machine == 'x86_64' and platform_release >= '22' and python_version >= '3.11' and python_version < '3.14'",
+]
+
+# These exact release-gated pins are uv-local constraints, not published wheel
+# metadata. They narrow the architecture-only requirements above only when the
+# corresponding macOS environment is resolved.
+constraint-dependencies = [
+    "onnxruntime==1.28.0; sys_platform == 'darwin' and platform_machine == 'arm64' and platform_release >= '23'",
+    "onnxruntime==1.23.2; sys_platform == 'darwin' and platform_machine == 'arm64' and platform_release >= '22' and platform_release < '23'",
+    "onnxruntime==1.23.2; sys_platform == 'darwin' and platform_machine == 'x86_64' and platform_release >= '22'",
+]
+
+# onnxruntime has no sdist. Enumerating each minor makes every supported
+# ABI/platform cell an explicit wheel obligation.
+required-environments = [
+    # Apple Silicon, macOS 14+
+    "sys_platform == 'darwin' and platform_machine == 'arm64' and platform_release >= '23' and python_version == '3.11'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64' and platform_release >= '23' and python_version == '3.12'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64' and platform_release >= '23' and python_version == '3.13'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64' and platform_release >= '23' and python_version == '3.14'",
+
+    # Apple Silicon, macOS 13
+    "sys_platform == 'darwin' and platform_machine == 'arm64' and platform_release >= '22' and platform_release < '23' and python_version == '3.11'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64' and platform_release >= '22' and platform_release < '23' and python_version == '3.12'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64' and platform_release >= '22' and platform_release < '23' and python_version == '3.13'",
+
+    # Intel/Rosetta, macOS 13+
+    "sys_platform == 'darwin' and platform_machine == 'x86_64' and platform_release >= '22' and python_version == '3.11'",
+    "sys_platform == 'darwin' and platform_machine == 'x86_64' and platform_release >= '22' and python_version == '3.12'",
+    "sys_platform == 'darwin' and platform_machine == 'x86_64' and platform_release >= '22' and python_version == '3.13'",
 ]
 
 [project.scripts]
 lingtai-agent = "lingtai.cli:main"
+lingtai-imap = "lingtai.mcp_servers.imap.__main__:main"
+lingtai-telegram = "lingtai.mcp_servers.telegram.__main__:main"
+lingtai-feishu = "lingtai.mcp_servers.feishu.__main__:main"
+lingtai-wechat = "lingtai.mcp_servers.wechat.__main__:main"
+lingtai-wechat-bootstrap = "lingtai.mcp_servers.wechat.login:_bootstrap_main"
+lingtai-whatsapp = "lingtai.mcp_servers.whatsapp.__main__:main"
+lingtai-cloud-mail = "lingtai.mcp_servers.cloud_mail.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["lingtai*"]
+exclude = [
+    "lingtai_imap*",
+    "lingtai_telegram*",
+    "lingtai_feishu*",
+    "lingtai_wechat*",
+    "lingtai_whatsapp*",
+    "lingtai.addons*",
+]
 
 [tool.setuptools.package-data]
-lingtai_kernel = ["i18n/*.json"]
-lingtai = [
+"lingtai.kernel" = ["i18n/*.json"]
+# The agent-readme generator is its own subpackage, so its static template and
+# paired architecture documents need their own entry (package-data globs do not
+# recurse into subpackages — same reason as telegram.task_card below). Without
+# this the wheel ships the writer but silently drops the template it renders.
+"lingtai.kernel.agent_readme" = ["README.md.tpl", "ANATOMY.md", "CONTRACT.md"]
+# The ACP adapter is a real shipped capability; its manual and governed twins
+# must survive wheel installation beside the implementation.
+"lingtai.adapters.acp" = ["ANATOMY.md", "CONTRACT.md", "BEHAVIORS.md", "MANUAL.md"]
+# Consolidated tool packages: i18n catalogs, per-tool JSON policy/data files
+# (e.g. lingtai/tools/bash/bash_policy.json), and every tool manual tree. Without
+# these the wheel installs the tool code but silently drops its data assets.
+"lingtai.tools" = [
     "i18n/*.json",
-    "mcp_catalog.json",
-    "core/*/*.json",
-    "core/*/manual/**/*",
-    "capabilities/*/*.json",
-    "capabilities/*/manual/**/*",
-    "intrinsic_skills/*/**/*",
-    "prompts/*.md",
-    # Rust sidecar binary bundled at build time by setup.py — present in
-    # platform-specific wheels, absent in pure-Python sdist fallback
-    # builds. The glob is non-strict, so missing files don't fail builds.
-    "bin/lingtai-search-sidecar",
-    "bin/lingtai-search-sidecar.exe",
+    "*/*.json",
+    "*/manual/**/*",
+    # Built-in Agent Plugin packages own capability manuals under skills/.
+    "*/skills/**/*",
+    # Shared future tool-call contract plus one
+    # src/lingtai/tools/<tool>/CONTRACT.md per built-in tool. The runtime and
+    # development graph use these invariants; omitting either entry silently
+    # drops contract documents while still shipping the tool code.
+    "CONTRACT.md",
+    "*/CONTRACT.md",
+    # Per-tool glossary resources — exactly glossary-{en,zh,wen}.md per
+    # first-party package (19 packages × 3 languages = 57 files). The
+    # renderer loads them via importlib.resources to append localized
+    # terminology bodies to each tool's ## tools description.
+    "*/glossary-en.md",
+    "*/glossary-zh.md",
+    "*/glossary-wen.md",
 ]
+lingtai = [
+    "mcp_catalog.json",
+    "init.jsonc",
+    "intrinsic_skills/*/**/*",
+    # Prompt-source anatomy at the prompts/ root.
+    "prompts/*.md",
+    # One directory per prompt section under prompts/ (parallel to guidance/):
+    # `<section>/<section>.md` bodies (principle/substrate/procedures) and
+    # `<section>/<section>.yaml` semantic definitions (including YAML-only
+    # definitions for generated/injected sections such as
+    # covenant/meta_guidance/comment/tools/... that have no body).
+    "prompts/*/*.md",
+    "prompts/*/*.yaml",
+    # Runtime-guidance catalog — INDEX.md + one <id>.md per guidance section,
+    # now nested under the meta_guidance section it generates (one level deeper
+    # than the `prompts/*/*.md` glob above, so it needs its own entry).
+    # Replaces the legacy prompts/guidance.json packaged resource.
+    "prompts/meta_guidance/catalog/*.md",
+]
+"lingtai.mcp_servers.telegram" = ["notification_header.md", "SKILL.md", "reference/**/*", "assets/**/*"]
+# The Telegram-owned programmable Task Card unit is its own subpackage, so its
+# strict-family manual and architecture documents are NOT covered by the parent telegram glob
+# above (package-data globs do not recurse into subpackages). Ship the nested
+# SKILL.md plus its paired ANATOMY.md/CONTRACT.md explicitly, or the wheel
+# installs the code and silently drops those documents.
+"lingtai.mcp_servers.telegram.task_card" = ["SKILL.md", "ANATOMY.md", "CONTRACT.md"]
+"lingtai.mcp_servers.feishu" = ["notification_header.md", "SKILL.md", "reference/**/*", "assets/**/*"]
+"lingtai.mcp_servers.wechat" = ["notification_header.md", "SKILL.md", "reference/**/*", "assets/**/*"]
+"lingtai.mcp_servers.whatsapp" = ["notification_header.md", "SKILL.md", "reference/**/*", "assets/**/*", "bridge/**/*"]
+"lingtai.mcp_servers.imap" = ["SKILL.md", "reference/**/*", "assets/**/*"]
+"lingtai.mcp_servers.cloud_mail" = ["SKILL.md", "reference/**/*", "assets/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

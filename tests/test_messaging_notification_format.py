@@ -2,7 +2,7 @@
 
 These tests cover the prose body produced by
 ``_render_unread_digest`` — which is the renderer that built the old
-per-arrival ``system(action="notification")`` body and now builds the
+per-arrival ``notification(action="check")`` body and now builds the
 single ``email(action="unread")`` digest body. The same edge cases
 apply (subject placeholder, sent_at vs received_at fallback, time-blind
 agents) — they just live one layer deeper in the code now.
@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import uuid4
 
-from lingtai_kernel.intrinsics.email.primitives import _render_unread_digest
+from lingtai.tools.email.primitives import _render_unread_digest
 
 
 def _make_agent(tmp_path: Path, *, time_awareness: bool = True, lang: str = "en"):

@@ -13,7 +13,7 @@ resume the work it had in flight. The reminder carries:
 - ``summary_path`` — pointer into ``system/summaries/`` when persisted
 
 The post-molt channel is intentionally distinct from the ``molt`` channel
-owned by ``base_agent.turn._check_molt_pressure``; pressure clearing must
+owned by ``base_agent.turn._check_molt_pressure``; legacy cleanup must
 never sweep the post-molt reminder.
 """
 
@@ -23,12 +23,15 @@ import json
 from unittest.mock import MagicMock
 
 
+from tests._molt_helpers import write_session_journal as _write_session_journal
+
+
 # ---------------------------------------------------------------------------
 # Helpers — mirror tests/test_molt_notification_persistence.py for parity
 # ---------------------------------------------------------------------------
 
 
-def _make_agent_with_psyche(tmp_path):
+def _make_agent_with_context(tmp_path):
     from lingtai.agent import Agent
 
     svc = MagicMock()
@@ -37,7 +40,7 @@ def _make_agent_with_psyche(tmp_path):
     svc.model = "gemini-test"
     return Agent(
         service=svc, agent_name="test", working_dir=tmp_path / "test",
-        capabilities=["psyche"],
+        capabilities=["context"],
     )
 
 
@@ -71,12 +74,12 @@ def _setup_mock_chat(agent):
 
 
 def _build_molt_call_entry(mock_interface, tc_id, summary, reasoning=None):
-    from lingtai_kernel.llm.interface import ToolCallBlock
+    from lingtai.kernel.llm.interface import ToolCallBlock
 
     args = {"object": "context", "action": "molt", "summary": summary}
     if reasoning is not None:
         args["_reasoning"] = reasoning
-    tc_block = ToolCallBlock(id=tc_id, name="psyche", args=args)
+    tc_block = ToolCallBlock(id=tc_id, name="context", args=args)
     mock_entry = MagicMock()
     mock_entry.role = "assistant"
     mock_entry.content = [tc_block]
@@ -97,7 +100,7 @@ def _read_post_molt(agent):
 class TestPostMoltNotificationAgentMolt:
     def test_agent_molt_publishes_post_molt_with_reasoning(self, tmp_path):
         """Agent molt → post-molt notification carries the agent's reasoning."""
-        agent = _make_agent_with_psyche(tmp_path)
+        agent = _make_agent_with_context(tmp_path)
         agent.start()
         try:
             mock_interface = _setup_mock_chat(agent)
@@ -109,11 +112,13 @@ class TestPostMoltNotificationAgentMolt:
                 reasoning="context full; want to resume foo cleanly",
             )
 
-            from lingtai_kernel.intrinsics.psyche._molt import _context_molt
+            journal_path = _write_session_journal(agent)
+            from lingtai.tools.context._molt import _context_molt
             result = _context_molt(agent, {
                 "summary": "finish the foo feature",
                 "_reasoning": "context full; want to resume foo cleanly",
                 "_tc_id": tc_id,
+                "session_journal_path": journal_path,
             })
             assert result.get("status") == "ok"
 
@@ -132,7 +137,7 @@ class TestPostMoltNotificationAgentMolt:
             data = payload["data"]
             assert data.get("initiator") == "agent"
             assert data.get("molt_count") == result["molt_count"]
-            assert data.get("reasoning") == \
+            assert data.get("reasoning") ==\
                 "context full; want to resume foo cleanly"
             # Helpful echo of the briefing the agent wrote for itself
             assert data.get("reminder")
@@ -145,7 +150,7 @@ class TestPostMoltNotificationAgentMolt:
 
     def test_agent_molt_without_reasoning_falls_back_to_summary(self, tmp_path):
         """Without `_reasoning`, the reminder falls back to the summary head."""
-        agent = _make_agent_with_psyche(tmp_path)
+        agent = _make_agent_with_context(tmp_path)
         agent.start()
         try:
             mock_interface = _setup_mock_chat(agent)
@@ -155,10 +160,12 @@ class TestPostMoltNotificationAgentMolt:
                 summary="first line: keep going on the parser bug\nsecond line",
             )
 
-            from lingtai_kernel.intrinsics.psyche._molt import _context_molt
+            journal_path = _write_session_journal(agent)
+            from lingtai.tools.context._molt import _context_molt
             result = _context_molt(agent, {
                 "summary": "first line: keep going on the parser bug\nsecond line",
                 "_tc_id": tc_id,
+                "session_journal_path": journal_path,
             })
             assert result.get("status") == "ok"
 
@@ -177,7 +184,7 @@ class TestPostMoltNotificationAgentMolt:
     def test_agent_molt_accepts_plain_reasoning_key(self, tmp_path):
         """ToolExecutor injects `_reasoning`, but accept `reasoning` too
         so direct callers (tests, internal call sites) work consistently."""
-        agent = _make_agent_with_psyche(tmp_path)
+        agent = _make_agent_with_context(tmp_path)
         agent.start()
         try:
             mock_interface = _setup_mock_chat(agent)
@@ -187,11 +194,13 @@ class TestPostMoltNotificationAgentMolt:
                 summary="continue work",
             )
 
-            from lingtai_kernel.intrinsics.psyche._molt import _context_molt
+            journal_path = _write_session_journal(agent)
+            from lingtai.tools.context._molt import _context_molt
             result = _context_molt(agent, {
                 "summary": "continue work",
                 "reasoning": "plain-key reasoning",
                 "_tc_id": tc_id,
+                "session_journal_path": journal_path,
             })
             assert result.get("status") == "ok"
 
@@ -209,12 +218,12 @@ class TestPostMoltNotificationAgentMolt:
 
 class TestPostMoltNotificationSystemForget:
     def test_context_forget_publishes_post_molt(self, tmp_path):
-        agent = _make_agent_with_psyche(tmp_path)
+        agent = _make_agent_with_context(tmp_path)
         agent.start()
         try:
             _setup_mock_chat(agent)
 
-            from lingtai_kernel.intrinsics.psyche._molt import context_forget
+            from lingtai.tools.context._molt import context_forget
             result = context_forget(agent, source="warning_ladder")
             assert result.get("status") == "ok"
 
@@ -233,11 +242,11 @@ class TestPostMoltNotificationSystemForget:
             agent.stop()
 
     def test_context_forget_aed_source_propagates(self, tmp_path):
-        agent = _make_agent_with_psyche(tmp_path)
+        agent = _make_agent_with_context(tmp_path)
         agent.start()
         try:
             _setup_mock_chat(agent)
-            from lingtai_kernel.intrinsics.psyche._molt import context_forget
+            from lingtai.tools.context._molt import context_forget
             result = context_forget(agent, source="aed", attempts=2)
             assert result.get("status") == "ok"
 
@@ -250,7 +259,7 @@ class TestPostMoltNotificationSystemForget:
 
 
 # ---------------------------------------------------------------------------
-# Channel isolation — pressure clear must not sweep post-molt
+# Channel isolation — legacy cleanup must not sweep post-molt
 # ---------------------------------------------------------------------------
 
 
@@ -265,7 +274,7 @@ class TestPostMoltContinuationSignal:
     """
 
     def test_agent_molt_carries_continuation_fields(self, tmp_path):
-        agent = _make_agent_with_psyche(tmp_path)
+        agent = _make_agent_with_context(tmp_path)
         agent.start()
         try:
             mock_interface = _setup_mock_chat(agent)
@@ -276,8 +285,12 @@ class TestPostMoltContinuationSignal:
             )
             _build_molt_call_entry(mock_interface, tc_id, summary=summary)
 
-            from lingtai_kernel.intrinsics.psyche._molt import _context_molt
-            result = _context_molt(agent, {"summary": summary, "_tc_id": tc_id})
+            journal_path = _write_session_journal(agent)
+            from lingtai.tools.context._molt import _context_molt
+            result = _context_molt(agent, {
+                "summary": summary, "_tc_id": tc_id,
+                "session_journal_path": journal_path,
+            })
             assert result.get("status") == "ok"
 
             payload = _read_post_molt(agent)
@@ -298,15 +311,19 @@ class TestPostMoltContinuationSignal:
             agent.stop()
 
     def test_instructions_spell_out_reconstruct_then_ack(self, tmp_path):
-        agent = _make_agent_with_psyche(tmp_path)
+        agent = _make_agent_with_context(tmp_path)
         agent.start()
         try:
             mock_interface = _setup_mock_chat(agent)
             tc_id = "toolu_cont_2"
             _build_molt_call_entry(mock_interface, tc_id, summary="keep going")
 
-            from lingtai_kernel.intrinsics.psyche._molt import _context_molt
-            result = _context_molt(agent, {"summary": "keep going", "_tc_id": tc_id})
+            journal_path = _write_session_journal(agent)
+            from lingtai.tools.context._molt import _context_molt
+            result = _context_molt(agent, {
+                "summary": "keep going", "_tc_id": tc_id,
+                "session_journal_path": journal_path,
+            })
             assert result.get("status") == "ok"
 
             instr = (_read_post_molt(agent).get("instructions") or "").lower()
@@ -318,11 +335,20 @@ class TestPostMoltContinuationSignal:
             assert "continue" in instr
             assert "defer" in instr
             assert "obsolete" in instr
-            # Concrete dismiss mechanism + reason-required ack.
+            # Concrete dismiss mechanism + reason-required ack. Since the LTP
+            # v2 migration the taught call carries the reason inside the
+            # action's own ``input`` object (``'reason': 'continue: ...'``),
+            # so match the reason values rather than the old flat
+            # ``reason='continue`` spelling. The exact taught call is
+            # separately proven dispatchable by
+            # ``test_notification_tool.py::test_post_molt_instruction_template_round_trips_through_dispatcher``.
             assert "post-molt" in instr
-            assert "reason='continue" in instr
-            assert "reason='defer" in instr
-            assert "reason='obsolete" in instr
+            assert "'continue: " in instr
+            assert "'defer: " in instr
+            assert "'obsolete: " in instr
+            # The dismissal is taught in the closed envelope shape.
+            assert "input={'channel': 'post-molt'" in instr
+            assert "reasoning=" in instr
             # No-auto-execution must be explicit (non-goal guard).
             assert "not auto-executed" in instr or "not auto" in instr
 
@@ -332,7 +358,7 @@ class TestPostMoltContinuationSignal:
     def test_no_next_action_field_even_with_marker_summary(self, tmp_path):
         """A summary that looks like it has a 'next action:' marker must NOT
         produce a next_action field — heuristic extraction is removed."""
-        agent = _make_agent_with_psyche(tmp_path)
+        agent = _make_agent_with_context(tmp_path)
         agent.start()
         try:
             mock_interface = _setup_mock_chat(agent)
@@ -340,8 +366,12 @@ class TestPostMoltContinuationSignal:
             summary = "Next step: finish wiring the parser; tests red on case 3."
             _build_molt_call_entry(mock_interface, tc_id, summary=summary)
 
-            from lingtai_kernel.intrinsics.psyche._molt import _context_molt
-            result = _context_molt(agent, {"summary": summary, "_tc_id": tc_id})
+            journal_path = _write_session_journal(agent)
+            from lingtai.tools.context._molt import _context_molt
+            result = _context_molt(agent, {
+                "summary": summary, "_tc_id": tc_id,
+                "session_journal_path": journal_path,
+            })
             assert result.get("status") == "ok"
 
             data = _read_post_molt(agent)["data"]
@@ -351,11 +381,11 @@ class TestPostMoltContinuationSignal:
             agent.stop()
 
     def test_system_forget_also_carries_continuation_fields(self, tmp_path):
-        agent = _make_agent_with_psyche(tmp_path)
+        agent = _make_agent_with_context(tmp_path)
         agent.start()
         try:
             _setup_mock_chat(agent)
-            from lingtai_kernel.intrinsics.psyche._molt import context_forget
+            from lingtai.tools.context._molt import context_forget
             result = context_forget(agent, source="warning_ladder")
             assert result.get("status") == "ok"
 
@@ -371,23 +401,23 @@ class TestPostMoltContinuationSignal:
 
 
 class TestPostMoltChannelIsolation:
-    def test_pressure_below_threshold_clears_molt_not_post_molt(self, tmp_path):
-        """Falling under molt_pressure clears `.notification/molt.json` but
+    def test_legacy_molt_cleanup_does_not_clear_post_molt(self, tmp_path):
+        """Cleaning stale `.notification/molt.json` must
         leaves `.notification/post-molt.json` intact — they are separate
         producer channels."""
-        from lingtai_kernel.notifications import publish, clear
+        from tests._notification_store_helpers import publish_test_payload, clear_test_payload
 
         # Use a bare workdir; this exercises only the file-channel contract.
         workdir = tmp_path / "agent"
         workdir.mkdir()
 
-        publish(workdir, "molt", {
+        publish_test_payload(workdir, "molt", {
             "header": "context 92% — molt NOW",
             "icon": "🚨",
             "priority": "high",
             "data": {"pressure": 0.92, "urgent": True},
         })
-        publish(workdir, "post-molt", {
+        publish_test_payload(workdir, "post-molt", {
             "header": "you just molted",
             "icon": "🌱",
             "priority": "high",
@@ -397,12 +427,12 @@ class TestPostMoltChannelIsolation:
         assert (workdir / ".notification" / "molt.json").is_file()
         assert (workdir / ".notification" / "post-molt.json").is_file()
 
-        # Simulate pressure-clear (channel="molt").
-        clear(workdir, "molt")
+        # Simulate legacy-cleanup (channel="molt").
+        clear_test_payload(workdir, "molt")
 
         assert not (workdir / ".notification" / "molt.json").exists(), (
-            "pressure clear should remove the molt channel"
+            "legacy cleanup should remove the molt channel"
         )
         assert (workdir / ".notification" / "post-molt.json").is_file(), (
-            "pressure clear must not touch the post-molt channel"
+            "legacy cleanup must not touch the post-molt channel"
         )

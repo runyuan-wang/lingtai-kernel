@@ -1,4 +1,5 @@
 .worktrees/
+.library/
 
 # Python
 __pycache__/
@@ -17,12 +18,6 @@ htmlcov/
 build/
 dist/
 
-# Rust sidecar — cargo build artifacts and the binary that setup.py drops
-# into the package tree at build time. Both are reproducible from the
-# crate sources under experimental/lingtai-search-sidecar/.
-experimental/lingtai-search-sidecar/target/
-src/lingtai/bin/
-
 # Editor / OS
 .DS_Store
 .idea/
@@ -33,12 +28,19 @@ src/lingtai/bin/
 .venv/
 venv/
 
-# Internal design docs / session artifacts (private — not for public repo)
+# Local agent/work-session scratch. These directories often hold private
+# transcripts, PR explainers, generated audits, or exploratory outputs. Keep PR
+# explainers local by default; only long-lived docs, release materials, or
+# reports with an explicit durable purpose should be force-added with rationale.
 docs/
-MagicMock/
 reports/
+tmp/
+MagicMock/
 
-# Specific discussion drafts kept local (others under discussions/ are
-# committed by convention; ignore individual files rather than the whole dir)
-discussions/voluntary-compression-patch.md
+
+# Local resolver lockfiles may appear during experiments; pyproject.toml is the
+# packaging source of truth for this repo.
 uv.lock
+DELIVERABLE.md
+PR_BODY.md
+PR_URL.txt

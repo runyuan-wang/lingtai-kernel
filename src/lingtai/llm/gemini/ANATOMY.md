@@ -1,3 +1,18 @@
+---
+related_files:
+  - ENVIRONMENT_VARIABLES.md
+  - src/lingtai/llm/ANATOMY.md
+  - src/lingtai/llm/gemini/__init__.py
+  - src/lingtai/llm/gemini/adapter.py
+maintenance: |
+  Keep related_files as repo-relative paths to real files. Include neighboring
+  ANATOMY.md files so the anatomy graph stays connected rather than isolated;
+  anatomy links must be bidirectional. If you create a new ANATOMY.md, copy this
+  maintenance field. If you notice drift between this anatomy and the code,
+  report it. See lingtai-dev-guide for details.
+  Capability mentions in any document require explicit bidirectional
+  related_files mapping to the implementing code (see root ## Maintenance).
+---
 # src/lingtai/llm/gemini
 
 Gemini adapter — `google-genai` SDK with Chat API and Interactions API, thinking budget, function declarations.
@@ -9,12 +24,11 @@ Gemini adapter — `google-genai` SDK with Chat API and Interactions API, thinki
 | File | LOC | Role |
 |------|-----|------|
 | `__init__.py` | 3 | Re-exports `GeminiAdapter`, `GeminiChatSession`, `InteractionsChatSession` |
-| `adapter.py` | 908 | Adapter + 2 session classes + helpers |
-| `defaults.py` | 4 | `DEFAULTS` dict: `api_key_env=GEMINI_API_KEY`, `model=gemini-3-flash-preview` |
+| `adapter.py` | 913 | Adapter + 2 session classes + helpers |
 
 ### Classes
 
-- **`GeminiAdapter(LLMAdapter)`** — `adapter.py:686` — wraps `genai.Client`.
+- **`GeminiAdapter(LLMAdapter)`** — `adapter.py:687` — wraps `genai.Client` and passes LingTai identity/version headers through `types.HttpOptions(headers=...)`.
 - **`GeminiChatSession(ChatSession)`** — `adapter.py:139` — Chat API session (used for `json_schema` mode).
 - **`InteractionsChatSession(ChatSession)`** — `adapter.py:342` — Interactions API session (server-side history, primary path).
 
@@ -29,14 +43,14 @@ Gemini adapter — `google-genai` SDK with Chat API and Interactions API, thinki
 | `_sanitize_parameters_for_interactions` | 189 | Strip `"required": []` (Interactions API rejects empty array) |
 | `_build_interactions_tools` | 204 | `FunctionSchema` → Interactions API tool dicts (`type: "function"`) |
 | `_parse_interaction_response` | 221 | Interactions API response → `LLMResponse`; reads `function_call`, `text`, `thought` outputs |
-| `_convert_history_to_turns` | 274 | Chat API history dicts → Interactions `TurnParam` format |
 
 ## Connections
 
-- **Imports from `lingtai_kernel`**: `ChatSession`, `FunctionSchema`, `LLMResponse`, `ToolCall`, `UsageMetadata`, `ToolResultBlock`, `ChatInterface`, `StreamingAccumulator`
+- **Imports from `lingtai.kernel`**: `ChatSession`, `FunctionSchema`, `LLMResponse`, `ToolCall`, `UsageMetadata`, `ToolResultBlock`, `ChatInterface`, `StreamingAccumulator`
 - **Imports from `lingtai`**: `LLMAdapter` ABC, `to_gemini` converter (lazy in `create_chat`)
 - **External**: `google.genai`, `google.genai.errors`, `google.genai.types`
 - **No inheritance from other adapters** (standalone implementation)
+- **HTTP identity**: `GeminiAdapter.__init__` uses `types.HttpOptions(headers=merge_lingtai_identity_headers(..., user_agent=False))`, sending `X-LingTai-*` headers while leaving the SDK-owned lowercase `user-agent` untouched.
 
 ## Composition
 
@@ -44,10 +58,10 @@ Gemini adapter — `google-genai` SDK with Chat API and Interactions API, thinki
 
 | Method | Line | Notes |
 |--------|------|-------|
-| `create_chat` | 706 | Routes to Interactions API (default) or Chat API (json_schema mode); wraps in `_GatedSession` |
-| `generate` | 851 | One-shot via `client.models.generate_content`; gated |
-| `make_tool_result_message` | 883 | Returns `ToolResultBlock` with `id=tool_call_id or tool_name` |
-| `is_quota_error` | 893 | `ClientError` with code 429 or `RESOURCE_EXHAUSTED` in message |
+| `create_chat` | 711 | Routes to Interactions API (default) or Chat API (json_schema mode); wraps in `_GatedSession` |
+| `generate` | 856 | One-shot via `client.models.generate_content`; gated |
+| `make_tool_result_message` | 888 | Returns `ToolResultBlock` with `id=tool_call_id or tool_name` |
+| `is_quota_error` | 898 | `ClientError` with code 429 or `RESOURCE_EXHAUSTED` in message |
 
 ### Dual session architecture
 

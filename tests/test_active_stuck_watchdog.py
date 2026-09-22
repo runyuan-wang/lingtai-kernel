@@ -13,15 +13,40 @@ The watchdog protects against two real-world failure modes documented in
 Both cases used to be invisible to the heartbeat-only liveness check.
 """
 import json
+import math
+from lingtai.tools.registry import INTRINSICS as _TEST_INTRINSICS
 import time
 from unittest.mock import MagicMock
+from tests._service_helpers import make_tool_result_mock_service as make_mock_service
+from tests._workdir_lease_helpers import make_test_lease
+from tests._snapshot_helpers import make_test_snapshot_port, make_test_source_revision_port
+from tests._lifecycle_clock_helpers import make_test_lifecycle_clock
+from tests._notification_store_helpers import notification_store_for
+from tests._agent_presence_helpers import make_test_presence_store
 
 
-def make_mock_service():
-    svc = MagicMock()
-    svc.model = "test-model"
-    svc.make_tool_result.return_value = {"role": "tool", "content": "ok"}
-    return svc
+class _RecordingEventJournal:
+    def __init__(self):
+        self.events: list[dict] = []
+
+    def append(self, event):
+        self.events.append(event)
+        return None
+
+    def close(self):
+        return None
+
+
+def test_active_stuck_threshold_non_finite_values_use_documented_default(
+    monkeypatch,
+):
+    from lingtai.kernel.base_agent.lifecycle import _active_stuck_threshold_s
+
+    for value in ("nan", "inf", "+inf", "-inf", "Infinity", "-Infinity"):
+        monkeypatch.setenv("LINGTAI_ACTIVE_STUCK_THRESHOLD_S", value)
+        threshold = _active_stuck_threshold_s()
+        assert math.isfinite(threshold)
+        assert threshold == 600.0
 
 
 class TestProgressBookkeeping:
@@ -29,46 +54,59 @@ class TestProgressBookkeeping:
     and refine the active-turn block surfaced in ``.status.json``."""
 
     def test_state_change_bumps_progress_and_state_change_clocks(self, tmp_path):
-        from lingtai_kernel import BaseAgent, AgentState
+        from lingtai.kernel import BaseAgent, AgentState
+        clock = make_test_lifecycle_clock()
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=clock, source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         before = agent._last_progress_at
-        time.sleep(0.01)
+        clock.advance_wall(0.01)
         agent._set_state(AgentState.ACTIVE, reason="test")
         assert agent._last_progress_at > before
         assert agent._state_changed_at > before
 
     def test_active_seeds_pending_turn_kind(self, tmp_path):
-        from lingtai_kernel import BaseAgent, AgentState
+        from lingtai.kernel import BaseAgent, AgentState
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         agent._set_state(AgentState.ACTIVE, reason="test")
         assert agent._active_turn_kind == "pending"
         assert agent._active_turn_started_at is not None
 
     def test_llm_call_event_refines_turn_kind(self, tmp_path):
-        from lingtai_kernel import BaseAgent, AgentState
+        from lingtai.kernel import BaseAgent, AgentState
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         agent._set_state(AgentState.ACTIVE, reason="test")
         agent._log("llm_call")
         assert agent._active_turn_kind == "llm_call"
 
     def test_tool_call_event_refines_turn_kind_and_records_id(self, tmp_path):
-        from lingtai_kernel import BaseAgent, AgentState
+        from lingtai.kernel import BaseAgent, AgentState
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         agent._set_state(AgentState.ACTIVE, reason="test")
         agent._log("tool_call", tool_call_id="call_abc123")
@@ -76,11 +114,14 @@ class TestProgressBookkeeping:
         assert agent._active_turn_id == "call_abc123"
 
     def test_leaving_active_clears_turn_block_and_latch(self, tmp_path):
-        from lingtai_kernel import BaseAgent, AgentState
+        from lingtai.kernel import BaseAgent, AgentState
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         agent._set_state(AgentState.ACTIVE, reason="test")
         agent._log("tool_call", tool_call_id="call_abc")
@@ -97,11 +138,14 @@ class TestDeferredNotificationsCounter:
     storm without scanning ``events.jsonl``."""
 
     def test_counter_increments(self, tmp_path):
-        from lingtai_kernel import BaseAgent
+        from lingtai.kernel import BaseAgent
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         assert agent._deferred_notifications_count == 0
         agent._log("notification_deferred_active", sources=["telegram"])
@@ -111,11 +155,14 @@ class TestDeferredNotificationsCounter:
         assert agent._deferred_notifications_oldest_at is not None
 
     def test_state_change_resets_counter(self, tmp_path):
-        from lingtai_kernel import BaseAgent, AgentState
+        from lingtai.kernel import BaseAgent, AgentState
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         agent._log("notification_deferred_active", sources=["telegram"])
         agent._log("notification_deferred_active", sources=["telegram"])
@@ -130,11 +177,14 @@ class TestStatusJsonExposesActiveTurn:
     from "wedged ACTIVE."""
 
     def test_status_has_state_changed_at_and_last_progress_at(self, tmp_path):
-        from lingtai_kernel import BaseAgent
+        from lingtai.kernel import BaseAgent
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         status = agent.status()
         runtime = status["runtime"]
@@ -145,12 +195,54 @@ class TestStatusJsonExposesActiveTurn:
         assert isinstance(runtime["no_progress_seconds"], (int, float))
         assert runtime["no_progress_seconds"] >= 0
 
-    def test_status_active_turn_block_present_only_in_active(self, tmp_path):
-        from lingtai_kernel import BaseAgent, AgentState
+    def test_status_exposes_last_api_call_at(self, tmp_path):
+        from lingtai.kernel import BaseAgent
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
+        )
+        status = agent.status()
+        runtime = status["runtime"]
+        assert "last_api_call_at" in runtime
+        assert isinstance(runtime["last_api_call_at"], (int, float))
+
+    def test_llm_call_bumps_last_api_call_at_but_tool_call_does_not(self, tmp_path):
+        from lingtai.kernel import BaseAgent, AgentState
+        clock = make_test_lifecycle_clock()
+        agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
+            service=make_mock_service(),
+            agent_name="test",
+            working_dir=tmp_path / "test_agent",
+            workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=clock, source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
+        )
+        agent._set_state(AgentState.ACTIVE, reason="test")
+        anchor = agent._last_api_call_at
+        clock.advance_wall(5.0)
+        # tool_call is progress but is NOT a new API call: anchor unchanged.
+        agent._log("tool_call", tool_call_id="t1")
+        assert agent._last_api_call_at == anchor
+        assert agent._last_progress_at > anchor
+        clock.advance_wall(5.0)
+        # llm_call is a new API call: anchor advances to now.
+        agent._log("llm_call", model="test", api_call_id="a1")
+        assert agent._last_api_call_at > anchor
+        assert agent._last_api_call_at == agent._last_progress_at
+
+    def test_status_active_turn_block_present_only_in_active(self, tmp_path):
+        from lingtai.kernel import BaseAgent, AgentState
+        agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
+            service=make_mock_service(),
+            agent_name="test",
+            working_dir=tmp_path / "test_agent",
+            workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         # IDLE — no active_turn block
         assert "active_turn" not in agent.status()
@@ -165,11 +257,14 @@ class TestStatusJsonExposesActiveTurn:
         assert "active_turn" not in agent.status()
 
     def test_status_deferred_notifications_block(self, tmp_path):
-        from lingtai_kernel import BaseAgent
+        from lingtai.kernel import BaseAgent
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         assert "deferred_notifications" not in agent.status()
         agent._log("notification_deferred_active", sources=["telegram"])
@@ -188,28 +283,25 @@ class TestWatchdogFires:
         # Force a 0-second threshold so the watchdog trips immediately.
         monkeypatch.setenv("LINGTAI_ACTIVE_STUCK_THRESHOLD_S", "30")
 
-        from lingtai_kernel import BaseAgent, AgentState
+        from lingtai.kernel import BaseAgent, AgentState
+        journal = _RecordingEventJournal()
+        clock = make_test_lifecycle_clock()
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            event_journal=journal,
+            workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=clock, source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         # Simulate: agent is ACTIVE, no progress for >> threshold.
         # Use a low env threshold via clamp (min 30) and rewind the
         # progress clock instead of sleeping for a test-friendly run.
         agent._set_state(AgentState.ACTIVE, reason="test")
-        agent._last_progress_at = time.time() - 120  # 2 minutes ago
+        agent._last_progress_at = clock.wall_seconds() - 120  # 2 minutes ago
 
-        logged: list[dict] = []
-        original_log = agent._log_service.log if agent._log_service else None
-
-        def capture_log(entry):
-            logged.append(entry)
-            if original_log:
-                original_log(entry)
-
-        if agent._log_service:
-            agent._log_service.log = capture_log
+        logged = journal.events
 
         agent._start_heartbeat()
         # Heartbeat ticks once per second; give it 2.5s to be sure.
@@ -229,11 +321,15 @@ class TestWatchdogFires:
     def test_watchdog_writes_fresh_status_json_when_active_stuck(self, tmp_path, monkeypatch):
         monkeypatch.setenv("LINGTAI_ACTIVE_STUCK_THRESHOLD_S", "30")
 
-        from lingtai_kernel import BaseAgent, AgentState
+        from lingtai.kernel import BaseAgent, AgentState
+        clock = make_test_lifecycle_clock()
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=clock, source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         agent._write_status_snapshot()
         stale_status = json.loads((agent._working_dir / ".status.json").read_text())
@@ -241,7 +337,7 @@ class TestWatchdogFires:
 
         agent._set_state(AgentState.ACTIVE, reason="test")
         agent._log("tool_call", tool_call_id="call_active")
-        agent._last_progress_at = time.time() - 120
+        agent._last_progress_at = clock.wall_seconds() - 120
 
         try:
             agent._start_heartbeat()
@@ -258,25 +354,22 @@ class TestWatchdogFires:
     def test_watchdog_only_fires_once_per_stuck_episode(self, tmp_path, monkeypatch):
         monkeypatch.setenv("LINGTAI_ACTIVE_STUCK_THRESHOLD_S", "30")
 
-        from lingtai_kernel import BaseAgent, AgentState
+        from lingtai.kernel import BaseAgent, AgentState
+        journal = _RecordingEventJournal()
+        clock = make_test_lifecycle_clock()
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            event_journal=journal,
+            workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=clock, source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         agent._set_state(AgentState.ACTIVE, reason="test")
-        agent._last_progress_at = time.time() - 120
+        agent._last_progress_at = clock.wall_seconds() - 120
 
-        logged: list[dict] = []
-        original_log = agent._log_service.log if agent._log_service else None
-
-        def capture_log(entry):
-            logged.append(entry)
-            if original_log:
-                original_log(entry)
-
-        if agent._log_service:
-            agent._log_service.log = capture_log
+        logged = journal.events
 
         agent._start_heartbeat()
         # Let the heartbeat tick several times.
@@ -291,24 +384,20 @@ class TestWatchdogFires:
     def test_watchdog_does_not_fire_when_idle(self, tmp_path, monkeypatch):
         monkeypatch.setenv("LINGTAI_ACTIVE_STUCK_THRESHOLD_S", "30")
 
-        from lingtai_kernel import BaseAgent
+        from lingtai.kernel import BaseAgent
+        journal = _RecordingEventJournal()
         agent = BaseAgent(
+            intrinsics=_TEST_INTRINSICS,
             service=make_mock_service(),
             agent_name="test",
             working_dir=tmp_path / "test_agent",
+            event_journal=journal,
+            workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test_agent"),
         )
         agent._last_progress_at = time.time() - 120  # rewind
 
-        logged: list[dict] = []
-        original_log = agent._log_service.log if agent._log_service else None
-
-        def capture_log(entry):
-            logged.append(entry)
-            if original_log:
-                original_log(entry)
-
-        if agent._log_service:
-            agent._log_service.log = capture_log
+        logged = journal.events
 
         agent._start_heartbeat()
         time.sleep(2.5)

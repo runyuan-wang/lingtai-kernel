@@ -1,0 +1,867 @@
+"""IMAPMailManager — tool handler for multi-account IMAP email.
+
+Registers a single ``imap`` tool with the agent and routes actions to the
+correct :class:`IMAPAccount` via :class:`IMAPMailService`.
+
+Storage layout (per-account):
+    working_dir/imap/{address}/{folder}/{uid}/message.json  — fetched emails
+    working_dir/imap/{address}/contacts.json                — contact book
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import tempfile
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable
+
+from .. import _skill
+from .._outbound_files import OutboundFileError, resolve_outbound_file
+from . import _family
+from .plugin import IMAP_PLUGIN
+
+if TYPE_CHECKING:
+    from .account import IMAPAccount
+    from .service import IMAPMailService
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Bundled usage manual (skill format) — SKILL.md ships in this package folder.
+# action='manual' reads the full body; the YAML frontmatter is parsed and the
+# name/description are injected into the tool schema as a progressive-disclosure
+# catalog entry, while the full body stays behind action='manual'.
+#
+# The package's plugin descriptor already loaded and validated that SKILL.md, so
+# these names alias its single copy rather than re-reading the file. The public
+# family answers ``manual`` from the same descriptor without entering this
+# manager at all; the flat ``_manual()`` below stays for the legacy internal
+# action boundary.
+# ---------------------------------------------------------------------------
+
+_SKILL_NAME = IMAP_PLUGIN.skill_name
+_SKILL_FRONTMATTER = IMAP_PLUGIN.skill_frontmatter
+_SKILL_BODY = IMAP_PLUGIN.skill_body
+_SKILL_PATH = IMAP_PLUGIN.skill_path
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def parse_email_id(email_id: str) -> tuple[str, str, str]:
+    """Split ``account:folder:uid`` compound key.
+
+    Uses first colon for account, last colon for uid so folder names
+    containing colons (rare) or slashes (common, e.g. ``[Gmail]/Sent Mail``)
+    are handled correctly.
+
+    Examples::
+
+        >>> parse_email_id("alice@gmail.com:INBOX:1042")
+        ('alice@gmail.com', 'INBOX', '1042')
+        >>> parse_email_id("a@b.com:[Gmail]/Sent Mail:999")
+        ('a@b.com', '[Gmail]/Sent Mail', '999')
+    """
+    account, _, remainder = email_id.partition(":")
+    folder, _, uid = remainder.rpartition(":")
+    return account, folder, uid
+
+
+def _opt_str(value: object) -> str | None:
+    """Normalize an optional string arg: empty/whitespace-only → None.
+
+    LLMs frequently pass ``""`` for an optional field they mean to omit. Treat
+    empty or whitespace-only strings exactly like an absent value so callers
+    fall back to the default (default account, default ``INBOX`` folder).
+    Non-string values are returned unchanged.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return value
+
+
+def _safe_attachment_name(filename: str) -> str:
+    """Reduce a sender-controlled filename to a safe basename.
+
+    Attachment filenames come straight from the MIME headers of inbound
+    mail, so they can contain ``..`` traversal segments or be absolute
+    paths (a ``pathlib`` join with an absolute right-hand side discards
+    the left side entirely). Strip all directory components — normalizing
+    ``\\`` to ``/`` first so Windows-style separators cannot survive on
+    POSIX — and fall back to ``"attachment"`` for empty or degenerate
+    dot names.
+    """
+    name = Path(filename.replace("\\", "/")).name
+    if name in ("", ".", ".."):
+        return "attachment"
+    return name
+
+
+def _dedupe_name(name: str, seen: set[str]) -> str:
+    """Suffix ``name`` with ``' (1)'``, ``' (2)'``, ... before the extension
+    until it no longer collides with an entry in ``seen``."""
+    if name not in seen:
+        return name
+    stem, suffix = Path(name).stem, Path(name).suffix
+    counter = 1
+    while f"{stem} ({counter}){suffix}" in seen:
+        counter += 1
+    return f"{stem} ({counter}){suffix}"
+
+
+# ---------------------------------------------------------------------------
+# Tool schema
+# ---------------------------------------------------------------------------
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": [
+                "send", "check", "read", "reply", "search",
+                "delete", "move", "flag", "folders",
+                "contacts", "add_contact", "remove_contact", "edit_contact",
+                "accounts", "manual",
+            ],
+            "description": (
+                "Strict action-owned IMAP input branches; use check/search then "
+                "read returned IDs before deciding whether to reply. send/reply "
+                "deliver real mail, so verify recipients and body first. "
+                + _skill.manual_action_description(_SKILL_FRONTMATTER, _SKILL_NAME)
+            ),
+        },
+        "account": {
+            "type": "string",
+            "description": (
+                "Which account to use (email address). Optional — an empty or "
+                "whitespace-only string is treated as omitted and defaults to "
+                "the primary account."
+            ),
+        },
+        "address": {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}},
+            ],
+            "description": "Target email address(es) for send",
+        },
+        "subject": {"type": "string", "description": "Email subject line"},
+        "message": {"type": "string", "description": "Email body"},
+        "cc": {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}},
+            ],
+            "description": "CC address(es)",
+        },
+        "bcc": {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}},
+            ],
+            "description": "BCC address(es)",
+        },
+        "email_id": {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}},
+            ],
+            "description": "Email ID(s) — compound key: account:folder:uid",
+        },
+        "n": {
+            "type": "integer",
+            "description": "Max recent emails to show (for check, default 10)",
+            "default": 10,
+        },
+        "query": {
+            "type": "string",
+            "description": "IMAP search query (e.g. from:addr subject:text unseen since:YYYY-MM-DD)",
+        },
+        "folder": {
+            "type": "string",
+            "description": (
+                "IMAP folder name (e.g. INBOX, [Gmail]/Sent Mail). For "
+                "check/search an empty or whitespace-only string is treated as "
+                "omitted and defaults to INBOX. For move this is the "
+                "destination folder and must be a non-empty name."
+            ),
+        },
+        "flags": {
+            "type": "object",
+            "description": "Required for flag — dict of flag name to bool, e.g. {\"seen\": true, \"flagged\": false}",
+        },
+        "name": {
+            "type": "string",
+            "description": "Contact's human-readable name (for add_contact, edit_contact)",
+        },
+        "note": {
+            "type": "string",
+            "description": "Free-text note about the contact (for add_contact, edit_contact)",
+        },
+        "attachments": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "List of file paths to attach. Relative paths resolve against "
+                "the agent working dir; absolute paths must be inside it."
+            ),
+        },
+    },
+    "required": ["action"],
+}
+
+DESCRIPTION = (
+    "Real IMAP/SMTP email. First read: check/search, then read the returned "
+    "compound email_id. send/reply deliver real mail; verify to/cc/bcc and body. "
+    "External replies require standing policy or confirmation the sender is the "
+    "same human who contacted you internally. "
+    "Blank check/search folders mean INBOX; account defaults when omitted; move "
+    "needs a destination; delete/move/flag mutate mailbox state. Inspect status/"
+    "errors. The orchestrator owns this addon; avatars must not configure it. "
+    "Read imap(action=\"manual\", input={}, reasoning=\"read IMAP guidance\") "
+    "for attachments, settings, contacts, configuration, and deeper detail."
+)
+
+# Public callers receive the strict LTP-v2 family schema. Manager dispatch
+# remains the internal flat action boundary after family validation.
+SCHEMA = _family.IMAP_SCHEMA
+
+
+# ---------------------------------------------------------------------------
+# Flag name mapping (friendly name → IMAP system flag)
+# ---------------------------------------------------------------------------
+
+_FLAG_MAP: dict[str, str] = {
+    "seen": "\\Seen",
+    "flagged": "\\Flagged",
+    "answered": "\\Answered",
+    "deleted": "\\Deleted",
+    "draft": "\\Draft",
+}
+
+
+# ---------------------------------------------------------------------------
+# IMAPMailManager
+# ---------------------------------------------------------------------------
+
+class IMAPMailManager:
+    """Tool handler for multi-account IMAP email.
+
+    Routes omnibus tool actions to the correct :class:`IMAPAccount` via
+    :class:`IMAPMailService`. Inbound IMAP events are forwarded via the
+    ``on_inbound`` callback (LICC ``push_inbox_event`` in production).
+    """
+
+    def __init__(
+        self,
+        service: "IMAPMailService",
+        *,
+        working_dir: Path,
+        tcp_alias: str,
+        on_inbound: "Callable[[dict], None]",
+        config_path: Path | str | None = None,
+    ) -> None:
+        self._service = service
+        self._working_dir = Path(working_dir)
+        # Production composition supplies the successfully loaded, resolved
+        # authority path. Optional only for legacy direct constructors; SHOW
+        # fails closed when that applied startup fact is unavailable.
+        self._config_path = Path(config_path) if config_path is not None else None
+        self._tcp_alias = tcp_alias
+        self._on_inbound = on_inbound
+        self._bridge = None  # set by setup() before start()
+        # Duplicate send protection — maps address → (message_text, count)
+        self._last_sent: dict[str, tuple[str, int]] = {}
+        self._dup_free_passes = 2
+
+    # ------------------------------------------------------------------
+    # Meta injection
+    # ------------------------------------------------------------------
+
+    def _inject_meta(
+        self,
+        result: dict,
+        account: "IMAPAccount | None" = None,
+    ) -> dict:
+        """Add tcp_alias and the resolved account to every response."""
+        result["tcp_alias"] = self._tcp_alias
+        result["account"] = (
+            account.address
+            if account is not None
+            else self._service.default_account.address
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Start IMAP poll and TCP bridge listener."""
+        self._service.listen(on_message=self.on_imap_received)
+
+        if self._bridge is not None:
+            def on_bridge_mail(payload: dict) -> None:
+                to = payload.get("to", [])
+                if isinstance(to, str):
+                    to = [to]
+                if not to:
+                    return
+                for addr in to:
+                    self._service.send(addr, payload)
+
+            self._bridge.listen(on_message=on_bridge_mail)
+
+    def stop(self) -> None:
+        """Stop IMAP poll and TCP bridge."""
+        self._service.stop()
+        if self._bridge is not None:
+            self._bridge.stop()
+
+    # ------------------------------------------------------------------
+    # Action dispatch
+    # ------------------------------------------------------------------
+
+    def handle(self, args: dict) -> dict:
+        action = args.get("action")
+        if action == "manual":
+            return self._manual()
+        # Treat empty/whitespace-only account exactly like omitted/None so the
+        # default (or sole) account is used instead of failing the lookup.
+        requested_account = _opt_str(args.get("account"))
+        account = self._service.get_account(requested_account)
+        if account is None and action != "accounts":
+            return self._inject_meta({
+                "status": "error",
+                "error": f"Unknown account: {requested_account}",
+                "requested_account": requested_account,
+            }, account)
+
+        dispatch = {
+            "send": self._send,
+            "check": self._check,
+            "read": self._read,
+            "reply": self._reply,
+            "search": self._search,
+            "delete": self._delete,
+            "move": self._move,
+            "flag": self._flag,
+            "folders": self._folders,
+            "contacts": self._contacts,
+            "add_contact": self._add_contact,
+            "remove_contact": self._remove_contact,
+            "edit_contact": self._edit_contact,
+        }
+
+        if action == "accounts":
+            return self._inject_meta(self._accounts(args), account)
+        elif action in dispatch:
+            return self._inject_meta(dispatch[action](args, account), account)
+        else:
+            return self._inject_meta(
+                {"error": f"Unknown imap action: {action}"},
+                account,
+            )
+
+    def _manual(self) -> dict:
+        # The manual lives in this package's bundled SKILL.md (standard skill
+        # format: YAML frontmatter + markdown body), loaded at import time.
+        # action='manual' returns the full skill markdown plus parsed metadata
+        # and the resolved path; the frontmatter is also injected into the
+        # schema's 'manual' action description as a catalog entry. Bundled
+        # asset/reference sidecars, if any, are documented inside SKILL.md and
+        # are not returned as structured tool fields.
+        # It is account-independent, so it skips account lookup/meta injection.
+        return _skill.manual_payload(
+            _SKILL_FRONTMATTER, _SKILL_BODY, _SKILL_PATH, _SKILL_NAME
+        )
+
+    # ------------------------------------------------------------------
+    # Receive handler — called by IMAPMailService IMAP poll
+    # ------------------------------------------------------------------
+
+    def on_imap_received(self, payload: dict) -> None:
+        """Forward an incoming email to the host over LICC.
+
+        The listener (``account.py``) fetches headers only, so ``payload``
+        has no ``message`` key today and the pushed body/truncation fields
+        stay empty/``0``/``False`` — content is genuinely absent, not short.
+        ``message`` handling stays for a future body-bearing producer. The
+        compound ``email_id`` is already known here, so it also travels as
+        routing metadata (``platform``/``conversation_ref``/``message_ref``);
+        see SKILL.md/operation-contract.md for the full agent-facing contract.
+        """
+        account_addr = payload.get("account", "")
+        email_id = payload.get("email_id", "")
+        sender = payload.get("from", "unknown")
+        subject = payload.get("subject", "(no subject)")
+        message = payload.get("message", "")
+
+        preview = message[:300].replace("\n", " ")
+        if len(message) > 300:
+            preview += "..."
+
+        log.info(
+            "imap_received account=%s sender=%r subject=%r email_id=%s",
+            account_addr, sender, subject, email_id,
+        )
+
+        try:
+            self._on_inbound({
+                "from": sender,
+                "subject": subject,
+                "body": preview,
+                "metadata": {
+                    "email_id": email_id,
+                    "account": account_addr,
+                    "preview_truncated": len(message) > 300,
+                    "full_length": len(message),
+                    "platform": "imap",
+                    "conversation_ref": account_addr,
+                    "message_ref": email_id,
+                },
+                "wake": True,
+            })
+        except Exception as e:
+            log.error("on_inbound callback failed for email_id=%s: %s",
+                      email_id, e)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_email_ids(args: dict) -> list[str]:
+        """Normalize email_id param to list.
+
+        Handles: single string, list of strings, or a JSON-encoded array
+        string (LLMs sometimes wrap the value in ``[...]``).
+        """
+        ids = args.get("email_id", [])
+        if isinstance(ids, str):
+            stripped = ids.strip()
+            if stripped.startswith("["):
+                import json
+                try:
+                    ids = json.loads(stripped)
+                except (json.JSONDecodeError, ValueError):
+                    ids = [ids]
+            else:
+                ids = [ids]
+        return ids
+
+    @staticmethod
+    def _normalize_addresses(raw: str | list | None) -> list[str]:
+        """Normalize address param to list."""
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            return [raw] if raw else []
+        return list(raw)
+
+    def _contacts_path(self, account: "IMAPAccount") -> Path:
+        """Per-account contacts path: imap/{address}/contacts.json."""
+        return self._working_dir / "imap" / account.address / "contacts.json"
+
+    def _load_contacts(self, account: "IMAPAccount") -> list[dict]:
+        path = self._contacts_path(account)
+        if path.is_file():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                return []
+        return []
+
+    def _save_contacts(self, account: "IMAPAccount", contacts: list[dict]) -> None:
+        path = self._contacts_path(account)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            os.write(fd, json.dumps(contacts, indent=2).encode())
+            os.close(fd)
+            os.replace(tmp, str(path))
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+
+    def _resolve_attachment_paths(self, raw_attachments: object) -> list[str]:
+        """Resolve tool-supplied attachment paths relative to the agent workdir.
+
+        Enforces the shared outbound-file containment policy: absolute paths
+        outside the working directory (including ``..`` and symlink escapes)
+        raise :class:`OutboundFileError`.
+        """
+        if not raw_attachments:
+            return []
+        if isinstance(raw_attachments, (str, Path)):
+            raw_items = [raw_attachments]
+        else:
+            raw_items = list(raw_attachments)
+
+        return [
+            str(resolve_outbound_file(item, self._working_dir))
+            for item in raw_items
+        ]
+
+    def _send(self, args: dict, account: "IMAPAccount") -> dict:
+        to_list = self._normalize_addresses(args.get("address"))
+        subject = args.get("subject", "")
+        message_text = args.get("message", "")
+        cc = self._normalize_addresses(args.get("cc"))
+        bcc = self._normalize_addresses(args.get("bcc"))
+        try:
+            attachments = self._resolve_attachment_paths(args.get("attachments", []))
+        except OutboundFileError as e:
+            return {"error": str(e)}
+
+        if not to_list:
+            return {"error": "address is required"}
+
+        # Block identical consecutive messages to the same recipient
+        duplicates = [
+            addr for addr in to_list
+            if (prev := self._last_sent.get(addr)) is not None
+            and prev[0] == message_text
+            and prev[1] >= self._dup_free_passes
+        ]
+        if duplicates:
+            return {
+                "status": "blocked",
+                "warning": (
+                    "Identical message already sent to: "
+                    f"{', '.join(duplicates)}. "
+                    "This looks like a repetitive loop — "
+                    "think twice before sending."
+                ),
+            }
+
+        err = account.send_email(
+            to=to_list,
+            subject=subject,
+            body=message_text,
+            cc=cc or None,
+            bcc=bcc or None,
+            attachments=attachments or None,
+        )
+
+        # Track last sent message per recipient for duplicate detection
+        for addr in to_list:
+            prev = self._last_sent.get(addr)
+            if prev is not None and prev[0] == message_text:
+                self._last_sent[addr] = (message_text, prev[1] + 1)
+            else:
+                self._last_sent[addr] = (message_text, 1)
+
+        log.info("imap_sent to=%s subject=%r", to_list, subject)
+
+        if err is None:
+            return {"status": "delivered", "to": to_list}
+        else:
+            return {"status": "error", "error": err}
+
+    def _check(self, args: dict, account: "IMAPAccount") -> dict:
+        # Empty/whitespace-only folder is treated like omitted → default INBOX.
+        folder = _opt_str(args.get("folder")) or "INBOX"
+        n = args.get("n", 10)
+        envelopes = account.fetch_envelopes(folder, n)
+        return {"status": "ok", "total": len(envelopes), "emails": envelopes}
+
+    def _read(self, args: dict, account: "IMAPAccount") -> dict:
+        ids = self._normalize_email_ids(args)
+        if not ids:
+            return {"error": "email_id is required"}
+
+        results: list[dict] = []
+        errors: list[str] = []
+        for eid in ids:
+            acct_addr, folder, uid = parse_email_id(eid)
+            # Use the account from the email_id if different
+            target = self._service.get_account(acct_addr) or account
+            data = target.fetch_full(folder, uid)
+            if data is None:
+                errors.append(eid)
+                continue
+
+            # Persist to disk: imap/{address}/{folder}/{uid}/message.json
+            persist_dir = (
+                self._working_dir / "imap"
+                / acct_addr / folder / uid
+            )
+            persist_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save attachments to disk. Filenames are sender-controlled:
+            # sanitize to a basename (path traversal) and dedupe within the
+            # message so duplicate names do not silently overwrite each other.
+            # Re-reads overwrite the same files, keeping reads idempotent.
+            attachments_raw = data.get("attachments_raw", [])
+            saved_attachments: list[dict] = []
+            seen_names: set[str] = set()
+            for att in attachments_raw:
+                safe_name = _dedupe_name(
+                    _safe_attachment_name(att["filename"]), seen_names
+                )
+                seen_names.add(safe_name)
+                att_path = persist_dir / safe_name
+                att_path.write_bytes(att["data"])
+                saved_attachments.append({
+                    "filename": safe_name,
+                    "original_filename": att["filename"],
+                    "content_type": att["content_type"],
+                    "size": len(att["data"]),
+                    "path": str(att_path),
+                })
+
+            # Build the persisted record (exclude raw binary data)
+            record = {
+                "email_id": eid,
+                "uid": uid,
+                "from": data.get("from", ""),
+                "from_address": data.get("from_address", ""),
+                "to": data.get("to", ""),
+                "cc": data.get("cc", ""),
+                "subject": data.get("subject", ""),
+                "date": data.get("date", ""),
+                "message": data.get("body", ""),
+                "message_id": data.get("message_id", ""),
+                "references": data.get("references", ""),
+                "flags": data.get("flags", []),
+                "attachments": saved_attachments or data.get("attachments", []),
+            }
+            (persist_dir / "message.json").write_text(
+                json.dumps(record, indent=2, default=str),
+                encoding="utf-8",
+            )
+
+            results.append(record)
+
+        result = {"status": "ok", "emails": results}
+        if errors:
+            result["not_found"] = errors
+        return result
+
+    def _reply(self, args: dict, account: "IMAPAccount") -> dict:
+        ids = self._normalize_email_ids(args)
+        if not ids:
+            return {"error": "email_id is required for reply"}
+        email_id = ids[0]
+        message_text = args.get("message", "")
+        if not message_text:
+            return {"error": "message is required for reply"}
+
+        acct_addr, folder, uid = parse_email_id(email_id)
+        target = self._service.get_account(acct_addr) or account
+
+        original = target.fetch_full(folder, uid)
+        if original is None:
+            return {"error": f"Email not found: {email_id}"}
+
+        # Build reply subject
+        orig_subject = original.get("subject", "")
+        subject = args.get("subject") or (
+            orig_subject if orig_subject.startswith("Re: ") else f"Re: {orig_subject}"
+        )
+
+        # Threading headers
+        orig_message_id = original.get("message_id", "")
+        orig_references = original.get("references", "")
+        in_reply_to = orig_message_id
+        references = (orig_references + " " + orig_message_id).strip()
+
+        # CC and attachments
+        cc = self._normalize_addresses(args.get("cc"))
+        try:
+            attachments = self._resolve_attachment_paths(args.get("attachments", []))
+        except OutboundFileError as e:
+            return {"error": str(e)}
+
+        # Reply to sender
+        reply_to = original.get("from_address") or original.get("from", "")
+        err = target.send_email(
+            to=[reply_to],
+            subject=subject,
+            body=message_text,
+            cc=cc or None,
+            attachments=attachments or None,
+            in_reply_to=in_reply_to or None,
+            references=references or None,
+        )
+
+        # Mark as answered
+        target.store_flags(folder, uid, ["\\Answered"])
+
+        log.info("imap_sent_reply to=%s subject=%r in_reply_to=%s",
+                 reply_to, subject, email_id)
+
+        if err is None:
+            return {"status": "delivered", "to": [reply_to], "in_reply_to": email_id}
+        else:
+            return {"status": "error", "error": err}
+
+    def _search(self, args: dict, account: "IMAPAccount") -> dict:
+        query = args.get("query", "")
+        if not query:
+            return {"error": "query is required for search"}
+
+        # Empty/whitespace-only folder is treated like omitted → default INBOX.
+        folder = _opt_str(args.get("folder")) or "INBOX"
+        uids = account.search(folder, query)
+        if not uids:
+            return {"status": "ok", "total": 0, "emails": []}
+
+        headers = account.fetch_headers_by_uids(folder, uids)
+        return {"status": "ok", "total": len(headers), "emails": headers}
+
+    def _delete(self, args: dict, account: "IMAPAccount") -> dict:
+        ids = self._normalize_email_ids(args)
+        if not ids:
+            return {"error": "email_id is required"}
+
+        results: list[dict] = []
+        for eid in ids:
+            acct_addr, folder, uid = parse_email_id(eid)
+            target = self._service.get_account(acct_addr) or account
+            ok = target.delete_message(folder, uid)
+            results.append({"email_id": eid, "deleted": ok})
+
+        return {"status": "ok", "results": results}
+
+    def _move(self, args: dict, account: "IMAPAccount") -> dict:
+        ids = self._normalize_email_ids(args)
+        if not ids:
+            return {"error": "email_id is required"}
+        # Unlike check/search, an empty destination is a hard error for move —
+        # we never silently default the target folder.
+        dest_folder = _opt_str(args.get("folder"))
+        if not dest_folder:
+            return {"error": "folder (destination) is required for move"}
+
+        results: list[dict] = []
+        for eid in ids:
+            acct_addr, folder, uid = parse_email_id(eid)
+            target = self._service.get_account(acct_addr) or account
+            ok = target.move_message(folder, uid, dest_folder)
+            results.append({"email_id": eid, "moved": ok})
+
+        return {"status": "ok", "results": results}
+
+    def _flag(self, args: dict, account: "IMAPAccount") -> dict:
+        ids = self._normalize_email_ids(args)
+        if not ids:
+            return {"error": "email_id is required"}
+        flags_dict = args.get("flags", {})
+        if not flags_dict:
+            return {
+                "status": "error",
+                "error": (
+                    "flags is required for flag — pass a dict mapping flag "
+                    "name to bool, e.g. flags={'seen': true} to mark read or "
+                    "flags={'flagged': false} to clear a star."
+                ),
+            }
+
+        # Convert dict of {flag_name: bool} to +FLAGS / -FLAGS calls
+        add_flags: list[str] = []
+        remove_flags: list[str] = []
+        for name, value in flags_dict.items():
+            imap_flag = _FLAG_MAP.get(name.lower(), f"\\{name.capitalize()}")
+            if value:
+                add_flags.append(imap_flag)
+            else:
+                remove_flags.append(imap_flag)
+
+        results: list[dict] = []
+        for eid in ids:
+            acct_addr, folder, uid = parse_email_id(eid)
+            target = self._service.get_account(acct_addr) or account
+            ok = True
+            if add_flags:
+                ok = ok and target.store_flags(folder, uid, add_flags, action="+FLAGS")
+            if remove_flags:
+                ok = ok and target.store_flags(folder, uid, remove_flags, action="-FLAGS")
+            results.append({"email_id": eid, "flagged": ok})
+
+        return {"status": "ok", "results": results}
+
+    def _folders(self, args: dict, account: "IMAPAccount") -> dict:
+        raw = account.list_folders()
+        folders = [{"name": name, "role": role} for name, role in raw.items()]
+        return {"status": "ok", "folders": folders}
+
+    def _accounts(self, args: dict) -> dict:
+        out: list[dict] = []
+        for acct in self._service.accounts:
+            listener_connected = (
+                getattr(acct, "_bg_thread", None) is not None
+                and acct._bg_thread.is_alive()
+                and getattr(acct, "_listen_imap", None) is not None
+            )
+            out.append({
+                "address": acct.address,
+                "tool_connected": acct.connected,
+                "listener_connected": listener_connected,
+                "listening": getattr(acct, "listening", False),
+            })
+        return {"accounts": out}
+
+    def _contacts(self, args: dict, account: "IMAPAccount") -> dict:
+        return {"status": "ok", "contacts": self._load_contacts(account)}
+
+    def _add_contact(self, args: dict, account: "IMAPAccount") -> dict:
+        address = args.get("address", "")
+        name = args.get("name", "")
+        if not address:
+            return {"error": "address is required"}
+        if not name:
+            return {"error": "name is required"}
+        note = args.get("note", "")
+
+        contacts = self._load_contacts(account)
+        for c in contacts:
+            if c["address"] == address:
+                c["name"] = name
+                c["note"] = note
+                self._save_contacts(account, contacts)
+                return {"status": "updated", "contact": c}
+        entry = {"address": address, "name": name, "note": note}
+        contacts.append(entry)
+        self._save_contacts(account, contacts)
+        return {"status": "added", "contact": entry}
+
+    def _remove_contact(self, args: dict, account: "IMAPAccount") -> dict:
+        address = args.get("address", "")
+        if not address:
+            return {"error": "address is required"}
+        contacts = self._load_contacts(account)
+        new_contacts = [c for c in contacts if c["address"] != address]
+        if len(new_contacts) == len(contacts):
+            return {"error": f"Contact not found: {address}"}
+        self._save_contacts(account, new_contacts)
+        return {"status": "removed", "address": address}
+
+    def _edit_contact(self, args: dict, account: "IMAPAccount") -> dict:
+        address = args.get("address", "")
+        if not address:
+            return {"error": "address is required"}
+        contacts = self._load_contacts(account)
+        for c in contacts:
+            if c["address"] == address:
+                if "name" in args:
+                    c["name"] = args["name"]
+                if "note" in args:
+                    c["note"] = args["note"]
+                self._save_contacts(account, contacts)
+                return {"status": "updated", "contact": c}
+        return {"error": f"Contact not found: {address}"}

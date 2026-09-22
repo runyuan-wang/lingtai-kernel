@@ -1,0 +1,741 @@
+"""Detached composition root for the production daemon execution units.
+
+This module intentionally lives outside ``kernel.daemon_supervisor``.  The
+kernel Port owns only the request/manifest contract; this composition layer may
+instantiate ``DaemonManager``'s existing setup and backend runners inside the
+supervisor process.  There is one parser/runner implementation for each
+backend, shared by the parent-era manager and detached ownership.
+"""
+from __future__ import annotations
+
+import os
+import signal
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from types import SimpleNamespace
+
+from lingtai.kernel.daemon_supervisor.agent_stub import DaemonSupervisorAgentStub
+from lingtai.kernel.llm.base import FunctionSchema
+from lingtai.adapters.posix.process_identity import (
+    process_identity,
+    process_identity_matches,
+)
+from lingtai.tools.daemon.process_port import (
+    DaemonProcessObservation,
+    DaemonProcessTerminationScope,
+)
+
+
+_DAEMON_COMMON_NAME = "daemon_common"
+_REDACTED_MARKER = "<redacted>"
+
+
+def _default_detached_process_port():
+    """Compose the platform's detached-scope daemon process Port.
+
+    The detached execution child already owns its isolation boundary (POSIX:
+    the session/process group it was spawned into; Windows: the supervisor's
+    exact-PID ownership), so both defaults carry the explicit
+    ``INHERITED_SUPERVISOR_GROUP`` scope: lifecycle operations signal only
+    exact children. Any other platform fails loudly.
+    """
+    if os.name == "posix":
+        from lingtai.tools.daemon.posix_process import PosixDaemonProcessPort
+        return PosixDaemonProcessPort(start_new_session=False)
+    if os.name == "nt":
+        from lingtai.tools.daemon.windows_process import WindowsDaemonProcessPort
+        return WindowsDaemonProcessPort(
+            termination_scope=DaemonProcessTerminationScope.INHERITED_SUPERVISOR_GROUP,
+        )
+    raise RuntimeError(
+        "detached daemon execution composition is unsupported on this platform"
+    )
+
+
+def _contains_redacted(value) -> bool:
+    """Detect a public redaction marker that must never reach a runner."""
+    if isinstance(value, str):
+        return value == _REDACTED_MARKER
+    if isinstance(value, dict):
+        return any(_contains_redacted(k) or _contains_redacted(v) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_redacted(item) for item in value)
+    return False
+
+
+class DetachedDaemonExecutionHost:
+    """Small manager-shaped host used only inside one supervisor process."""
+
+    def __init__(
+        self, run_dir, manifest: dict, cancel_event, timeout_event,
+        *, capsule: dict | None = None, process_port=None,
+        interactive_terminal_port=None, adopted_fd: int | None = None,
+    ) -> None:
+        from lingtai.tools.daemon import DaemonManager
+
+        self._run_dir = run_dir
+        # Keep the owner events available to the Port observation callback even
+        # during construction-time/direct composition tests; run_with_events
+        # and run_resume replace these with their active loop events.
+        self._cancel_event = cancel_event
+        self._timeout_event = timeout_event
+        self._manifest = manifest
+        self._capsule = capsule if isinstance(capsule, dict) else {}
+        self._adopted_fd = adopted_fd
+        self._driver_authority = None
+        self._provider_call_admission_port = None
+        self._provider_admission_parent = None
+        self._agent = DaemonSupervisorAgentStub(
+            Path(manifest["parent_working_dir"]),
+            log_fn=lambda event, **fields: run_dir.append_event(event, **fields),
+        )
+        # A detached child receives no derived authority today. Marking the
+        # requirement here preserves its full tool surface while making any
+        # nested daemon/avatar launch fail closed rather than use legacy allow.
+        # This boolean is deliberately not a bearer; later Driver wiring must
+        # inject the actual authority separately.
+        self._agent._requires_derived_launch_admission_port = True
+        self._agent._config.language = manifest.get("language", "en") or "en"
+        self._agent.service = SimpleNamespace(
+            model=(manifest.get("llm") or {}).get("model", "unknown"),
+        )
+        self._agent._mcp_tool_names = set()
+        self._max_turns = int(manifest["max_turns"])
+        self._timeout = float(manifest["timeout_s"])
+        self._manager_pool_size = DaemonManager._env_nonnegative_int(
+            "LINGTAI_DAEMON_MANAGER_POOL_SIZE", 100,
+        )
+        self._default_model = self._agent.service.model
+        self._notify_threshold = 20
+        self._emanations = {}
+        self._pools = []
+        self._ask_pool = None
+        self._cli_procs = []
+        self._cli_proc_groups = {}
+        self._cli_term_reasons = {}
+        self._cli_lock = threading.Lock()
+
+        # Detached execution already owns the session/process group. Compose
+        # adapters with inheritance enabled and bind the immutable observation
+        # callback before any backend runner can spawn a child. The callback is
+        # deliberately adapter-facing: Core sees no Popen object, only a
+        # portable PID/PGID/start-identity receipt.
+        if process_port is None:
+            process_port = _default_detached_process_port()
+        # Interactive terminal remains POSIX-only: on Windows this stays None
+        # (ConPTY is out of scope) and the claude-interactive bridge fails
+        # loudly when it receives no terminal port.
+        if interactive_terminal_port is None and os.name == "posix":
+            from lingtai.adapters.posix.interactive_terminal import (
+                PosixInteractiveTerminalAdapter,
+            )
+            interactive_terminal_port = PosixInteractiveTerminalAdapter(
+                start_new_session=False,
+            )
+        self._process_port = process_port
+        self._interactive_terminal_port = interactive_terminal_port
+        for port in (self._process_port, self._interactive_terminal_port):
+            setter = getattr(port, "set_observation_callback", None)
+            if callable(setter):
+                setter(self._publish_process_observation)
+
+        # Reconstruct the ordinary host tool floor through the same registry
+        # setup used by the parent manager.  No full Agent/workdir lease is
+        # constructed in this process.
+        from lingtai.tools.daemon import _ToolCollector
+        from lingtai.tools.registry import BUILTIN_TOOLS, setup_capability
+        collector = _ToolCollector(self._agent)
+        expanded = DaemonManager._expand_requested_tools(self, manifest.get("tools", []))
+        # Selected detached Shell is mounted through its private composer. It
+        # receives a RunDir-only adapter and a run-private async job namespace;
+        # it never borrows the stub's deliberately absent Agent notification/store
+        # route or the parent workdir's shared system/jobs namespace.
+        self._shell_prompt_event_adapter = None
+        # The removed ``file`` family and its retired per-operation names
+        # (``read``, ``write``, ``edit``, ``glob``, ``grep``) have no alias, so
+        # a stale manifest naming them builds no surface: each is rejected as
+        # an unknown tool by ``_expand_requested_tools`` above.
+        for name in sorted(expanded):
+            if name not in BUILTIN_TOOLS:
+                continue
+            if name == "shell":
+                from lingtai.tools.bash import _setup_detached_daemon_shell
+                _, self._shell_prompt_event_adapter = _setup_detached_daemon_shell(
+                    collector, run_dir=run_dir,
+                )
+            else:
+                setup_capability(collector, name)
+        self._agent._tool_schemas = list(collector.schemas.values())
+        self._agent._tool_handlers = dict(collector.handlers)
+
+        # The manager units below consume the same narrow runtime/workdir ports
+        # as the official parent binding.  This detached host owns a supervisor
+        # stub rather than a live Agent, so its adapter is intentionally local
+        # to this execution body and never participates in model tool mounting.
+        from lingtai.adapters.tool_plugin_host import (
+            AgentWorkdirAdapter,
+            daemon_runtime_for_agent,
+        )
+        self._runtime = daemon_runtime_for_agent(self._agent, {})
+        self._workdir = AgentWorkdirAdapter(lambda: self._agent._working_dir)
+
+        # The manager methods are used as unbound production units below.  A
+        # host does not need DaemonManager.__init__, which would create a
+        # parent-owned ask executor and perform parent-record reconciliation.
+        self._manager_type = DaemonManager
+        self._task_mcp_clients: list[object] = []
+
+    def adopt_derived_driver_authority(self) -> None:
+        """Consume this host's adopted daemon endpoint before derived work.
+
+        The endpoint is delivered only through B8's SCM_RIGHTS capsule.  This
+        execution child must never call ``authority_adapter_from_environment``:
+        that profile-only helper rejects and closes a derived endpoint by
+        design.  The capsule marker is not authority; it makes a lost
+        descriptor fail closed instead of running an unconstrained daemon.
+
+        The execution-child entrypoint calls this only after construction has
+        transferred descriptor ownership to this host.  On return or failure,
+        this method (or the Driver client it invokes) owns cleanup; callers
+        must not close the original descriptor number afterwards.
+        """
+        expected = self._capsule.get("driver_authority_required") is True
+        if not expected:
+            # B8a transports a generic optional descriptor too. Only the
+            # explicit Driver marker authorizes this host to consume it as an
+            # authority endpoint; otherwise the execution-child boundary
+            # retains ownership and will close it in its normal finally path.
+            return
+        adopted_fd = self._take_adopted_fd()
+        if adopted_fd is None:
+            from lingtai.adapters.acp.driver_authority import (
+                DriverAuthorityTransportError,
+            )
+
+            raise DriverAuthorityTransportError(
+                "derived daemon authority endpoint was not delivered"
+            )
+
+        from lingtai.adapters.acp.driver_authority import (
+            DriverAuthorityClient,
+            DriverAuthorityEndpointBindingMismatch,
+        )
+        from lingtai.kernel.provider_admission import ProviderCallClass
+
+        authority = None
+        try:
+            authority = DriverAuthorityClient.from_inherited_fd(adopted_fd)
+            if authority.identity.role != "derived":
+                raise DriverAuthorityEndpointBindingMismatch(
+                    "daemon execution requires a derived authority endpoint"
+                )
+            parent = authority.derived_provider_parent(ProviderCallClass.DAEMON)
+        except Exception:
+            if authority is not None:
+                authority.close()
+            # ``from_inherited_fd`` takes (and closes) the descriptor on its
+            # own failure. Preserve the typed endpoint error for callers.
+            raise
+
+        self._driver_authority = authority
+        self._provider_call_admission_port = authority
+        self._provider_admission_parent = parent
+
+    def _take_adopted_fd(self) -> int | None:
+        """Transfer the received child endpoint to its runtime consumer."""
+        adopted_fd = self._adopted_fd
+        self._adopted_fd = None
+        return adopted_fd
+
+    def close_adopted_fd(self) -> None:
+        """Close an endpoint that was not consumed by authority composition."""
+        self._close_driver_authority()
+        adopted_fd = self._adopted_fd
+        self._adopted_fd = None
+        if adopted_fd is None:
+            return
+        try:
+            os.close(adopted_fd)
+        except OSError:
+            pass
+
+    def _close_driver_authority(self) -> None:
+        """Release the derived endpoint after its execution lifetime ends."""
+        authority = self._driver_authority
+        self._driver_authority = None
+        self._provider_call_admission_port = None
+        self._provider_admission_parent = None
+        if authority is not None:
+            authority.close()
+
+    def __getattr__(self, name):
+        """Forward unmodified parser/helper units to the production manager."""
+        manager = self.__dict__.get("_manager_type")
+        if manager is not None:
+            attr = getattr(manager, name, None)
+            if callable(attr):
+                raw = manager.__dict__.get(name)
+                if isinstance(raw, staticmethod):
+                    return attr
+                return lambda *args, **kwargs: attr(self, *args, **kwargs)
+            if attr is not None:
+                return attr
+        raise AttributeError(name)
+
+    def _log(self, event_type: str, **fields) -> None:
+        try:
+            self._run_dir.append_event(event_type, **fields)
+        except Exception:
+            pass
+
+    def _completion_surface(self) -> tuple[dict[str, FunctionSchema], dict]:
+        from lingtai.mcp_servers.daemon_common.server import (
+            CHECKPOINT_DESCRIPTION,
+            CHECKPOINT_SCHEMA,
+            DESCRIPTION,
+            FINISH_SCHEMA,
+            _record_checkpoint,
+            _validate_finish,
+        )
+        from lingtai.kernel._fsutil import atomic_write_json
+
+        path = self._run_dir.path / "daemon_completion.json"
+
+        def checkpoint(arguments: dict) -> dict:
+            return _record_checkpoint(self._run_dir, arguments or {})
+
+        def finish(arguments: dict) -> dict:
+            payload = _validate_finish(arguments or {})
+            payload["run_id"] = self._run_dir.run_id
+            atomic_write_json(path, payload, ensure_ascii=False, indent=2)
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+            return {"status": "ok", "completion_status": payload["status"]}
+
+        return {
+            "checkpoint": FunctionSchema(
+                name="checkpoint", description=CHECKPOINT_DESCRIPTION,
+                parameters=CHECKPOINT_SCHEMA,
+            ),
+            "finish": FunctionSchema(
+                name="finish", description=DESCRIPTION,
+                parameters=FINISH_SCHEMA,
+            ),
+        }, {"checkpoint": checkpoint, "finish": finish}
+
+    # Explicit forwarding keeps the production runner methods unmodified while
+    # preventing this host from becoming a second backend implementation.
+    def _expand_requested_tools(self, requested):
+        return self._manager_type._expand_requested_tools(self, requested)
+
+    def _parent_mcp_tool_names(self):
+        return self._manager_type._parent_mcp_tool_names(self)
+
+    def _daemon_intrinsic_surface(self):
+        return self._manager_type._daemon_intrinsic_surface(self)
+
+    def _daemon_provider_defaults(self, *args, **kwargs):
+        return self._manager_type._daemon_provider_defaults(self, *args, **kwargs)
+
+    def _llm_defaults_from_manifest(self, llm):
+        return self._manager_type._llm_defaults_from_manifest(llm)
+
+    def _require_done_completion(self, run_dir, final_text):
+        return self._manager_type._require_done_completion(self, run_dir, final_text)
+
+    def _fail_missing_or_bad_completion(self, run_dir, completion, final_text):
+        return self._manager_type._fail_missing_or_bad_completion(
+            self, run_dir, completion, final_text
+        )
+
+    def _read_daemon_completion(self, run_dir):
+        return self._manager_type._read_daemon_completion(run_dir)
+
+    def _run_has_daemon_common_mcp(self, run_dir):
+        return self._manager_type._run_has_daemon_common_mcp(run_dir)
+
+    def _close_task_mcp_clients(self, clients):
+        # Pass ``self`` explicitly: this is now an instance method (it clears
+        # the task MCP metadata sidecar), and this host is the owner that
+        # ``_connect_task_mcp_registrations`` recorded that sidecar on.
+        return self._manager_type._close_task_mcp_clients(self, clients)
+
+    def _cli_start_new_session(self) -> bool:
+        # The execution child already owns a fresh session/process group. Keep
+        # each CLI in that group from Popen onward so supervisor timeout/reclaim
+        # covers the pre-registration window as well as the steady state.
+        return False
+
+    def _publish_process_observation(self, observation: DaemonProcessObservation) -> None:
+        """Publish child identity before a runner performs any blocking I/O."""
+        if not isinstance(observation, DaemonProcessObservation):
+            raise TypeError("daemon process observation must be immutable and typed")
+        pid = observation.pid
+        pgid = observation.pgid
+        identity = observation.start_identity
+        termination_scope = observation.termination_scope
+        if termination_scope is not DaemonProcessTerminationScope.INHERITED_SUPERVISOR_GROUP:
+            raise ValueError(
+                "detached observation must use supervisor-owned inherited-group scope"
+            )
+        state = self._run_dir.read_state_from_disk(self._run_dir.path)
+        history = list(state.get("child_history") or [])
+        identity_row = {
+            "pid": pid, "pgid": pgid, "start_identity": identity,
+            "termination_scope": termination_scope.value,
+            "registered_at": self._run_dir._now_iso(),
+        }
+        history.append(identity_row)
+        self._run_dir.update_state(
+            cli_pid=pid, cli_pgid=pgid,
+            child_pid=pid, child_pgid=pgid,
+            child_start_identity=identity,
+            child_termination_scope=termination_scope.value,
+            child_registered_at=identity_row["registered_at"],
+            child_history=history[-32:],
+        )
+        # Close the cancellation-before-registration race. Identity and group
+        # checks are repeated immediately before signalling so PID reuse cannot
+        # turn a stale callback into ownership of an unrelated process. On
+        # Windows there is no PGID to re-check (recorded as None): the guard is
+        # identity-only and the close is an exact-PID TerminateProcess.
+        cancel_event = getattr(self, "_cancel_event", None)
+        if cancel_event is not None and cancel_event.is_set():
+            if os.name == "nt":
+                from lingtai.adapters.windows import _win32
+                try:
+                    if isinstance(identity, str) and process_identity_matches(pid, identity):
+                        _win32.terminate_pid(pid)
+                except OSError:
+                    pass
+            else:
+                try:
+                    if (
+                        isinstance(pgid, int)
+                        and isinstance(identity, str)
+                        and os.getpgid(pid) == pgid
+                        and process_identity_matches(pid, identity)
+                    ):
+                        os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+
+    def _register_cli_proc(self, proc, group_id=None):
+        # Legacy direct-Popen callers still use this manager-shaped hook; the
+        # migrated Port runners use _publish_process_observation above.
+        # This callback is invoked immediately after every production runner
+        # creates a child and before its first blocking stdout/stderr read.
+        pid = getattr(proc, "pid", None)
+        if isinstance(pid, int):
+            try:
+                pgid = os.getpgid(pid)
+            except (ProcessLookupError, PermissionError, OSError):
+                pgid = None
+            identity = process_identity(pid)
+            state = self._run_dir.read_state_from_disk(self._run_dir.path)
+            history = list(state.get("child_history") or [])
+            identity_row = {
+                "pid": pid, "pgid": pgid, "start_identity": identity,
+                "registered_at": self._run_dir._now_iso(),
+            }
+            history.append(identity_row)
+            self._run_dir.update_state(
+                cli_pid=pid, cli_pgid=pgid,
+                child_pid=pid, child_pgid=pgid,
+                child_start_identity=identity,
+                child_registered_at=identity_row["registered_at"],
+                child_history=history[-32:],
+            )
+            # Close the watcher-before-registration race.  Only this exact
+            # newly created process group is touched.
+            if self._cancel_event.is_set():
+                try:
+                    if (
+                        isinstance(pgid, int)
+                        and isinstance(identity, str)
+                        and os.getpgid(pid) == pgid
+                        and process_identity_matches(pid, identity)
+                    ):
+                        os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+        return self._manager_type._register_cli_proc(self, proc, group_id)
+
+    def _unregister_cli_proc(self, proc, group_id=None):
+        return self._manager_type._unregister_cli_proc(self, proc, group_id)
+
+    def _attributed_cli_exit(self, proc, backend_name, detail, run_dir=None):
+        return self._manager_type._attributed_cli_exit(self, proc, backend_name, detail, run_dir)
+
+    def _take_cli_term_reason(self, proc):
+        return self._manager_type._take_cli_term_reason(self, proc)
+
+    @staticmethod
+    def _signal_exit_name(returncode):
+        from lingtai.tools.daemon import DaemonManager
+        return DaemonManager._signal_exit_name(returncode)
+
+    def _drain_followup(self, em_id):
+        # Follow-ups are persisted before their control request is acked.  The
+        # shared LingTai runner consumes them only at a text-only boundary.
+        return self._run_dir.drain_followups()
+
+    def _build_lingtai_surface(self) -> tuple[list[FunctionSchema], dict]:
+        manager = self._manager_type
+        requested = list(self._manifest.get("tools") or [])
+        preset_surface = None
+        caps = self._manifest.get("preset_capabilities")
+        preset_llm = self._manifest.get("preset_llm") or self._manifest.get("llm") or {}
+        if isinstance(caps, dict):
+            preset_surface = manager._instantiate_preset_capabilities(
+                self, caps, preset_llm,
+                required_tools=manager._expand_requested_tools(self, requested),
+            )
+
+        common_schemas, common_handlers = self._completion_surface()
+        mcp_schemas = dict(common_schemas)
+        mcp_handlers = dict(common_handlers)
+        source_mcp = self._capsule.get("mcp")
+        if not isinstance(source_mcp, list):
+            source_mcp = self._manifest.get("mcp") or []
+        registrations = [
+            reg for reg in source_mcp
+            if isinstance(reg, dict) and reg.get("name") != _DAEMON_COMMON_NAME
+        ]
+        if registrations:
+            # Values in this list are the manifest-safe registrations.  Secret
+            # env/header values are never available here; the owner can use the
+            # inherited environment or native config instead.
+            schemas, handlers, clients = manager._connect_task_mcp_registrations(
+                self, registrations,
+            )
+            mcp_schemas.update(schemas)
+            mcp_handlers.update(handlers)
+            self._task_mcp_clients.extend(clients)
+        return manager._build_tool_surface(
+            self, requested, preset_surface=preset_surface,
+            mcp_surface=(mcp_schemas, mcp_handlers),
+        )
+
+    def _rehydrate_native_mcp_files(self) -> None:
+        """Write unavoidable run-private native files only inside the owner."""
+        if not self._capsule.get("mcp"):
+            return
+        # External CLIs do not receive LingTai's local completion surface, so
+        # their native config must retain the reserved daemon_common server.
+        regs = [
+            r for r in self._capsule.get("mcp", [])
+            if isinstance(r, dict)
+        ]
+        argv = self._manifest.get("backend_argv") or []
+        if not isinstance(argv, list):
+            return
+        from lingtai.kernel._fsutil import atomic_write_json
+
+        def write(path: Path, payload: dict) -> None:
+            atomic_write_json(path, payload, ensure_ascii=False, indent=2)
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+
+        backend = self._manifest.get("backend")
+        if backend in {"claude-p", "claude-code"} and "--mcp-config" in argv:
+            idx = argv.index("--mcp-config")
+            if idx + 1 < len(argv):
+                servers = {
+                    r["name"]: {"command": r["command"], "args": list(r.get("args") or []), **(
+                        {"env": dict(r["env"])} if r.get("env") else {}
+                    )}
+                    for r in regs if r.get("transport", "stdio") == "stdio" and r.get("command")
+                }
+                write(Path(argv[idx + 1]), {"mcpServers": servers})
+        elif backend == "qwen-code" and "__lingtai_qwen_system_settings_path" in argv:
+            idx = argv.index("__lingtai_qwen_system_settings_path")
+            if idx + 1 < len(argv):
+                servers = {
+                    r["name"]: {"command": r["command"], "args": list(r.get("args") or []), "env": dict(r.get("env") or {})}
+                    for r in regs if r.get("transport", "stdio") == "stdio" and r.get("command")
+                }
+                write(Path(argv[idx + 1]), {"mcpServers": servers})
+
+    def run(self) -> str | None:
+        from lingtai.tools.daemon import _backend_spec
+
+        # Overlay runtime-only values after the capsule has been consumed.  No
+        # overlay is written back to daemon.json or the manifest.
+        runtime_task = self._capsule.get("task")
+        if isinstance(runtime_task, str):
+            self._manifest = dict(self._manifest, task=runtime_task)
+        runtime_prompt = self._capsule.get("prompt")
+        if runtime_prompt is None or isinstance(runtime_prompt, str):
+            self._manifest = dict(self._manifest, prompt=runtime_prompt)
+        runtime_mcp = self._capsule.get("mcp")
+        if isinstance(runtime_mcp, list):
+            # The public manifest intentionally contains redacted env/header
+            # values.  Overlay the owner-only registration copy before the
+            # runtime marker gate and before MCP client construction.
+            self._manifest = dict(self._manifest, mcp=list(runtime_mcp))
+        runtime_llm = self._capsule.get("llm")
+        if isinstance(runtime_llm, dict) and isinstance(self._manifest.get("llm"), dict):
+            llm = dict(self._manifest["llm"])
+            llm.update(runtime_llm)
+            self._manifest = dict(self._manifest, llm=llm)
+            if isinstance(self._manifest.get("preset_llm"), dict):
+                preset = dict(self._manifest["preset_llm"])
+                preset.update(runtime_llm)
+                self._manifest = dict(self._manifest, preset_llm=preset)
+        runtime_argv = self._capsule.get("backend_argv")
+        if isinstance(runtime_argv, list) and all(isinstance(v, str) for v in runtime_argv):
+            self._manifest = dict(self._manifest, backend_argv=list(runtime_argv))
+
+        # A redaction marker is suitable for public prompt/state metadata only;
+        # silently handing it to a provider/MCP/CLI is both incorrect and a
+        # potential credential-corruption footgun.  The manager-created path
+        # overlays the real values from the one-shot capsule before this gate.
+        for field in ("llm", "mcp", "backend_argv"):
+            if _contains_redacted(self._manifest.get(field)):
+                raise ValueError(
+                    f"runtime field {field!r} still contains a redaction marker; "
+                    "the detached secret capsule was not supplied"
+                )
+
+        backend = self._manifest["backend"]
+        if backend == "lingtai":
+            schemas, dispatch = self._build_lingtai_surface()
+            preset_llm = self._manifest.get("preset_llm") or self._manifest.get("llm")
+            provider_admission_token = None
+            try:
+                parent = self._provider_admission_parent
+                if parent is not None:
+                    from lingtai.kernel.provider_admission import bind_provider_admission
+
+                    provider_admission_token = bind_provider_admission(parent)
+                return self._manager_type._run_emanation(
+                    self,
+                    self._run_dir.handle,
+                    self._run_dir,
+                    schemas,
+                    dispatch,
+                    self._manifest["task"],
+                    self._cancel_event,
+                    self._timeout_event,
+                    preset_llm,
+                    self._max_turns,
+                    self._task_mcp_clients,
+                    self._manifest.get("context_token_limit"),
+                    prompt=self._manifest.get("prompt"),
+                )
+            finally:
+                self._task_mcp_clients = []
+                if provider_admission_token is not None:
+                    from lingtai.kernel.provider_admission import clear_provider_admission
+
+                    clear_provider_admission(provider_admission_token)
+                self._close_driver_authority()
+
+        self._rehydrate_native_mcp_files()
+        spec = _backend_spec(backend)
+        if spec is None or not spec.runner_attr:
+            raise ValueError(f"unknown detached backend {backend!r}")
+        runner = getattr(self._manager_type, spec.runner_attr)
+        try:
+            return runner(
+                self,
+                self._run_dir.handle,
+                self._run_dir,
+                self._manifest["task"],
+                self._cancel_event,
+                self._timeout_event,
+                list(self._manifest.get("backend_argv") or []),
+                self._runtime_backend_env(),
+            )
+        finally:
+            self._close_driver_authority()
+
+    def _runtime_backend_env(self) -> dict[str, str]:
+        """Return the reserved ``backend_options.env`` overlay for this run.
+
+        The overlay never enters the manifest — durable state redacts every
+        ``env`` container's values — so it travels in the one-shot capsule and
+        is re-validated here before reaching a spawn environment.
+        """
+        source = self._capsule.get("backend_env")
+        if not isinstance(source, dict):
+            return {}
+        import re as _re
+        name_pattern = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+        return {
+            key: value for key, value in source.items()
+            if isinstance(key, str) and isinstance(value, str)
+            and name_pattern.match(key)
+        }
+
+    def run_with_events(self, cancel_event, timeout_event) -> str | None:
+        self._cancel_event = cancel_event
+        self._timeout_event = timeout_event
+        return self.run()
+
+    def run_resume(self, generation: str) -> dict:
+        """Run one supported CLI resume using the production stream parser.
+
+        The detached child owns the local executor only as an implementation
+        detail; no parent manager future or process handle crosses this seam.
+        Backend-specific command/parser policy remains in ``DaemonManager``.
+        """
+        from lingtai.tools.daemon import _backend_spec
+        backend = self._manifest.get("backend")
+        spec = _backend_spec(backend)
+        if spec is None or not spec.is_cli or spec.ask_handler_attr is None:
+            raise ValueError(
+                f"detached resume is unsupported for backend {backend!r}"
+            )
+        state = self._run_dir.read_state_from_disk(self._run_dir.path)
+        entry = {
+            "detached": True, "run_dir": self._run_dir,
+            "backend": backend, "task": state.get("task", ""),
+            "followup_lock": threading.Lock(), "ask_in_flight": False,
+            "ask_future": None, "cancel_event": threading.Event(),
+        }
+        self._cancel_event = entry["cancel_event"]
+        self._timeout_event = threading.Event()
+        self._emanations[self._run_dir.handle] = entry
+        self._ask_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="daemon-detached-resume")
+        message = self._capsule.get("message")
+        if not isinstance(message, str) or not message:
+            raise ValueError("detached resume message was not supplied through the one-shot capsule")
+        try:
+            handler = getattr(self._manager_type, spec.ask_handler_attr)
+            response = handler(self, self._run_dir.handle, entry, message)
+            if response.get("status") == "busy":
+                return response
+            future = entry.get("ask_future")
+            if future is None:
+                if response.get("status") == "error":
+                    self._run_dir.record_followup(
+                        generation, status="failed", error=response.get("message", "resume failed")
+                    )
+                return response
+            result = future.result(timeout=float(self._manifest.get("timeout_s", 30)) + 5.0)
+            if result.get("status") == "sent":
+                self._run_dir.record_followup(
+                    generation, status="done", output=result.get("output", "")
+                )
+            else:
+                self._run_dir.record_followup(
+                    generation, status="failed", error=result.get("message", "resume failed")
+                )
+            return result
+        except Exception as exc:
+            self._run_dir.record_followup(
+                generation, status="failed", error=f"{type(exc).__name__}: {exc}"
+            )
+            raise
+        finally:
+            self._ask_pool.shutdown(wait=False, cancel_futures=True)
+
+
+__all__ = ["DetachedDaemonExecutionHost"]

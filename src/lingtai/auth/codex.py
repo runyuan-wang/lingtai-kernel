@@ -6,6 +6,8 @@ checks expiry, and auto-refreshes via the OpenAI OAuth endpoint.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import time
@@ -17,6 +19,36 @@ from filelock import FileLock
 TOKEN_URL = "https://auth.openai.com/oauth/token"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 REFRESH_BUFFER_SECONDS = 300  # refresh if within 5 minutes of expiry
+
+# Namespaced OAuth claim that carries the user's ChatGPT account id in the
+# OpenAI-issued id_token. The official OpenAI OAuth payload nests it under this
+# OIDC-style namespace key, e.g.
+#   {"https://api.openai.com/auth": {"chatgpt_account_id": "<uuid>", ...}, ...}
+_OAUTH_AUTH_CLAIM = "https://api.openai.com/auth"
+_ACCOUNT_ID_CLAIM = "chatgpt_account_id"
+
+
+def _decode_jwt_payload(token: str) -> dict:
+    """Decode a JWT's payload segment locally (NO signature verification).
+
+    This only base64url-decodes the middle segment to read non-secret metadata
+    claims the issuer put there. We never verify the signature — we are not
+    authenticating the token, just reading our own account metadata out of it.
+    Returns ``{}`` for anything that is not a well-formed JWT-with-JSON-payload
+    rather than raising, so callers can treat "no account id" uniformly.
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return {}
+        payload_b64 = parts[1]
+        # base64url, padding stripped by the JWT spec — restore it before decode.
+        padding = "=" * (-len(payload_b64) % 4)
+        raw = base64.urlsafe_b64decode(payload_b64 + padding)
+        decoded = json.loads(raw)
+        return decoded if isinstance(decoded, dict) else {}
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return {}
 
 
 class CodexAuthError(Exception):
@@ -34,7 +66,7 @@ class CodexTokenManager:
         if token_path is None:
             tui_dir = os.environ.get("LINGTAI_TUI_DIR", "~/.lingtai-tui")
             token_path = str(Path(tui_dir).expanduser() / "codex-auth.json")
-        self._path = Path(token_path)
+        self._path = Path(token_path).expanduser()
         self._lock_path = self._path.with_suffix(".json.lock")
         self._cache: dict | None = None
         self._cache_mtime: float = 0.0
@@ -65,6 +97,65 @@ class CodexTokenManager:
 
         return data["access_token"]
 
+    def refresh_access_token(self, rejected_access_token: str) -> str:
+        """Reload or refresh after a model request rejects ``rejected_access_token``.
+
+        The refresh is serialized by the same cross-process lock as proactive
+        expiry refresh.  Once inside the lock we re-read from disk: if another
+        request already replaced the rejected token, reuse that newer credential;
+        otherwise refresh even when the JWT's local expiry still looks valid.
+        OAuth refresh-endpoint failures retain the ordinary ``CodexAuthError``
+        behavior from :meth:`_refresh`.
+        """
+        if not isinstance(rejected_access_token, str) or not rejected_access_token:
+            raise ValueError("rejected_access_token must be a non-empty string")
+        data = self._read()
+        self._refresh(data, rejected_access_token=rejected_access_token)
+        return self._read()["access_token"]
+
+    def get_account_id(self) -> str | None:
+        """Return the user's own ChatGPT account id, or ``None`` if unavailable.
+
+        Source priority (the user's OWN auth data only — never invented):
+          1. An explicit ``account_id`` / ``chatgpt_account_id`` field written
+             into ``codex-auth.json`` by the TUI, if present.
+          2. The namespaced claim decoded locally from the ``id_token`` JWT:
+             ``payload["https://api.openai.com/auth"]["chatgpt_account_id"]``
+             (no signature verification — local metadata extraction only).
+
+        Always non-raising: a missing file, malformed JSON, or absent claim all
+        yield ``None`` so callers can simply omit the header. The returned id is
+        a non-secret account identifier; the access/refresh tokens are never
+        read or returned here.
+        """
+        try:
+            data = self._read()
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+        return self._extract_account_id(data)
+
+    @staticmethod
+    def _extract_account_id(data: dict) -> str | None:
+        """Pull the ChatGPT account id out of already-loaded auth data."""
+        # 1. Explicit field wins — the TUI may persist it directly.
+        for key in ("account_id", "chatgpt_account_id"):
+            val = data.get(key)
+            if isinstance(val, str) and val:
+                return val
+
+        # 2. Fall back to decoding the id_token JWT's namespaced auth claim.
+        id_token = data.get("id_token")
+        if not isinstance(id_token, str) or not id_token:
+            return None
+        payload = _decode_jwt_payload(id_token)
+        auth_claim = payload.get(_OAUTH_AUTH_CLAIM)
+        if isinstance(auth_claim, dict):
+            val = auth_claim.get(_ACCOUNT_ID_CLAIM)
+            if isinstance(val, str) and val:
+                return val
+        return None
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -89,7 +180,9 @@ class CodexTokenManager:
         self._cache_mtime = mtime
         return data
 
-    def _refresh(self, data: dict) -> None:
+    def _refresh(
+        self, data: dict, *, rejected_access_token: str | None = None
+    ) -> None:
         """Refresh the access token using the stored refresh token.
 
         Uses a file lock so concurrent processes don't race.  After
@@ -98,10 +191,23 @@ class CodexTokenManager:
         """
         lock = FileLock(self._lock_path, timeout=30)
         with lock:
-            # Re-read inside the lock; someone else may have refreshed.
+            # Force a physical re-read inside the lock. Atomic replacement can
+            # otherwise leave this manager's mtime cache holding a credential a
+            # concurrent process already superseded (notably on coarse-mtime FSes).
+            self._cache = None
+            self._cache_mtime = 0.0
             fresh = self._read()
-            if fresh.get("expires_at", 0) > time.time() + REFRESH_BUFFER_SECONDS:
-                return  # already refreshed by another process
+            expires_safely = (
+                fresh.get("expires_at", 0) > time.time() + REFRESH_BUFFER_SECONDS
+            )
+            already_replaced = bool(
+                rejected_access_token
+                and fresh.get("access_token") != rejected_access_token
+            )
+            if expires_safely and (
+                rejected_access_token is None or already_replaced
+            ):
+                return  # proactively valid, or recovered by another request
 
             refresh_token = fresh.get("refresh_token") or data.get("refresh_token")
             if not refresh_token:
@@ -143,3 +249,69 @@ class CodexTokenManager:
             # Invalidate cache so next _read() picks up the new file.
             self._cache = None
             self._cache_mtime = 0.0
+
+
+# ===========================================================================
+# STRUCTURAL error classification — Codex-owned switch/failover helpers
+# ===========================================================================
+
+# The exact structured provider error code that triggers a request-scoped Codex
+# account switch. Recognized STRUCTURALLY only (never from the message string).
+_USAGE_LIMIT_CODE = "usage_limit_reached"
+_TOKEN_EXPIRED_CODE = "token_expired"
+
+
+def _structured_status_code(exc: BaseException) -> int | None:
+    """Best-effort STRUCTURAL HTTP status extraction, or ``None``."""
+    for attr in ("status_code", "status"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+    response = getattr(exc, "response", None)
+    if response is not None:
+        value = getattr(response, "status_code", None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _structured_error_codes(exc: BaseException) -> tuple[str, ...]:
+    """Collect machine error codes from trusted structured locations."""
+    candidates: list[object] = []
+    code_attr = getattr(exc, "code", None)
+    if isinstance(code_attr, str):
+        candidates.append(code_attr)
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            candidates.append(err.get("code"))
+            candidates.append(err.get("type"))
+        candidates.append(body.get("code"))
+    return tuple(c for c in candidates if isinstance(c, str) and c)
+
+
+def _is_token_expired_error(exc: BaseException) -> bool:
+    """Return whether ``exc`` is structurally an HTTP ``401`` carrying the
+    exact trusted machine code ``token_expired``.
+
+    This classifies ordinary provider request failures only. OAuth refresh
+    endpoint handling remains inside :class:`CodexTokenManager` and never calls
+    this helper; message text and websocket fallback strings are not inspected.
+    """
+    if _structured_status_code(exc) != 401:
+        return False
+    return _TOKEN_EXPIRED_CODE in _structured_error_codes(exc)
+
+
+def _is_usage_limit_reached_error(exc: BaseException) -> bool:
+    """``True`` iff ``exc`` is structurally a ``429`` whose structured
+    error code is exactly ``usage_limit_reached``.
+
+    Both facts are extracted STRUCTURALLY — never from the message string.
+    """
+    if _structured_status_code(exc) != 429:
+        return False
+    return _USAGE_LIMIT_CODE in _structured_error_codes(exc)

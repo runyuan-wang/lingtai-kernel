@@ -5,14 +5,15 @@ import json
 import subprocess
 import sys
 
-from lingtai.capabilities import get_all_providers
+from lingtai.tools.registry import get_all_providers
 
 
 def test_get_all_providers_returns_all_capabilities():
     result = get_all_providers()
     expected = {
-        "file", "bash", "web_search", "knowledge",
+        "shell", "web", "knowledge",
         "skills", "vision", "avatar", "daemon",
+        "task_card",
     }
     assert expected == set(result.keys())
 
@@ -27,7 +28,7 @@ def test_get_all_providers_structure():
 
 def test_builtin_capabilities_have_empty_providers():
     result = get_all_providers()
-    builtins = ["file", "bash", "knowledge", "skills", "avatar", "daemon"]
+    builtins = ["shell", "knowledge", "skills", "avatar", "daemon"]
     for name in builtins:
         assert result[name]["providers"] == [], f"{name} should have empty providers"
         assert result[name]["default"] == "builtin", f"{name} should default to builtin"
@@ -38,10 +39,11 @@ def test_provider_dependent_capabilities():
     assert result["vision"]["default"] is None
     assert "minimax" in result["vision"]["providers"]
     assert "gemini" in result["vision"]["providers"]
-    # "local" is intentionally NOT advertised in PROVIDERS yet — it works
-    # via explicit opt-in (add_capability(..., provider="local")) but
-    # should not appear in check-caps output. See capabilities/vision.py.
-    assert "local" not in result["vision"]["providers"]
+    # "local" is the generic local OpenAI-compatible provider: advertised in
+    # check-caps so operators see it as a first-class route. The native
+    # on-device "mlx" pseudo-provider stays hidden (explicit opt-in only).
+    assert "local" in result["vision"]["providers"]
+    assert "mlx" not in result["vision"]["providers"]
 
 
 def test_check_caps_cli_output():
@@ -52,6 +54,7 @@ def test_check_caps_cli_output():
     )
     assert proc.returncode == 0, f"check-caps failed: {proc.stderr}"
     data = json.loads(proc.stdout)
-    assert "file" in data
+    assert "shell" in data
+    assert "file" not in data
     assert "vision" in data
     assert isinstance(data["vision"]["providers"], list)

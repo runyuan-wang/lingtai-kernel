@@ -13,7 +13,8 @@ Key Anthropic API differences from OpenAI/Gemini:
 
 from __future__ import annotations
 
-import json
+import math
+import os
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -21,35 +22,78 @@ from typing import Any
 import anthropic
 import httpx
 
-from lingtai_kernel.logging import get_logger
+from lingtai.kernel.logging import get_logger
 
 logger = get_logger()
 
 
+_READ_TIMEOUT_ENV = "LINGTAI_LLM_READ_TIMEOUT"
+_READ_TIMEOUT_DEFAULT = 300.0
+
+
+def _read_timeout_cap() -> float:
+    """Resolve the per-phase HTTP read cap (seconds).
+
+    ``LINGTAI_LLM_READ_TIMEOUT`` overrides the default 300s cap so operators
+    can tune how long a thinking model may occupy a read phase before the
+    SDK gives up. Values must be positive and finite; anything else falls
+    back to the default.
+    """
+    raw = os.environ.get(_READ_TIMEOUT_ENV, "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            return _READ_TIMEOUT_DEFAULT
+        if math.isfinite(value) and value > 0:
+            return value
+    return _READ_TIMEOUT_DEFAULT
+
+
 def _build_http_timeout(request_timeout: float | None):
-    """Build explicit per-phase HTTP timeout for SDK calls."""
+    """Build explicit per-phase HTTP timeout for SDK calls.
+
+    The read cap defaults to the watchdog's ``retry_timeout`` (300s, config.py)
+    so modern thinking models (DeepSeek/GLM extended thinking, 60-180s) are not
+    killed mid-thought before the watchdog can decide. Operators may tune the
+    read cap with ``LINGTAI_LLM_READ_TIMEOUT`` (seconds).
+    """
     if request_timeout is None:
         return None
-    return httpx.Timeout(
+    # Construct the SDK's own ``Timeout`` class, never ``httpx.Timeout`` directly:
+    # anthropic SDKs built on the ``httpx2`` fork do not accept a foreign
+    # ``httpx.Timeout``, and the failure is VERSION-DEPENDENT — e.g. 1.4/1.5
+    # fail-fast with a TypeError before any request, while 1.2.0 does NOT raise
+    # but silently mis-coerces it, stuffing the whole object into every phase
+    # (connect/read/write/pool); either way the per-phase caps are lost.
+    # ``anthropic.Timeout`` re-exports whichever Timeout the installed SDK actually
+    # uses — ``httpx`` for SDKs on plain httpx, ``httpx2`` for SDKs on the fork —
+    # so this keys on what the SDK accepts rather than on which httpx package is
+    # importable (httpx2 is installed across the current range, so "is httpx2
+    # importable" would be a constant-true, useless predicate).
+    timeout_cls = getattr(anthropic, "Timeout", httpx.Timeout)
+    return timeout_cls(
         connect=min(float(request_timeout), 30.0),
-        read=min(float(request_timeout), 60.0),
+        read=min(float(request_timeout), _read_timeout_cap()),
         write=min(float(request_timeout), 30.0),
         pool=10.0,
     )
 
 
-from lingtai_kernel.llm.base import (
+from lingtai.kernel.llm.base import (
     ChatSession,
     FunctionSchema,
     LLMResponse,
     ToolCall,
     UsageMetadata,
+    wire_tool_description,
 )
-from lingtai_kernel.llm.interface import ToolResultBlock
+from lingtai.kernel.llm.interface import ToolResultBlock
 from lingtai.llm.base import LLMAdapter
-from lingtai_kernel.llm.interface import ChatInterface
+from lingtai.kernel.llm.interface import ChatInterface
 from ..interface_converters import to_anthropic
-from lingtai_kernel.llm.streaming import StreamingAccumulator
+from lingtai.kernel.llm.streaming import StreamingAccumulator
+from lingtai.llm.identity_headers import merge_lingtai_identity_headers
 
 
 # ---------------------------------------------------------------------------
@@ -60,13 +104,20 @@ from lingtai_kernel.llm.streaming import StreamingAccumulator
 def _build_tools(
     schemas: list[FunctionSchema] | None, *, cache_tools: bool = False
 ) -> list[dict] | None:
-    """Convert FunctionSchema list to Anthropic tool format."""
+    """Convert FunctionSchema list to Anthropic tool format.
+
+    The wire description comes from ``wire_tool_description``: the constant
+    ``WIRE_TOOL_DESCRIPTION`` pointer while the resident ``## tools`` section is
+    opted in via ``LINGTAI_TOOL_PROSE_SECTION_ENABLED``, otherwise the full
+    ``FunctionSchema.description`` prose (that section is not rendered by
+    default, so the wire is where the prose lives).
+    """
     if not schemas:
         return None
     tools = [
         {
             "name": s.name,
-            "description": s.description,
+            "description": wire_tool_description(s.description),
             "input_schema": s.parameters,
         }
         for s in schemas
@@ -189,15 +240,6 @@ def _parse_response(raw) -> LLMResponse:
     )
 
 
-def _tool_result_to_dict(block: ToolResultBlock) -> dict:
-    """Convert a canonical ToolResultBlock to Anthropic tool_result dict."""
-    return {
-        "type": "tool_result",
-        "tool_use_id": block.id,
-        "content": block.content if isinstance(block.content, str) else json.dumps(block.content, default=str),
-    }
-
-
 def _ensure_alternation(messages: list[dict]) -> list[dict]:
     """Merge consecutive same-role messages to satisfy Anthropic's alternation rule.
 
@@ -236,39 +278,6 @@ def _ensure_alternation(messages: list[dict]) -> list[dict]:
             merged.append(dict(msg))
 
     return merged
-
-
-def _response_to_messages(raw) -> list[dict]:
-    """Convert an Anthropic response into message dicts for the history."""
-    result: dict[str, Any] = {"role": "assistant", "content": []}
-
-    for block in raw.content:
-        if block.type == "text":
-            result["content"].append({"type": "text", "text": block.text})
-        elif block.type == "tool_use":
-            result["content"].append(
-                {
-                    "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name,
-                    "input": block.input if isinstance(block.input, dict) else {},
-                }
-            )
-        elif block.type == "thinking":
-            # Include thinking blocks so history round-trips correctly
-            result["content"].append(
-                {
-                    "type": "thinking",
-                    "thinking": getattr(block, "thinking", ""),
-                    # Anthropic requires a signature for thinking blocks in history
-                    "signature": getattr(block, "signature", ""),
-                }
-            )
-
-    if not result["content"]:
-        result["content"] = [{"type": "text", "text": ""}]
-
-    return [result]
 
 
 # ---------------------------------------------------------------------------
@@ -399,13 +408,17 @@ class AnthropicChatSession(ChatSession):
 
         try:
             raw, total_dropped, rounds = self._run_with_overflow_recovery(_do_call)
-        except Exception:
+        except Exception as exc:
             # Revert the interface on error - drop the last user entry,
             # but only when this call appended one.  ``message is None``
             # means the caller pre-staged the wire and we must not
             # corrupt it on failure.
             if message is not None:
                 self._interface.drop_trailing(lambda e: e.role == "user")
+            # Terminal overflow failure may already have trimmed entries;
+            # surface the loss after the revert (the revert would strip a
+            # just-injected user-role notice) — issue #653.
+            self._inject_overflow_notice_after_error(exc)
             raise
 
         # If recovery fired (entries were dropped), inject the molt notice.
@@ -415,7 +428,7 @@ class AnthropicChatSession(ChatSession):
         # Parse response and add to interface
         response = _parse_response(raw)
         # Record assistant response from raw API object (preserves thinking signatures)
-        from lingtai_kernel.llm.interface import TextBlock, ThinkingBlock, ToolCallBlock
+        from lingtai.kernel.llm.interface import TextBlock, ThinkingBlock, ToolCallBlock
         assistant_blocks = []
         for block in raw.content:
             if block.type == "thinking":
@@ -453,7 +466,7 @@ class AnthropicChatSession(ChatSession):
         on_chunk: Callable[[str], None] | None = None,
     ) -> LLMResponse:
         """Streaming send. User message committed to history only after success."""
-        from lingtai_kernel.llm.interface import TextBlock, ThinkingBlock, ToolCallBlock
+        from lingtai.kernel.llm.interface import TextBlock, ThinkingBlock, ToolCallBlock
 
         # Record user input into interface first.  ``None`` means the
         # caller pre-staged the wire (see send() docstring).
@@ -519,11 +532,14 @@ class AnthropicChatSession(ChatSession):
 
         try:
             raw_result, total_dropped, rounds = self._run_with_overflow_recovery(_do_stream)
-        except Exception:
+        except Exception as exc:
             # Revert the interface on error — drop the last user entry
             # only if this call appended one.
             if message is not None:
                 self._interface.drop_trailing(lambda e: e.role == "user")
+            # Terminal overflow failure may already have trimmed entries;
+            # surface the loss after the revert (see issue #653).
+            self._inject_overflow_notice_after_error(exc)
             raise
 
         # If recovery fired (entries were dropped), inject the molt notice.
@@ -660,11 +676,13 @@ class AnthropicAdapter(LLMAdapter):
         base_url: str | None = None,
         timeout_ms: int = 300_000,
         max_rpm: int = 0,
+        default_headers: dict | None = None,
     ):
         self._base_url = base_url
         kwargs: dict[str, Any] = {
             "api_key": api_key,
             "timeout": timeout_ms / 1000.0,
+            "default_headers": merge_lingtai_identity_headers(default_headers),
         }
         if base_url:
             kwargs["base_url"] = base_url
@@ -672,24 +690,31 @@ class AnthropicAdapter(LLMAdapter):
         self._client = anthropic.Anthropic(**kwargs)
         self._setup_gate(max_rpm)
 
+    # Extended-thinking budget per kernel THINKING_LEVELS tier. Every level a
+    # manifest can select is mapped, so a user-chosen effort never silently
+    # disables thinking; explicit ``"none"`` is the one level that means off.
+    _THINKING_BUDGETS = {
+        "none": None,
+        "minimal": 1024,
+        "low": 2048,
+        "medium": 8192,
+        "high": 16384,
+        "xhigh": 32768,
+        "max": 65536,
+    }
+
     @staticmethod
     def _resolve_thinking_budget(thinking: str) -> int | None:
-        """Resolve thinking tier to budget tokens using config."""
-        if thinking == "default" or thinking is None:
-            return None
+        """Resolve a kernel thinking tier to Anthropic budget tokens.
 
-        if thinking == "high":
-            tier = "high"
-        elif thinking == "low":
-            tier = "low"
-        else:
+        Returns ``None`` (extended thinking off) for the omitted-value
+        sentinel ``"default"``, for ``None``/empty, for explicit ``"none"``,
+        and for any unknown tier; every other ``THINKING_LEVELS`` value maps to
+        its budget in ``_THINKING_BUDGETS``.
+        """
+        if not thinking or thinking == "default":
             return None
-
-        if tier == "high":
-            return 16384
-        elif tier in ("low", "medium"):
-            return 2048
-        return None
+        return AnthropicAdapter._THINKING_BUDGETS.get(thinking)
 
     # -- LLMAdapter interface --------------------------------------------------
 

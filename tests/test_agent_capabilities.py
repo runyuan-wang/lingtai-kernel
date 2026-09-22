@@ -2,18 +2,12 @@
 from __future__ import annotations
 
 import pytest
-from unittest.mock import MagicMock
 from lingtai.agent import Agent
 from lingtai.services.vision import VisionService
 from lingtai.services.websearch import SearchService, SearchResult
+from tests._service_helpers import make_gemini_mock_service as make_mock_service
 
 
-def make_mock_service():
-    svc = MagicMock()
-    svc.get_adapter.return_value = MagicMock()
-    svc.provider = "gemini"
-    svc.model = "gemini-test"
-    return svc
 
 
 class FakeVisionService(VisionService):
@@ -27,21 +21,48 @@ class FakeSearchService(SearchService):
 
 
 def test_agent_no_capabilities_boots_core_floor(tmp_path):
-    """Agent with no explicit capabilities still boots the `lingtai.core.*` floor.
+    """Agent with no explicit capabilities still boots the always-on tool floor.
 
-    The default-on set covers knowledge/skills/bash/avatar/daemon/mcp + file caps.
-    Opt-in capabilities (vision, web_search) stay off until requested.
+    The default-on set covers knowledge/skills/shell/avatar/daemon/mcp;
+    vision is always registered (provider-bound, defaults to the active LLM).
+    The opt-in capability (web) stays off until requested.
     """
-    from lingtai.capabilities import CORE_DEFAULTS
+    from lingtai.tools.registry import CORE_DEFAULTS
     agent = Agent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
     registered = {name for name, _ in agent._capabilities}
     assert registered == set(CORE_DEFAULTS), (
         f"expected exactly the core defaults, got {registered - set(CORE_DEFAULTS)} extra / "
         f"{set(CORE_DEFAULTS) - registered} missing"
     )
-    assert "vision" not in registered
-    assert "web_search" not in registered
+    manifest_registered = {
+        name for name, _ in agent._build_manifest().get("capabilities", [])
+    }
+    for name in CORE_DEFAULTS:
+        assert agent.has_capability(name) is True
+        assert name in manifest_registered
+    assert "vision" in registered
+    assert "web" not in registered
     agent.stop(timeout=1.0)
+
+
+def test_agent_unsupported_vision_registers_manual_route(tmp_path):
+    """Unsupported vision remains registered for explicit manual guidance."""
+    agent = Agent(
+        service=make_mock_service(),
+        agent_name="test",
+        working_dir=tmp_path / "test",
+        capabilities={"vision": {"provider": "not-real"}},
+    )
+    try:
+        manifest_registered = {
+            name for name, _ in agent._build_manifest().get("capabilities", [])
+        }
+        assert agent.has_capability("vision") is True
+        assert agent.get_capability("vision") is not None
+        assert "vision" in agent._tool_handlers
+        assert "vision" in manifest_registered
+    finally:
+        agent.stop(timeout=1.0)
 
 
 def test_agent_disable_strips_core_capability(tmp_path):
@@ -60,16 +81,16 @@ def test_agent_disable_strips_core_capability(tmp_path):
 def test_agent_capabilities_dict_kwarg_overrides_default(tmp_path):
     """Passing kwargs for a default-on capability merges over the defaults.
 
-    `bash` defaults to {"yolo": True}; passing `policy_file` keeps yolo (since
-    the override is a merge, not a replace) — hosts wanting strict sandbox
-    should set `{"yolo": False, "policy_file": "..."}`.
+    `bash` carries no core-default kwargs (the Shell binding resolves omitted
+    config to yolo), so an explicit `{"yolo": False}` or `policy_file` survives
+    the merge unmasked.
     """
     agent = Agent(
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
         capabilities={"bash": {"yolo": False}},
     )
-    bash_entry = [(n, k) for n, k in agent._capabilities if n == "bash"]
-    assert bash_entry and bash_entry[0][1].get("yolo") is False
+    shell_entry = [(n, k) for n, k in agent._capabilities if n == "shell"]
+    assert shell_entry and shell_entry[0][1].get("yolo") is False
     agent.stop(timeout=1.0)
 
 
@@ -77,28 +98,18 @@ def test_agent_capabilities_list(tmp_path):
     """capabilities= as list of strings is honored alongside the core defaults."""
     agent = Agent(
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
-        capabilities=["read", "write"],
+        capabilities=["web"],
     )
     registered = {name for name, _ in agent._capabilities}
-    assert "read" in registered
-    assert "write" in registered
+    assert "web" in registered
+    # The core defaults still register alongside the opt-in list entry.
+    assert "shell" in registered
+    # The removed ``file`` family and its retired per-operation names are not
+    # capabilities at all.
+    assert "file" not in registered
+    assert "read" not in registered
+    assert "write" not in registered
     agent.stop(timeout=1.0)
-
-
-def test_read_tool_description_points_to_file_manual(tmp_path):
-    """The read tool should route hard file cases to the intrinsic file manual."""
-    agent = Agent(
-        service=make_mock_service(),
-        agent_name="test",
-        working_dir=tmp_path / "test",
-        capabilities=["read"],
-    )
-    try:
-        read_schema = next(schema for schema in agent._tool_schemas if schema.name == "read")
-        assert "file-manual" in read_schema.description
-        assert "non-UTF-8" in read_schema.description
-    finally:
-        agent.stop(timeout=1.0)
 
 
 def test_agent_capabilities_dict(tmp_path):
@@ -111,14 +122,14 @@ def test_agent_capabilities_dict(tmp_path):
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
         capabilities={
             "vision": {"vision_service": FakeVisionService()},
-            "web_search": {"search_service": FakeSearchService()},
+            "web": {"search_service": FakeSearchService()},
         },
     )
     registered = {name for name, _ in agent._capabilities}
     assert "vision" in registered
-    assert "web_search" in registered
+    assert "web" in registered
     assert "vision" in agent._tool_handlers
-    assert "web_search" in agent._tool_handlers
+    assert "web" in agent._tool_handlers
     agent.stop(timeout=1.0)
 
 
@@ -149,27 +160,23 @@ def test_agent_seal_after_start(tmp_path):
 
 
 def test_vision_requires_provider(tmp_path):
-    """Vision capability is skipped when no provider or service is given.
-
-    setup() raises ValueError, but the agent catches it (capability_skipped)
-    and simply doesn't register the tool.
-    """
+    """No provider still registers vision's manual route."""
     agent = Agent(
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
         capabilities=["vision"],
     )
-    assert agent.get_capability("vision") is None
-    assert "vision" not in {s.name for s in agent._tool_schemas}
+    assert agent.get_capability("vision") is not None
+    assert "vision" in {s.name for s in agent._tool_schemas}
     agent.stop(timeout=1.0)
 
 
-def test_web_search_defaults_to_duckduckgo(tmp_path):
+def test_web_defaults_to_duckduckgo(tmp_path):
     """Web search capability falls back to duckduckgo when no provider given."""
     agent = Agent(
         service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test",
-        capabilities=["web_search"],
+        capabilities=["web"],
     )
-    mgr = agent.get_capability("web_search")
+    mgr = agent.get_capability("web")
     assert mgr is not None
-    assert "web_search" in {s.name for s in agent._tool_schemas}
+    assert "web" in {s.name for s in agent._tool_schemas}
     agent.stop(timeout=1.0)

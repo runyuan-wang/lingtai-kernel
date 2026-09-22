@@ -1,7 +1,7 @@
 """Tests for ChatInterface.pop_orphan_tool_call()."""
 from __future__ import annotations
 
-from lingtai_kernel.llm.interface import (
+from lingtai.kernel.llm.interface import (
     ChatInterface,
     TextBlock,
     ToolCallBlock,
@@ -72,7 +72,7 @@ def test_pop_orphan_tool_call_noop_on_empty():
 # ---------------------------------------------------------------------------
 
 
-def _seed_strict_pair(iface: ChatInterface, call_id: str, name: str = "soul",
+def _seed_strict_pair(iface: ChatInterface, call_id: str, name: str = "demo",
                       args: dict | None = None, content=None) -> None:
     """Append the canonical strict (assistant{tool_call}, user{tool_result})
     pair shape that remove_pair_by_call_id is meant to recognize."""
@@ -115,9 +115,9 @@ def test_remove_pair_by_call_id_returns_false_when_missing():
 
 def test_remove_pair_by_call_id_allows_text_plus_tool_call():
     """An assistant entry containing one ToolCallBlock plus TextBlocks IS
-    accepted: the synthesized notification pair carries a leading text
-    summary alongside the tool call (see ChatInterface.remove_pair_by_call_id
-    docstring). The user entry must still be exactly one ToolResultBlock."""
+    accepted for backward compatibility with older synthesized pairs (see
+    ChatInterface.remove_pair_by_call_id docstring). The user entry must
+    still be exactly one ToolResultBlock."""
     iface = ChatInterface()
     iface.add_system("sys")
     iface.add_user_message("hi")
@@ -159,7 +159,7 @@ def test_remove_pair_by_call_id_refuses_multiple_tool_calls():
 
 
 def test_remove_pair_by_call_id_only_first_match():
-    """Pair may appear at most once for the soul-flow use case, but defend
+    """Pair may appear at most once for the single-slot appendix use case, but defend
     against duplicates: only the first match is removed. (Caller can call
     again to remove subsequent matches if desired.)"""
     iface = ChatInterface()

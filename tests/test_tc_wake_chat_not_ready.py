@@ -1,14 +1,15 @@
 """Regression tests for the post-refresh livelock in _handle_tc_wake.
 
 Background: after `refresh` the agent's _session.chat is torn down (None)
-and re-created lazily on the next _session.send() call. If a soul-flow
-consultation fires while in this transient None-chat state, it posts
+and re-created lazily on the next _session.send() call. If an involuntary
+producer fires while in this transient None-chat state, it posts
 MSG_TC_WAKE which routes to _handle_tc_wake. The original handler bailed
 with `tc_wake_noop reason=chat_not_ready` and re-enqueued the items —
 WITHOUT posting another MSG_TC_WAKE. The next consultation_fire would post
 its own wake, fire the same bail, re-enqueue again, and the cycle never
-made progress. Production observed: agent stuck idle, soul flow firing
-every 2.5 minutes for hours, never producing a turn.
+made progress. Production observed (with the since-removed soul-flow
+producer): agent stuck idle, a timer firing every 2.5 minutes for hours,
+never producing a turn.
 
 Fix: when _chat is None, call _session.ensure_session() to create it
 inline rather than re-enqueueing. ensure_session is idempotent. If session
@@ -21,14 +22,16 @@ from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import MagicMock
 
-from lingtai_kernel.base_agent.turn import _handle_tc_wake
-from lingtai_kernel.llm.interface import (
+import pytest
+
+from lingtai.kernel.base_agent.turn import _handle_tc_wake
+from lingtai.kernel.llm.interface import (
     ChatInterface,
     TextBlock,
     ToolCallBlock,
     ToolResultBlock,
 )
-from lingtai_kernel.tc_inbox import InvoluntaryToolCall, TCInbox
+from lingtai.kernel.tc_inbox import InvoluntaryToolCall, TCInbox
 
 
 # ---------------------------------------------------------------------------
@@ -269,3 +272,97 @@ def test_pending_tool_calls_after_ensure_session_re_enqueues():
     assert session.ensure_calls == 1  # session DID get created
     # Item was re-enqueued because the wire wasn't safe to splice into.
     assert len(agent._tc_inbox) == 1
+
+
+def test_tc_wake_worker_still_running_does_not_touch_iface_in_except(tmp_path):
+    """When the wire-drive send() raises WorkerStillRunningError, the
+    except path must re-raise WITHOUT re-inspecting/healing/saving the
+    poisoned interface. The run loop's central branch owns poisoning and
+    refresh — touching the interface here could race the live worker."""
+    from lingtai.kernel.llm_utils import WorkerStillRunningError
+    from lingtai.kernel.message import Message, MSG_TC_WAKE
+
+    iface = ChatInterface()
+    iface.add_assistant_message([
+        ToolCallBlock(id="notif_call", name="system", args={"action": "notification"})
+    ])
+    iface.add_tool_results([
+        ToolResultBlock(id="notif_call", name="system", content={"status": "ok"})
+    ])
+
+    pending_checks = {"count": 0}
+
+    def has_pending_once():
+        pending_checks["count"] += 1
+        if pending_checks["count"] > 1:
+            raise AssertionError("exception path must not inspect poisoned interface")
+        return False
+
+    iface.has_pending_tool_calls = has_pending_once
+
+    @dataclass
+    class _ChatHolder:
+        interface: ChatInterface
+
+    @dataclass
+    class _Session:
+        chat: _ChatHolder
+
+        def ensure_session(self):
+            return self.chat
+
+        def send(self, payload):
+            assert payload is None
+            raise WorkerStillRunningError(elapsed=300.0, grace=5.0, agent_name="test")
+
+    @dataclass
+    class _Agent:
+        _chat: _ChatHolder
+        _session: _Session
+        _tc_inbox: TCInbox = field(default_factory=TCInbox)
+        _appendix_ids_by_source: dict = field(default_factory=dict)
+        _intrinsics: dict = field(default_factory=dict)
+        _tool_handlers: dict = field(default_factory=dict)
+        _PARALLEL_SAFE_TOOLS: set = field(default_factory=set)
+        _working_dir: Any = tmp_path
+        _logs: list[tuple[str, dict]] = field(default_factory=list)
+        saves: int = 0
+
+        class _ConfigStub:
+            provider = "openai"
+            language = "en"
+
+        _config = _ConfigStub()
+
+        class _ServiceStub:
+            def make_tool_result(self, name, result, **kw):
+                return ToolResultBlock(
+                    id=kw.get("tool_call_id") or "",
+                    name=name,
+                    content=result,
+                )
+
+        service = _ServiceStub()
+
+        def _dispatch_tool(self, _call):
+            return {"status": "ok"}
+
+        def _log(self, event_type, **fields):
+            self._logs.append((event_type, fields))
+
+        def _save_chat_history(self, *, ledger_source=None):
+            self.saves += 1
+
+    chat = _ChatHolder(iface)
+    agent = _Agent(_chat=chat, _session=_Session(chat))
+    wake_msg = Message(type=MSG_TC_WAKE, sender="kernel", content="", timestamp=0.0)
+
+    with pytest.raises(WorkerStillRunningError):
+        _handle_tc_wake(agent, wake_msg)
+
+    assert pending_checks["count"] == 1
+    assert agent.saves == 0
+    assert any(
+        event == "tc_wake_error" and fields.get("worker_still_running") is True
+        for event, fields in agent._logs
+    )

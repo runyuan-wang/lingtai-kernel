@@ -16,7 +16,7 @@ def _build_lib(plib: Path):
         "manifest": {
             "llm": {"provider": "p1", "model": "m1",
                     "api_key": None, "api_key_env": "P1KEY"},
-            "capabilities": {"file": {}, "web_search": {"provider": "duckduckgo"}},
+            "capabilities": {"shell": {}, "web_search": {"provider": "duckduckgo"}},
         },
     }))
     (plib / "beta.json").write_text(json.dumps({
@@ -26,7 +26,7 @@ def _build_lib(plib: Path):
         "manifest": {
             "llm": {"provider": "p2", "model": "m2",
                     "api_key": None, "api_key_env": "P2KEY"},
-            "capabilities": {"file": {}, "vision": {"provider": "p2",
+            "capabilities": {"shell": {}, "vision": {"provider": "p2",
                                                     "api_key_env": "P2KEY"}},
         },
     }))
@@ -68,7 +68,7 @@ def _build_workdir(wd: Path, plib: Path, active: str, *,
             "molt_pressure": 0.8, "molt_prompt": "", "max_turns": 50,
             "admin": {"karma": True}, "streaming": False,
         },
-        "principle": "p", "covenant": "c", "pad": "", "prompt": "",
+        "principle": "p", "covenant": "c", "pad": "", "lingtai": "",
         "soul": "",
         "env_file": str(env),
     }
@@ -123,8 +123,8 @@ def test_e2e_boot_with_alpha_then_swap_to_beta(tmp_path, monkeypatch):
     assert "vision" in data2["manifest"]["capabilities"]
     assert data2["manifest"]["agent_name"] == "test"  # identity preserved
     assert data2["manifest"]["admin"]["karma"] is True  # admin preserved
-    assert data2["manifest"]["soul"]["delay"] == 120  # soul preserved
-    assert data2["manifest"]["stamina"] == 3600  # stamina preserved
+    assert data2["manifest"]["soul"]["delay"] == 120  # inert legacy block left untouched
+    assert "stamina" not in data2["manifest"]  # legacy runtime knob removed
     assert data2["manifest"]["preset"]["active"] == beta_path
     assert data2["manifest"]["preset"]["default"] == alpha_path  # original default preserved
 
@@ -157,7 +157,7 @@ def test_e2e_inherit_resolves_after_swap(tmp_path, monkeypatch):
             "llm": {"provider": "gemini", "model": "gemini-2.5-pro",
                     "api_key": None, "api_key_env": "GEMINI_API_KEY"},
             "capabilities": {
-                "file": {},
+                "shell": {},
                 "web_search": {"provider": "inherit"},
                 "vision": {"provider": "inherit"},
             },
@@ -185,7 +185,7 @@ def test_e2e_inherit_resolves_after_swap(tmp_path, monkeypatch):
             "molt_pressure": 0.8, "molt_prompt": "", "max_turns": 50,
             "admin": {"karma": True}, "streaming": False,
         },
-        "principle": "p", "covenant": "c", "pad": "", "prompt": "",
+        "principle": "p", "covenant": "c", "pad": "", "lingtai": "",
         "soul": "",
         "env_file": str(env),
     }
@@ -198,10 +198,10 @@ def test_e2e_inherit_resolves_after_swap(tmp_path, monkeypatch):
     assert data is not None
 
     caps = data["manifest"]["capabilities"]
-    assert caps["web_search"]["provider"] == "gemini"
-    assert caps["web_search"]["api_key_env"] == "GEMINI_API_KEY"
+    assert caps["web"]["provider"] == "gemini"
+    assert caps["web"]["api_key_env"] == "GEMINI_API_KEY"
     assert caps["vision"]["provider"] == "gemini"
     assert caps["vision"]["api_key_env"] == "GEMINI_API_KEY"
     # model is NOT inherited
-    assert "model" not in caps["web_search"]
+    assert "model" not in caps["web"]
     assert "model" not in caps["vision"]

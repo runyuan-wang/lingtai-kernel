@@ -25,7 +25,7 @@ def _baseline_parent_init(preset_path: str | None = None,
         manifest["preset"] = preset_block
     return {
         "manifest": manifest,
-        "principle": "p", "covenant": "c", "pad": "", "prompt": "",
+        "principle": "p", "covenant": "c", "pad": "", "lingtai": "",
         "soul": "",
     }
 
@@ -39,7 +39,7 @@ def test_avatar_inherits_active_preset_and_absolute_path(tmp_path):
     parent_init = _baseline_parent_init(
         preset_path="/abs/path/to/presets", active_preset="minimax")
 
-    from lingtai.core.avatar import AvatarManager
+    from lingtai.tools.avatar import AvatarManager
     avatar_init = AvatarManager._make_avatar_init(parent_init, "child")
 
     # active is rewritten to default (both were "minimax")
@@ -58,7 +58,7 @@ def test_avatar_resolves_relative_preset_default(tmp_path):
     parent_wd.mkdir()
     parent_init = _baseline_parent_init(active_preset="./presets/x.json")
 
-    from lingtai.core.avatar import AvatarManager
+    from lingtai.tools.avatar import AvatarManager
     avatar_init = AvatarManager._make_avatar_init(
         parent_init, "child", parent_working_dir=parent_wd)
 
@@ -71,7 +71,7 @@ def test_avatar_no_preset_unchanged(tmp_path):
     """Avatar with parent that has no preset block carries no preset."""
     parent_init = _baseline_parent_init()
 
-    from lingtai.core.avatar import AvatarManager
+    from lingtai.tools.avatar import AvatarManager
     avatar_init = AvatarManager._make_avatar_init(parent_init, "child")
 
     assert "preset" not in avatar_init["manifest"]
@@ -86,7 +86,7 @@ def test_avatar_no_parent_working_dir_relative_path_unchanged(tmp_path):
     parent_init = _baseline_parent_init(
         preset_path="./presets", active_preset="x")
 
-    from lingtai.core.avatar import AvatarManager
+    from lingtai.tools.avatar import AvatarManager
     avatar_init = AvatarManager._make_avatar_init(parent_init, "child")
 
     # Without parent_working_dir, the path is preserved verbatim
@@ -109,15 +109,15 @@ def test_avatar_spawns_with_parent_default_when_active_differs(tmp_path):
             },
             "llm": {"provider": "minimax", "model": "MiniMax-M2.7-highspeed",
                     "api_key": None, "api_key_env": "MINIMAX_API_KEY"},
-            "capabilities": {"file": {}, "vision": {"provider": "minimax"}},
+            "capabilities": {"shell": {}, "vision": {"provider": "minimax"}},
             "soul": {"delay": 120}, "stamina": 3600,
             "molt_pressure": 0.8, "molt_prompt": "", "max_turns": 50,
             "admin": {}, "streaming": False,
         },
-        "principle": "p", "covenant": "c", "pad": "", "prompt": "", "soul": "",
+        "principle": "p", "covenant": "c", "pad": "", "lingtai": "", "soul": "",
     }
 
-    from lingtai.core.avatar import AvatarManager
+    from lingtai.tools.avatar import AvatarManager
     avatar_init = AvatarManager._make_avatar_init(parent_init, "child")
 
     # Avatar's preset block: active rewritten to default, default unchanged
@@ -139,21 +139,21 @@ def test_avatar_no_preset_block_inherits_flat_config(tmp_path):
             "agent_name": "parent", "language": "en",
             "llm": {"provider": "x", "model": "y",
                     "api_key": None, "api_key_env": "X"},
-            "capabilities": {"file": {}},
+            "capabilities": {"shell": {}},
             "soul": {"delay": 120}, "stamina": 3600,
             "molt_pressure": 0.8, "molt_prompt": "", "max_turns": 50,
             "admin": {}, "streaming": False,
         },
-        "principle": "p", "covenant": "c", "pad": "", "prompt": "", "soul": "",
+        "principle": "p", "covenant": "c", "pad": "", "lingtai": "", "soul": "",
     }
 
-    from lingtai.core.avatar import AvatarManager
+    from lingtai.tools.avatar import AvatarManager
     avatar_init = AvatarManager._make_avatar_init(parent_init, "child")
 
     # No preset block, no stripping
     assert "preset" not in avatar_init["manifest"]
     assert avatar_init["manifest"]["llm"]["provider"] == "x"
-    assert avatar_init["manifest"]["capabilities"] == {"file": {}}
+    assert avatar_init["manifest"]["capabilities"] == {"shell": {}}
 
 
 def test_avatar_strips_materialized_when_active_equals_default(tmp_path):
@@ -166,15 +166,15 @@ def test_avatar_strips_materialized_when_active_equals_default(tmp_path):
                        "path": "/abs/path"},
             "llm": {"provider": "deepseek", "model": "v4",
                     "api_key": None, "api_key_env": "DEEPSEEK_API_KEY"},
-            "capabilities": {"file": {}},
+            "capabilities": {"shell": {}},
             "soul": {"delay": 120}, "stamina": 3600,
             "molt_pressure": 0.8, "molt_prompt": "", "max_turns": 50,
             "admin": {}, "streaming": False,
         },
-        "principle": "p", "covenant": "c", "pad": "", "prompt": "", "soul": "",
+        "principle": "p", "covenant": "c", "pad": "", "lingtai": "", "soul": "",
     }
 
-    from lingtai.core.avatar import AvatarManager
+    from lingtai.tools.avatar import AvatarManager
     avatar_init = AvatarManager._make_avatar_init(parent_init, "child")
 
     avatar_preset = avatar_init["manifest"]["preset"]
@@ -183,14 +183,60 @@ def test_avatar_strips_materialized_when_active_equals_default(tmp_path):
     assert "capabilities" not in avatar_init["manifest"]
 
 
-def test_avatar_init_drops_legacy_procedures_override(tmp_path):
-    """Avatar init construction must not copy retired procedures overrides."""
+def test_avatar_prompt_owner_document_inherits_only_base_and_covenant(tmp_path):
+    """Avatar init has no live prompt pairs; a narrow Psyche document carries
+    base/covenant and replaces the spawn comment without a comment pointer."""
     parent_init = _baseline_parent_init()
-    parent_init["procedures"] = "legacy parent procedures"
-    parent_init["procedures_file"] = "relative/procedures.md"
+    parent_init["base_prompt"] = "legacy inert base prompt"
+    parent_init["base_prompt_file"] = "relative/base_prompt.md"
+    parent_init["covenant"] = "legacy inert covenant"
+    # The avatar must not inherit the parent's 灵台 character seed.
+    parent_init["lingtai"] = "parent self-authored identity"
+    parent_init["lingtai_file"] = "relative/lingtai.md"
+    retired = {
+        "principle": "legacy parent principle",
+        "principle_file": "relative/principle.md",
+        "procedures": "legacy parent procedures",
+        "procedures_file": "relative/procedures.md",
+        "substrate": "legacy parent substrate",
+        "substrate_file": "relative/substrate.md",
+        "brief": "legacy parent brief",
+        "brief_file": "relative/brief.md",
+    }
+    parent_init.update(retired)
 
-    from lingtai.core.avatar import AvatarManager
+    from lingtai.tools.avatar import AvatarManager
     avatar_init = AvatarManager._make_avatar_init(parent_init, "child")
 
-    assert "procedures" not in avatar_init
-    assert "procedures_file" not in avatar_init
+    for key in (
+        "base_prompt", "base_prompt_file", "covenant", "covenant_file",
+        "comment", "comment_file",
+    ):
+        assert key not in avatar_init
+    # The 灵台 seed is blanked (required field stays present, but empty) and the
+    # _file form is dropped — the avatar starts with no inherited character.
+    assert avatar_init["lingtai"] == ""
+    assert "lingtai_file" not in avatar_init
+    for key in retired:
+        assert key not in avatar_init
+
+    owner = AvatarManager._make_avatar_psyche_settings(
+        {
+            "base_prompt": "recipe base prompt",
+            "base_prompt_file": str(tmp_path / "parent-base.md"),
+            "covenant": "parent covenant",
+            "covenant_file": str(tmp_path / "parent-covenant.md"),
+            "comment": "parent comment",
+            "comment_file": str(tmp_path / "parent-comment.md"),
+        },
+        comment="child spawn comment",
+    )
+    from lingtai.tools.psyche.settings import serialize_prompt_owner_document
+
+    assert owner == serialize_prompt_owner_document(
+        base_prompt="recipe base prompt",
+        base_prompt_file=str(tmp_path / "parent-base.md"),
+        covenant="parent covenant",
+        covenant_file=str(tmp_path / "parent-covenant.md"),
+        comment="child spawn comment",
+    )

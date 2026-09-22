@@ -22,13 +22,25 @@ from __future__ import annotations
 
 import json
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from lingtai_kernel.config import AgentConfig
-from lingtai.core.daemon import DaemonManager
-from lingtai.core.daemon.run_dir import DaemonRunDir
+from lingtai.tools.daemon import DaemonManager
+from lingtai.tools.daemon.process_port import (
+    DaemonProcessCommand,
+    DaemonProcessExit,
+    DaemonProcessHandle,
+)
+from tests._daemon_helpers import (
+    FiniteFakeProc,
+    completed_future,
+    install_fake_detached_owner,
+    make_daemon_agent,
+    make_daemon_run_dir,
+    register_daemon_entry,
+    wait_daemon_terminal,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -36,26 +48,9 @@ from lingtai.core.daemon.run_dir import DaemonRunDir
 # ---------------------------------------------------------------------------
 
 
-def _make_agent(tmp_path):
-    """Minimal Agent with daemon capability and a mock LLM service."""
-    from lingtai.agent import Agent
-
-    svc = MagicMock()
-    svc.provider = "mock"
-    svc.model = "mock-model"
-    svc.create_session = MagicMock()
-    svc.make_tool_result = MagicMock()
-    return Agent(
-        svc,
-        working_dir=tmp_path / "daemon-agent",
-        capabilities=["daemon"],
-        config=AgentConfig(),
-    )
-
-
 def _make_run_dir(agent, *, handle="em-test"):
-    return DaemonRunDir(
-        parent_working_dir=agent._working_dir,
+    return make_daemon_run_dir(
+        agent,
         handle=handle,
         task="dummy task",
         tools=[],
@@ -69,17 +64,59 @@ def _make_run_dir(agent, *, handle="em-test"):
     )
 
 
-class _FakeProc:
-    """Minimal subprocess.Popen stand-in for opencode."""
+class _RecordingPort:
+    """Small caller-side Port fake; adapter internals are deliberately absent."""
 
-    def __init__(self, stdout_lines=(), stderr_lines=(), returncode=0):
-        self.stdout = iter(list(stdout_lines))
-        self.stderr = iter(list(stderr_lines))
-        self.returncode = returncode
-        self.pid = 0
+    class _Stderr:
+        lines: list[str] = []
 
-    def wait(self, timeout=None):
-        return self.returncode
+        def join(self, timeout: float = 2.0) -> None:
+            return None
+
+    def __init__(self, stdout_by_spawn=(), *, timeout_on_iter=False):
+        self.stdout_by_spawn = [list(lines) for lines in stdout_by_spawn]
+        self.timeout_on_iter = timeout_on_iter
+        self.commands: list[DaemonProcessCommand] = []
+        self.group_ids: list[str | None] = []
+        self.deadlines: list[float | None] = []
+        self.waits: list[float | None] = []
+        self.terminations: list[str | None] = []
+        self.releases: list[DaemonProcessHandle] = []
+        self._handles: list[DaemonProcessHandle] = []
+
+    def spawn(self, command, *, group_id=None):
+        handle = DaemonProcessHandle(len(self._handles))
+        self.commands.append(command)
+        self.group_ids.append(group_id)
+        self._handles.append(handle)
+        return handle
+
+    def iter_stdout(self, handle, *, deadline=None):
+        self.deadlines.append(deadline)
+        if self.timeout_on_iter:
+            raise TimeoutError("silent child")
+        return iter(self.stdout_by_spawn[self._handles.index(handle)])
+
+    def drain_stderr(self, handle, *, on_line=None, thread_name="daemon-stderr"):
+        return self._Stderr()
+
+    def wait(self, handle, *, timeout=None):
+        self.waits.append(timeout)
+        return DaemonProcessExit(0)
+
+    def terminate(self, handle, *, reason=None):
+        self.terminations.append(reason)
+        return DaemonProcessExit(-15, reason)
+
+    def release(self, handle):
+        self.releases.append(handle)
+        return True
+
+    def terminate_group(self, group_id, *, reason=None):
+        return 0
+
+    def terminate_all(self, *, reason=None):
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -87,18 +124,9 @@ class _FakeProc:
 # ---------------------------------------------------------------------------
 
 
-def test_schema_enum_includes_opencode():
-    from lingtai.core.daemon import get_schema
-    schema = get_schema("en")
-    backend = schema["properties"]["backend"]
-    assert "opencode" in backend["enum"]
-    assert "opencode" in backend["description"]
-
-
 def test_schema_backend_options_description_mentions_opencode():
-    from lingtai.core.daemon import get_schema
-    schema = get_schema("en")
-    bo = schema["properties"]["tasks"]["items"]["properties"]["backend_options"]
+    from tests._daemon_helpers import daemon_emanate_task_schema
+    bo = daemon_emanate_task_schema("en")["properties"]["backend_options"]
     assert "opencode" in bo["description"]
     # The discovery hint should now point at opencode's own --help too.
     assert "opencode run --help" in bo["description"]
@@ -157,20 +185,20 @@ def test_text_extraction_returns_empty_for_purely_structural_events():
 
 
 def test_opencode_emanate_cmd_includes_run_and_format_json(tmp_path):
-    agent = _make_agent(tmp_path)
+    agent = make_daemon_agent(tmp_path)
     mgr = agent.get_capability("daemon")
 
     captured: list[list[str]] = []
 
     def fake_popen(cmd, *args, **kwargs):
         captured.append(list(cmd))
-        return _FakeProc()
+        return FiniteFakeProc()
 
     run_dir = _make_run_dir(agent, handle="em-oc")
     cancel = threading.Event()
     timeout = threading.Event()
 
-    with patch("lingtai.core.daemon.subprocess.Popen", side_effect=fake_popen):
+    with patch("lingtai.tools.daemon.subprocess.Popen", side_effect=fake_popen):
         mgr._run_opencode_emanation(
             "em-oc", run_dir, "Refactor the auth module.",
             cancel, timeout,
@@ -191,22 +219,109 @@ def test_opencode_emanate_cmd_includes_run_and_format_json(tmp_path):
     assert "LingTai daemon" in cmd[-1]
 
 
+def test_opencode_emanation_uses_injected_port_contract(tmp_path):
+    """The shared initial runner owns policy; the Port owns process access."""
+    from lingtai.tools.daemon import setup
+
+    port = _RecordingPort([[
+        '{"type":"session.created","session_id":"port-session"}\n',
+        '{"type":"session.completed","text":"port result"}\n',
+    ]])
+    agent = make_daemon_agent(tmp_path, capabilities={})
+    mgr = setup(agent, process_port=port)
+    run_dir = _make_run_dir(agent, handle="em-oc-port")
+
+    result = mgr._run_opencode_emanation(
+        "em-oc-port", run_dir, "Use the Port.", threading.Event(),
+        backend_argv=["__lingtai_opencode_config_content", '{"mcp":{}}'],
+    )
+
+    command = port.commands[0]
+    assert command.argv[:4] == ("opencode", "run", "--format", "json")
+    assert command.argv[-1].endswith("Use the Port.")
+    assert dict(command.environment or ()) ["OPENCODE_CONFIG_CONTENT"] == '{"mcp":{}}'
+    assert command.cwd == agent._working_dir
+    assert port.group_ids == [run_dir.group_id]
+    assert result == "port result"
+    assert json.loads(run_dir.daemon_json_path.read_text())["opencode_session_id"] == "port-session"
+    assert len(port.waits) == 1
+    assert len(port.releases) == 1
+
+
+def test_opencode_ask_uses_injected_port_with_deadline_and_releases(tmp_path):
+    """Ask uses the exact resume argv and the Port-owned deadline contract."""
+    from lingtai.tools.daemon import setup
+
+    port = _RecordingPort([[
+        '{"type":"result","text":"follow-up result"}\n',
+    ]])
+    agent = make_daemon_agent(tmp_path, capabilities={})
+    mgr = setup(agent, timeout=30, process_port=port)
+    run_dir = _make_run_dir(agent, handle="em-oc-ask-port")
+    run_dir._state["opencode_session_id"] = "port-resume"
+    run_dir._atomic_write_json(run_dir.daemon_json_path, run_dir._state)
+    entry = register_daemon_entry(
+        mgr, "em-oc-ask-port", run_dir, future=completed_future("done"),
+        backend="opencode", ask_in_flight=False,
+    )
+
+    result = mgr._handle_ask_opencode("em-oc-ask-port", entry, "Continue now")
+    assert result == {
+        "status": "sent", "id": "em-oc-ask-port", "async": True,
+        "message": "ask dispatched; check daemon(action='check', id='em-oc-ask-port') for progress and final reply",
+    }
+    entry["ask_future"].result(timeout=5)
+
+    assert port.commands[0].argv == (
+        "opencode", "run", "--session", "port-resume", "--format", "json", "Continue now",
+    )
+    assert port.group_ids == [None]
+    assert len(port.deadlines) == 1 and port.deadlines[0] is not None
+    assert entry["ask_in_flight"] is False
+    assert len(port.waits) == 1
+    assert len(port.releases) == 1
+
+
+def test_opencode_ask_port_timeout_terminates_and_preserves_timeout_result(tmp_path):
+    from lingtai.tools.daemon import setup
+
+    port = _RecordingPort([[]], timeout_on_iter=True)
+    agent = make_daemon_agent(tmp_path, capabilities={})
+    mgr = setup(agent, timeout=1, process_port=port)
+    run_dir = _make_run_dir(agent, handle="em-oc-ask-timeout")
+    run_dir._state["opencode_session_id"] = "port-timeout"
+    run_dir._atomic_write_json(run_dir.daemon_json_path, run_dir._state)
+    entry = register_daemon_entry(
+        mgr, "em-oc-ask-timeout", run_dir, future=completed_future("done"),
+        backend="opencode", ask_in_flight=False,
+    )
+
+    result = mgr._handle_ask_opencode("em-oc-ask-timeout", entry, "Wait")
+    entry["ask_future"].result(timeout=5)
+
+    assert port.terminations == ["timeout"]
+    assert len(port.releases) == 1
+    assert entry["ask_in_flight"] is False
+    assert result["status"] == "sent"
+    assert "timed out" in entry["ask_future"].result()["message"]
+
+
 def test_opencode_emanate_appends_backend_argv_before_prompt(tmp_path):
     """backend_options tokens must sit between --format json and the prompt."""
-    agent = _make_agent(tmp_path)
+    agent = make_daemon_agent(tmp_path)
     mgr = agent.get_capability("daemon")
 
     captured: list[list[str]] = []
 
     def fake_popen(cmd, *args, **kwargs):
         captured.append(list(cmd))
-        return _FakeProc()
+        return FiniteFakeProc()
 
     run_dir = _make_run_dir(agent, handle="em-oc-opts")
     cancel = threading.Event()
     timeout = threading.Event()
 
-    with patch("lingtai.core.daemon.subprocess.Popen", side_effect=fake_popen):
+    with patch("lingtai.tools.daemon.subprocess.Popen", side_effect=fake_popen):
         mgr._run_opencode_emanation(
             "em-oc-opts", run_dir, "Find the bug.",
             cancel, timeout,
@@ -230,7 +345,7 @@ def test_opencode_emanate_persists_session_id_from_first_event(tmp_path):
     """The first JSON event carrying a session-id-shaped field is stored
     in daemon.json so daemon(ask) can resume from the moment the
     emanation returns."""
-    agent = _make_agent(tmp_path)
+    agent = make_daemon_agent(tmp_path)
     mgr = agent.get_capability("daemon")
 
     stdout_lines = [
@@ -241,13 +356,13 @@ def test_opencode_emanate_persists_session_id_from_first_event(tmp_path):
     ]
 
     def fake_popen(cmd, *args, **kwargs):
-        return _FakeProc(stdout_lines=stdout_lines)
+        return FiniteFakeProc(stdout_lines=stdout_lines)
 
     run_dir = _make_run_dir(agent, handle="em-oc-sid")
     cancel = threading.Event()
     timeout = threading.Event()
 
-    with patch("lingtai.core.daemon.subprocess.Popen", side_effect=fake_popen):
+    with patch("lingtai.tools.daemon.subprocess.Popen", side_effect=fake_popen):
         result = mgr._run_opencode_emanation(
             "em-oc-sid", run_dir, "What is the answer?",
             cancel, timeout,
@@ -264,7 +379,7 @@ def test_opencode_emanate_handles_non_json_lines_gracefully(tmp_path):
     """Banners / progress lines that aren't JSON should be recorded as
     cli_output, not crash the parser. The terminal text from a later
     JSON event still wins."""
-    agent = _make_agent(tmp_path)
+    agent = make_daemon_agent(tmp_path)
     mgr = agent.get_capability("daemon")
 
     stdout_lines = [
@@ -275,13 +390,13 @@ def test_opencode_emanate_handles_non_json_lines_gracefully(tmp_path):
     ]
 
     def fake_popen(cmd, *args, **kwargs):
-        return _FakeProc(stdout_lines=stdout_lines)
+        return FiniteFakeProc(stdout_lines=stdout_lines)
 
     run_dir = _make_run_dir(agent, handle="em-oc-mixed")
     cancel = threading.Event()
     timeout = threading.Event()
 
-    with patch("lingtai.core.daemon.subprocess.Popen", side_effect=fake_popen):
+    with patch("lingtai.tools.daemon.subprocess.Popen", side_effect=fake_popen):
         result = mgr._run_opencode_emanation(
             "em-oc-mixed", run_dir, "task",
             cancel, timeout,
@@ -296,17 +411,17 @@ def test_opencode_emanate_uses_no_output_sentinel_when_silent(tmp_path):
     """A process that exits 0 with no JSON events and no stderr is
     surfaced as the explicit [no output] sentinel — not as an empty
     string that the agent has to interpret."""
-    agent = _make_agent(tmp_path)
+    agent = make_daemon_agent(tmp_path)
     mgr = agent.get_capability("daemon")
 
     def fake_popen(cmd, *args, **kwargs):
-        return _FakeProc(stdout_lines=[], stderr_lines=[], returncode=0)
+        return FiniteFakeProc(stdout_lines=[], stderr_lines=[], returncode=0)
 
     run_dir = _make_run_dir(agent, handle="em-oc-silent")
     cancel = threading.Event()
     timeout = threading.Event()
 
-    with patch("lingtai.core.daemon.subprocess.Popen", side_effect=fake_popen):
+    with patch("lingtai.tools.daemon.subprocess.Popen", side_effect=fake_popen):
         result = mgr._run_opencode_emanation(
             "em-oc-silent", run_dir, "task",
             cancel, timeout,
@@ -318,14 +433,14 @@ def test_opencode_emanate_uses_no_output_sentinel_when_silent(tmp_path):
 def test_opencode_emanate_raises_when_returncode_nonzero(tmp_path):
     """Non-zero exit → mark_failed + raise, with the stderr tail in the
     error message so the parent can see what went wrong."""
-    agent = _make_agent(tmp_path)
+    agent = make_daemon_agent(tmp_path)
     mgr = agent.get_capability("daemon")
 
     stdout_lines = ['{"type":"text","text":"partial"}\n']
     stderr_lines = ['auth: invalid token\n', 'exit 1\n']
 
     def fake_popen(cmd, *args, **kwargs):
-        return _FakeProc(
+        return FiniteFakeProc(
             stdout_lines=stdout_lines, stderr_lines=stderr_lines, returncode=1,
         )
 
@@ -333,7 +448,7 @@ def test_opencode_emanate_raises_when_returncode_nonzero(tmp_path):
     cancel = threading.Event()
     timeout = threading.Event()
 
-    with patch("lingtai.core.daemon.subprocess.Popen", side_effect=fake_popen):
+    with patch("lingtai.tools.daemon.subprocess.Popen", side_effect=fake_popen):
         with pytest.raises(RuntimeError, match="opencode CLI exited with code 1"):
             mgr._run_opencode_emanation(
                 "em-oc-fail", run_dir, "task",
@@ -343,7 +458,7 @@ def test_opencode_emanate_raises_when_returncode_nonzero(tmp_path):
 
 def test_opencode_emanate_missing_cli_raises_runtime_error(tmp_path):
     """FileNotFoundError → mark_failed + RuntimeError naming opencode."""
-    agent = _make_agent(tmp_path)
+    agent = make_daemon_agent(tmp_path)
     mgr = agent.get_capability("daemon")
 
     def fake_popen(cmd, *args, **kwargs):
@@ -353,7 +468,7 @@ def test_opencode_emanate_missing_cli_raises_runtime_error(tmp_path):
     cancel = threading.Event()
     timeout = threading.Event()
 
-    with patch("lingtai.core.daemon.subprocess.Popen", side_effect=fake_popen):
+    with patch("lingtai.tools.daemon.subprocess.Popen", side_effect=fake_popen):
         with pytest.raises(RuntimeError, match="'opencode' CLI not found on PATH"):
             mgr._run_opencode_emanation(
                 "em-oc-missing", run_dir, "task",
@@ -366,44 +481,40 @@ def test_opencode_emanate_missing_cli_raises_runtime_error(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_emanate_opencode_routes_to_cli_handler(tmp_path):
-    """`emanate` with backend='opencode' must go through
-    `_handle_emanate_cli` (which skips preset resolution) and ultimately
-    submit `_run_opencode_emanation` to the pool."""
-    agent = _make_agent(tmp_path)
+def test_emanate_opencode_routes_to_cli_handler(tmp_path, monkeypatch):
+    """OpenCode dispatch persists the exact detached CLI execution contract."""
+    agent = make_daemon_agent(
+        tmp_path, capabilities={"daemon": {"manager_pool_size": 0}}
+    )
     mgr = agent.get_capability("daemon")
+    records = install_fake_detached_owner(monkeypatch)
 
-    captured: dict = {}
+    result = mgr.handle({
+        "action": "emanate",
+        "backend": "opencode",
+        "tasks": [{
+            "task": "Summarise the changelog.",
+            "tools": [],
+            "backend_options": {"model": "openai/gpt-5"},
+        }],
+    })
+    assert result["status"] == "dispatched"
+    assert result["backend"] == "opencode"
+    em_id = result["ids"][0]
+    state = wait_daemon_terminal(mgr._emanations[em_id]["run_dir"])
 
-    def fake_run(em_id, run_dir, task, cancel_event, timeout_event,
-                 backend_argv=None):
-        captured["em_id"] = em_id
-        captured["task"] = task
-        captured["backend_argv"] = list(backend_argv or [])
-        captured["state"] = json.loads(run_dir.daemon_json_path.read_text())
-        run_dir.mark_done("[fake opencode done]")
-        return "[fake opencode done]"
-
-    with patch.object(mgr, "_run_opencode_emanation", side_effect=fake_run):
-        result = mgr.handle({
-            "action": "emanate",
-            "backend": "opencode",
-            "tasks": [{
-                "task": "Summarise the changelog.",
-                "tools": [],
-                "backend_options": {"model": "openai/gpt-5"},
-            }],
-        })
-        assert result["status"] == "dispatched"
-        assert result["backend"] == "opencode"
-
-        em_id = result["ids"][0]
-        mgr._emanations[em_id]["future"].result(timeout=5)
-
-    assert captured["task"] == "Summarise the changelog."
-    assert captured["backend_argv"] == ["--model", "openai/gpt-5"]
-    assert captured["state"]["backend"] == "opencode"
-    assert captured["state"]["backend_options"] == {"model": "openai/gpt-5"}
+    manifest = records[0]["manifest"]
+    assert manifest["backend"] == "opencode"
+    assert manifest["task"].endswith("Task:\nSummarise the changelog.")
+    assert "call the MCP tool `finish`" in manifest["task"]
+    assert "daemon_common" in manifest["task"]
+    assert manifest["backend_argv"][:2] == ["--model", "openai/gpt-5"]
+    assert "__lingtai_opencode_config_content" in manifest["backend_argv"]
+    assert state["backend"] == "opencode"
+    assert state["backend_options"] == {"model": "openai/gpt-5"}
+    assert state["backend_argv"] == ["--model", "openai/gpt-5"]
+    assert "__lingtai_opencode_config_content" in state["backend_harness_argv"]
+    assert "future" not in mgr._emanations[em_id]
 
 
 # ---------------------------------------------------------------------------
@@ -414,28 +525,21 @@ def test_emanate_opencode_routes_to_cli_handler(tmp_path):
 def test_ask_opencode_errors_when_no_session_id(tmp_path):
     """ask before the emanation captured a session id → clear error
     pointing the agent at the (still-initializing) state, not a hang."""
-    agent = _make_agent(tmp_path)
+    agent = make_daemon_agent(tmp_path)
     mgr = agent.get_capability("daemon")
 
     # Register a fake opencode emanation entry with a run_dir but no
     # opencode_session_id yet.
-    from concurrent.futures import Future
     run_dir = _make_run_dir(agent, handle="em-oc-noresume")
-    fut = Future()
-    fut.set_result("[fake done]")
-    mgr._emanations["em-oc-noresume"] = {
-        "future": fut,
-        "task": "x",
-        "start_time": 0,
-        "cancel_event": threading.Event(),
-        "timeout_event": threading.Event(),
-        "followup_buffer": "",
-        "followup_lock": threading.Lock(),
-        "run_dir": run_dir,
-        "backend": "opencode",
-        "ask_in_flight": False,
-        "ask_future": None,
-    }
+    register_daemon_entry(
+        mgr,
+        "em-oc-noresume",
+        run_dir,
+        future=completed_future("[fake done]"),
+        task="x",
+        backend="opencode",
+        ask_in_flight=False,
+    )
 
     result = mgr.handle({
         "action": "ask",
@@ -451,7 +555,7 @@ def test_ask_opencode_resumes_with_captured_session_id(tmp_path):
     """When opencode_session_id is present, ask spawns
     `opencode run --session <id> --format json <message>` and returns
     {"status":"sent","async":true} synchronously."""
-    agent = _make_agent(tmp_path)
+    agent = make_daemon_agent(tmp_path)
     mgr = agent.get_capability("daemon")
 
     captured_cmd: list[list[str]] = []
@@ -460,31 +564,24 @@ def test_ask_opencode_resumes_with_captured_session_id(tmp_path):
         captured_cmd.append(list(cmd))
         # Return an empty-stream proc — the ask worker will see EOF and
         # complete cleanly via the deadline branch.
-        return _FakeProc()
+        return FiniteFakeProc()
 
-    from concurrent.futures import Future
     run_dir = _make_run_dir(agent, handle="em-oc-resume")
     # Pre-seed the session id as if a prior emanation captured it.
     run_dir._state["opencode_session_id"] = "oc-resumable-123"
     run_dir._atomic_write_json(run_dir.daemon_json_path, run_dir._state)
 
-    fut = Future()
-    fut.set_result("[fake done]")
-    mgr._emanations["em-oc-resume"] = {
-        "future": fut,
-        "task": "x",
-        "start_time": 0,
-        "cancel_event": threading.Event(),
-        "timeout_event": threading.Event(),
-        "followup_buffer": "",
-        "followup_lock": threading.Lock(),
-        "run_dir": run_dir,
-        "backend": "opencode",
-        "ask_in_flight": False,
-        "ask_future": None,
-    }
+    register_daemon_entry(
+        mgr,
+        "em-oc-resume",
+        run_dir,
+        future=completed_future("[fake done]"),
+        task="x",
+        backend="opencode",
+        ask_in_flight=False,
+    )
 
-    with patch("lingtai.core.daemon.subprocess.Popen", side_effect=fake_popen):
+    with patch("lingtai.tools.daemon.subprocess.Popen", side_effect=fake_popen):
         result = mgr.handle({
             "action": "ask",
             "id": "em-oc-resume",
@@ -520,29 +617,22 @@ def test_ask_opencode_concurrent_returns_busy(tmp_path):
     still streaming must return ``status='busy'`` (the resumed CLI
     serializes per session and a second spawn would interleave or
     error)."""
-    agent = _make_agent(tmp_path)
+    agent = make_daemon_agent(tmp_path)
     mgr = agent.get_capability("daemon")
 
-    from concurrent.futures import Future
     run_dir = _make_run_dir(agent, handle="em-oc-busy")
     run_dir._state["opencode_session_id"] = "oc-busy-1"
     run_dir._atomic_write_json(run_dir.daemon_json_path, run_dir._state)
 
-    fut = Future()
-    fut.set_result("[fake done]")
-    mgr._emanations["em-oc-busy"] = {
-        "future": fut,
-        "task": "x",
-        "start_time": 0,
-        "cancel_event": threading.Event(),
-        "timeout_event": threading.Event(),
-        "followup_buffer": "",
-        "followup_lock": threading.Lock(),
-        "run_dir": run_dir,
-        "backend": "opencode",
-        "ask_in_flight": True,  # pretend an ask is already in flight
-        "ask_future": None,
-    }
+    register_daemon_entry(
+        mgr,
+        "em-oc-busy",
+        run_dir,
+        future=completed_future("[fake done]"),
+        task="x",
+        backend="opencode",
+        ask_in_flight=True,  # pretend an ask is already in flight
+    )
 
     result = mgr._handle_ask("em-oc-busy", "second concurrent ask")
     assert result["status"] == "busy"

@@ -1,0 +1,1095 @@
+"""S4 Notification Store conformance and hostile red-counterexamples.
+
+Filesystem cases use ordinary portable pytest ``tmp_path`` composition.  Local
+execution remains a parent-owned safety gate and is not encoded into the test
+suite's source semantics.
+"""
+
+from __future__ import annotations
+
+import inspect
+import json
+import multiprocessing
+import os
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from lingtai.adapters.posix.notification_store import DaemonControlError, PosixNotificationStoreAdapter
+from lingtai.kernel.base_agent.messaging import _enqueue_system_notification
+from lingtai.kernel.notification_store import (
+    CompareUpdateResult,
+    NotificationStorePort,
+    UNCONDITIONAL,
+    UpdateAckRefsResult,
+    UpdateHookManifestsResult,
+)
+from lingtai.kernel.notifications import (
+    ack_large_result_refs,
+    dismiss_channel,
+    is_channel_allowed,
+    purge_stale_large_result_acks,
+    register_generic_dismiss_guard,
+    submit,
+)
+from lingtai.kernel.nudge import remove as remove_nudge
+from lingtai.kernel.nudge import upsert as upsert_nudge
+from tests._notification_store_helpers import FakeNotificationStore
+
+
+def _allow_all(_channel: str) -> bool:
+    return True
+
+
+def _posix_store(workdir: Path) -> PosixNotificationStoreAdapter:
+    workdir.mkdir(parents=True, exist_ok=True)
+    return PosixNotificationStoreAdapter(workdir)
+
+
+def _daemon_payload(daemon_id: str, *event_ids: str, count: int | None = None) -> dict:
+    data = {"daemon_id": daemon_id, "events": [{"event_id": event_id} for event_id in event_ids]}
+    if count is not None:
+        data["daemon"] = {"count": count, "alarm_fired": False}
+    return {"data": data}
+
+
+def _publish_daemon(store, daemon_id: str, *event_ids: str) -> None:
+    store.publish("daemon", _daemon_payload(daemon_id, *event_ids))
+
+
+def _tombstone_control(*, cleared=None, pending=None) -> dict:
+    return {
+        "version": 1, "epoch": 0, "cleared": cleared or {},
+        "batch_state": {"count": 0, "alarm_fired": False}, "pending": pending,
+    }
+
+
+def _process_increment_channel(workdir: str, barrier) -> None:
+    store = PosixNotificationStoreAdapter(Path(workdir))
+    barrier.wait(timeout=30)
+
+    def increment(current: dict):
+        # Widen the read/modify/write race between independently composed
+        # Store instances without blocking inside the process lock itself.
+        time.sleep(0.1)
+        return ({"count": int(current.get("count", 0)) + 1}, True, None)
+
+    result = store.compare_update_channel("system", UNCONDITIONAL, increment)
+    if not result.applied:
+        raise RuntimeError(f"channel increment was not applied: {result!r}")
+
+
+def _process_hold_native_scope(workdir: str, scope: str, ready, release) -> None:
+    from lingtai.adapters.posix.notification_store_lock import PosixNotificationStoreLockAdapter
+
+    with PosixNotificationStoreLockAdapter().exclusive(Path(workdir) / ".notification", scope):
+        ready.set()
+        if not release.wait(timeout=30):
+            raise RuntimeError("scope holder release timed out")
+
+
+def _process_write_and_read_email(workdir: str, result_queue, ready=None) -> None:
+    store = PosixNotificationStoreAdapter(Path(workdir))
+    if ready is not None:
+        ready.set()
+    result = store.compare_update_channel(
+        "email", UNCONDITIONAL, lambda current: ({**current, "committed": True}, True, None)
+    )
+    result_queue.put((result.applied, store.snapshot(_allow_all).get("email")))
+
+
+def _process_owner_daemon_append(workdir: str, daemon_id: str, barrier) -> None:
+    store = PosixNotificationStoreAdapter(Path(workdir))
+    barrier.wait(timeout=60)
+
+    def append(current: dict):
+        data = current.get("data") if isinstance(current.get("data"), dict) else {}
+        events = list(data.get("events", []))
+        event_id = f"evt-{daemon_id}"
+        if any(event.get("idempotency_key") == daemon_id for event in events if isinstance(event, dict)):
+            return current, False, event_id
+        events.append({"event_id": event_id, "idempotency_key": daemon_id, "ref_id": daemon_id})
+        batch = data.get("daemon") if isinstance(data.get("daemon"), dict) else {}
+        count = int(batch.get("count", 0)) + 1
+        return (
+            {"data": {"events": events, "daemon": {"count": count, "alarm_fired": False}, "daemon_id": daemon_id}},
+            True,
+            event_id,
+        )
+
+    result = store.compare_update_channel("daemon", UNCONDITIONAL, append, owner=daemon_id)
+    if not result.applied:
+        raise RuntimeError(f"daemon append was not applied: {result!r}")
+
+
+@pytest.fixture(params=("fake", "posix"))
+def conforming_store(request, tmp_path) -> NotificationStorePort:
+    if request.param == "fake":
+        return FakeNotificationStore()
+    return _posix_store(tmp_path / "posix-conformance")
+
+
+class TestEightFamilyConformance:
+    def test_exact_eight_operation_families_plus_composed_lock_port(self):
+        assert NotificationStorePort.__abstractmethods__ == {
+            "mutation_lock",
+            "snapshot",
+            "fingerprint",
+            "publish",
+            "clear",
+            "compare_update_channel",
+            "load_ack_refs",
+            "update_ack_refs",
+            "load_hook_manifests",
+            "update_hook_manifests",
+            "stat_hook_registry",
+        }
+
+    def test_snapshot_fingerprint_publish_and_clear(self, conforming_store):
+        store = conforming_store
+        assert store.snapshot(_allow_all) == {}
+        assert store.fingerprint(_allow_all) == ()
+        store.publish("email", {"nested": {"count": 1}})
+        snapshot = store.snapshot(_allow_all)
+        snapshot["email"]["nested"]["count"] = 99
+        assert store.snapshot(_allow_all)["email"]["nested"]["count"] == 1
+        entry = store.fingerprint(_allow_all)[0]
+        assert entry[0] == "email.json"
+        assert store.snapshot(lambda channel: channel == "cron") == {}
+        assert store.clear("email") is True
+        assert store.clear("email") is False
+
+    def test_unconditional_is_not_expected_absence(self, conforming_store):
+        store = conforming_store
+        store.publish("email", {"version": 1})
+        called = []
+
+        conflict = store.compare_update_channel(
+            "email",
+            None,
+            lambda current: (called.append(current) or current, False, "wrong"),
+        )
+        assert isinstance(conflict, CompareUpdateResult)
+        assert conflict.conflict is True
+        assert conflict.applied is False
+        assert conflict.value is None
+        assert called == []
+
+        applied = store.compare_update_channel(
+            "email",
+            UNCONDITIONAL,
+            lambda current: ({**current, "version": 2}, True, ("policy", 2)),
+        )
+        assert applied == CompareUpdateResult(
+            applied=True,
+            conflict=False,
+            changed=True,
+            cleared=False,
+            value=("policy", 2),
+            current_version=applied.current_version,
+            previous_version=applied.previous_version,
+        )
+        assert applied.current_version != applied.previous_version
+
+    def test_expected_absence_applies_only_when_missing(self, conforming_store):
+        result = conforming_store.compare_update_channel(
+            "email", None, lambda _current: ({"created": True}, True, "created")
+        )
+        assert result.applied and not result.conflict and result.value == "created"
+
+    def test_stale_version_refuses_without_calling_mutator(self, conforming_store):
+        store = conforming_store
+        store.publish("system", {"version": 1})
+        delivered = store.fingerprint(_allow_all)[0]
+        store.publish("system", {"version": 2})
+        called = False
+
+        def forbidden(_current):
+            nonlocal called
+            called = True
+            return None, True, None
+
+        result = store.compare_update_channel("system", delivered, forbidden)
+        assert result.conflict and not result.applied and not result.changed
+        assert called is False
+        assert store.snapshot(_allow_all)["system"] == {"version": 2}
+
+    def test_no_change_is_applied_and_carries_policy_value(self, conforming_store):
+        conforming_store.publish("email", {"version": 1})
+        result = conforming_store.compare_update_channel(
+            "email", UNCONDITIONAL, lambda current: (current, False, {"why": "same"})
+        )
+        assert result.applied and not result.conflict
+        assert result.changed is False and result.cleared is False
+        assert result.value == {"why": "same"}
+        assert result.current_version == result.previous_version
+
+    def test_clear_result_reports_actual_absence(self, conforming_store):
+        result = conforming_store.compare_update_channel(
+            "email", UNCONDITIONAL, lambda _current: (None, True, "clear")
+        )
+        assert result.applied and not result.changed and not result.cleared
+        assert result.value == "clear"
+
+    def test_atomic_ack_result_and_value(self, conforming_store):
+        store = conforming_store
+        result = store.update_ack_refs(
+            lambda current: (current | {"ref-a"}, True, ("union", "ref-a"))
+        )
+        assert isinstance(result, UpdateAckRefsResult)
+        assert result.changed is True
+        assert result.value == ("union", "ref-a")
+        assert store.load_ack_refs() == {"ref-a"}
+        noop = store.update_ack_refs(
+            lambda current: (current, False, "already-present")
+        )
+        assert noop == UpdateAckRefsResult(False, "already-present")
+
+    def test_atomic_hook_manifest_result_and_value(self, conforming_store):
+        store = conforming_store
+        manifest = {
+            "name": "comm_watcher",
+            "version": "1.0.0",
+            "channel": "comm_watcher",
+            "source": "G:",
+            "description": "poll relay",
+        }
+        result = store.update_hook_manifests(
+            lambda current: (
+                current + [dict(manifest)],
+                True,
+                ("append", "comm_watcher"),
+            )
+        )
+        assert isinstance(result, UpdateHookManifestsResult)
+        assert result.changed is True
+        assert result.value == ("append", "comm_watcher")
+        assert store.load_hook_manifests() == [manifest]
+        noop = store.update_hook_manifests(
+            lambda current: (current, False, "already-present")
+        )
+        assert noop == UpdateHookManifestsResult(False, "already-present")
+
+    def test_atomic_hook_manifest_append_and_clear(self, conforming_store):
+        store = conforming_store
+        manifest = {
+            "name": "comm_watcher",
+            "channel": "comm_watcher",
+            "source": "G:",
+            "description": "poll relay",
+        }
+        seeded = store.update_hook_manifests(
+            lambda current: ([dict(manifest)], True, "seed")
+        )
+        assert seeded == UpdateHookManifestsResult(True, "seed")
+        assert store.load_hook_manifests() == [manifest]
+        # Clearing through the atomic family reports presence and empties the
+        # registry; clearing again is an idempotent no-change.
+        cleared = store.update_hook_manifests(
+            lambda current: ([], True, "clear")
+        )
+        assert cleared == UpdateHookManifestsResult(True, "clear")
+        assert store.load_hook_manifests() == []
+        again = store.update_hook_manifests(
+            lambda current: ([], True, "clear")
+        )
+        assert again == UpdateHookManifestsResult(False, "clear")
+
+
+class TestPosixContractErrorsAndEnvelope:
+    def test_missing_state_contract(self, tmp_path):
+        store = _posix_store(tmp_path / "missing")
+        assert store.snapshot(_allow_all) == {}
+        assert store.fingerprint(_allow_all) == ()
+        assert store.load_ack_refs() == set()
+        assert store.load_hook_manifests() == []
+        assert store.clear("email") is False
+        result = store.compare_update_channel(
+            "email", None, lambda current: ({**current, "new": True}, True, None)
+        )
+        assert result.applied and result.changed
+
+    def test_malformed_channel_has_version_and_cannot_match_absence(self, tmp_path):
+        workdir = tmp_path / "malformed-channel"
+        channel = workdir / ".notification" / "email.json"
+        channel.parent.mkdir(parents=True)
+        channel.write_text("{not-json", encoding="utf-8")
+        store = _posix_store(workdir)
+        assert store.snapshot(_allow_all) == {}
+        delivered = store.fingerprint(_allow_all)[0]
+        absent = store.compare_update_channel(
+            "email", None, lambda _current: ({"bad": "overwrite"}, True, None)
+        )
+        assert absent.conflict and channel.read_text(encoding="utf-8") == "{not-json"
+        seen = []
+        matched = store.compare_update_channel(
+            "email",
+            delivered,
+            lambda current: (seen.append(current) or {"recovered": True}, True, "ok"),
+        )
+        assert matched.applied and seen == [{}]
+
+    def test_malformed_ack_is_legacy_empty(self, tmp_path):
+        ack = tmp_path / "malformed-ack" / ".notification" / "large_result_acks.json"
+        ack.parent.mkdir(parents=True)
+        ack.write_text("not-json", encoding="utf-8")
+        assert _posix_store(tmp_path / "malformed-ack").load_ack_refs() == set()
+
+    def test_malformed_hook_manifests_raises(self, tmp_path):
+        """R10: a corrupt registry raises instead of masquerading as empty."""
+        registry = tmp_path / "malformed-hooks" / ".notification" / "hooks.json"
+        registry.parent.mkdir(parents=True)
+        registry.write_text("not-json", encoding="utf-8")
+        with pytest.raises(json.JSONDecodeError):
+            _posix_store(tmp_path / "malformed-hooks").load_hook_manifests()
+
+    def test_absent_hook_manifests_is_empty(self, tmp_path):
+        """Only an ABSENT registry yields an empty list (R10)."""
+        assert _posix_store(tmp_path / "absent-hooks").load_hook_manifests() == []
+
+    def test_malformed_hook_manifests_blocks_atomic_add(self, tmp_path):
+        """R10: a corrupt registry is never treated as empty — atomic add
+        propagates the load failure and leaves the file untouched."""
+        registry = tmp_path / "malformed-hooks-add" / ".notification" / "hooks.json"
+        registry.parent.mkdir(parents=True)
+        registry.write_text("{not-json", encoding="utf-8")
+        store = _posix_store(tmp_path / "malformed-hooks-add")
+        with pytest.raises(json.JSONDecodeError):
+            store.update_hook_manifests(
+                lambda current: (
+                    current
+                    + [
+                        {
+                            "name": "comm_watcher",
+                            "channel": "comm_watcher",
+                            "source": "G:",
+                            "description": "poll relay",
+                        }
+                    ],
+                    True,
+                    "appended",
+                )
+            )
+        assert registry.read_text(encoding="utf-8") == "{not-json"
+
+    def test_unreadable_entries_skip_reads_but_compare_propagates(
+        self, tmp_path, monkeypatch
+    ):
+        workdir = tmp_path / "unreadable"
+        target = workdir / ".notification" / "email.json"
+        target.parent.mkdir(parents=True)
+        target.write_text("{}", encoding="utf-8")
+        original = Path.read_bytes
+
+        def unreadable(path):
+            if path == target:
+                raise PermissionError("denied")
+            return original(path)
+
+        monkeypatch.setattr(Path, "read_bytes", unreadable)
+        store = _posix_store(workdir)
+        assert store.snapshot(_allow_all) == {}
+        assert store.fingerprint(_allow_all) == ()
+        with pytest.raises(PermissionError, match="denied"):
+            store.compare_update_channel(
+                "email", None, lambda current: (current, False, None)
+            )
+
+    def test_publish_and_clear_non_enoent_errors_propagate(self, tmp_path, monkeypatch):
+        import lingtai.adapters.posix.notification_store as adapter_module
+
+        store = _posix_store(tmp_path / "write-errors")
+
+        def write_error(*_args, **_kwargs):
+            raise OSError("write failed")
+
+        monkeypatch.setattr(adapter_module, "atomic_write_json", write_error)
+        with pytest.raises(OSError, match="write failed"):
+            store.publish("email", {})
+
+        def unlink_error(_path):
+            raise PermissionError("clear denied")
+
+        monkeypatch.setattr(Path, "unlink", unlink_error)
+        with pytest.raises(PermissionError, match="clear denied"):
+            store.clear("email")
+
+    def test_ack_unreadable_is_empty_and_empty_clear_is_best_effort(
+        self, tmp_path, monkeypatch
+    ):
+        store = _posix_store(tmp_path / "ack-errors")
+
+        def read_error(_path, *_args, **_kwargs):
+            raise PermissionError("ack denied")
+
+        monkeypatch.setattr(Path, "read_text", read_error)
+        assert store.load_ack_refs() == set()
+
+        def unlink_error(_path):
+            raise PermissionError("ack clear denied")
+
+        monkeypatch.setattr(Path, "unlink", unlink_error)
+        result = store.update_ack_refs(lambda _current: (set(), True, "purged"))
+        assert result == UpdateAckRefsResult(changed=False, value="purged")
+
+    def test_external_mcp_envelope_and_licc_layout_remain_visible(self, tmp_path):
+        workdir = tmp_path / "external-envelope"
+        notification_dir = workdir / ".notification"
+        notification_dir.mkdir(parents=True)
+        envelope = {
+            "header": "2 new events from MCP 'telegram'",
+            "icon": "💬",
+            "priority": "high",
+            "published_at": "2026-07-12T00:00:00Z",
+            "instructions": "Call the MCP read action.",
+            "data": {"count": 2, "source": "telegram", "previews": []},
+        }
+        (notification_dir / "mcp.telegram.json").write_text(
+            json.dumps(envelope), encoding="utf-8"
+        )
+        snapshot = _posix_store(workdir).snapshot(is_channel_allowed)
+        assert snapshot == {"mcp.telegram": envelope}
+
+
+@dataclass
+class _CoreAgent:
+    _notification_store: NotificationStorePort
+    _notification_fp: tuple = ()
+    _logs: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    _wake_reasons: list[str] = field(default_factory=list)
+
+    def _log(self, event: str, **fields: Any) -> None:
+        self._logs.append((event, fields))
+
+    def _wake_nap(self, reason: str) -> None:
+        self._wake_reasons.append(reason)
+
+
+def _system_events(store: NotificationStorePort) -> list[dict]:
+    payload = store.snapshot(_allow_all).get("system", {})
+    return payload.get("data", {}).get("events", []) if isinstance(payload, dict) else []
+
+
+class TestAtomicCoreRedCounterexamples:
+    def test_real_adapter_concurrent_channel_updates_are_serialized(self, tmp_path):
+        store = _posix_store(tmp_path / "channel-concurrency")
+        barrier = threading.Barrier(13)
+
+        def increment() -> None:
+            barrier.wait()
+            store.compare_update_channel(
+                "system",
+                UNCONDITIONAL,
+                lambda current: (
+                    {"count": int(current.get("count", 0)) + 1},
+                    True,
+                    None,
+                ),
+            )
+
+        threads = [threading.Thread(target=increment) for _ in range(12)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        assert store.snapshot(_allow_all)["system"]["count"] == 12
+
+    def test_real_adapter_cross_process_channel_updates_are_serialized(self, tmp_path):
+        workdir = tmp_path / "channel-process-concurrency"
+        workdir.mkdir()
+        context = multiprocessing.get_context("spawn")
+        barrier = context.Barrier(5)
+        processes = [
+            context.Process(
+                target=_process_increment_channel,
+                args=(str(workdir), barrier),
+            )
+            for _ in range(4)
+        ]
+
+        for process in processes:
+            process.start()
+        barrier.wait(timeout=30)
+        for process in processes:
+            process.join(timeout=30)
+        assert all(not process.is_alive() for process in processes)
+        assert [process.exitcode for process in processes] == [0, 0, 0, 0]
+
+        store = PosixNotificationStoreAdapter(workdir)
+        assert store.snapshot(_allow_all)["system"]["count"] == 4
+
+    def test_posix_lock_preserves_acquisition_error(self, tmp_path, monkeypatch):
+        if os.name != "posix":
+            pytest.skip("POSIX flock adapter is unavailable")
+        from lingtai.adapters.posix import notification_store_lock as lock_module
+
+        calls = []
+
+        def fail_acquire(_fileno, operation):
+            calls.append(operation)
+            if operation == lock_module.fcntl.LOCK_EX:
+                raise OSError("acquisition failed")
+
+        monkeypatch.setattr(lock_module.fcntl, "flock", fail_acquire)
+        lock = lock_module.PosixNotificationStoreLockAdapter()
+        with pytest.raises(OSError, match="acquisition failed"):
+            with lock.exclusive(tmp_path, "channel:email"):
+                pytest.fail("mutation body ran without the process lock")
+        assert calls == [
+            lock_module.fcntl.LOCK_SH,
+            lock_module.fcntl.LOCK_EX,
+            lock_module.fcntl.LOCK_UN,
+        ]
+
+    def test_windows_lock_preserves_acquisition_error(self, tmp_path, monkeypatch):
+        from lingtai.adapters.windows.notification_store_lock import (
+            WindowsNotificationStoreLockAdapter,
+        )
+
+        calls = []
+        fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2)
+
+        def fail_acquire(_fileno, operation, _size):
+            calls.append(operation)
+            if operation == fake_msvcrt.LK_NBLCK:
+                raise OSError(5, "acquisition failed")
+
+        fake_msvcrt.locking = fail_acquire
+        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+
+        lock = WindowsNotificationStoreLockAdapter()
+        with pytest.raises(OSError, match="acquisition failed"):
+            with lock.exclusive(tmp_path, "channel:email"):
+                pytest.fail("mutation body ran without the process lock")
+        assert calls == [fake_msvcrt.LK_NBLCK]
+
+    def test_windows_lock_declares_quiesced_legacy_cutover(self):
+        from lingtai.adapters.windows.notification_store_lock import (
+            WindowsNotificationStoreLockAdapter,
+        )
+
+        assert WindowsNotificationStoreLockAdapter.requires_quiesced_legacy_cutover is True
+
+    def test_fake_store_rejects_non_daemon_owner_like_production(self):
+        store = FakeNotificationStore()
+
+        with pytest.raises(ValueError, match="only valid for daemon"):
+            store.compare_update_channel(
+                "email", UNCONDITIONAL, lambda current: (current, False, None), owner="em-a"
+            )
+
+    def test_concurrent_ack_unions_use_atomic_family_seven(self, tmp_path):
+        store = _posix_store(tmp_path / "ack-unions")
+        agent = _CoreAgent(store)
+        barrier = threading.Barrier(17)
+
+        def union(index: int) -> None:
+            barrier.wait()
+            ack_large_result_refs(agent, {f"ref-{index}"})
+
+        threads = [threading.Thread(target=union, args=(i,)) for i in range(16)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert store.load_ack_refs() == {f"ref-{i}" for i in range(16)}
+
+    def test_concurrent_hook_manifest_appends_use_atomic_family_eight(
+        self, tmp_path
+    ):
+        store = _posix_store(tmp_path / "hook-appends")
+        barrier = threading.Barrier(17)
+
+        def append(index: int) -> None:
+            barrier.wait()
+            store.update_hook_manifests(
+                lambda current: (
+                    current
+                    + [
+                        {
+                            "name": f"hook-{index}",
+                            "channel": f"hook_{index}",
+                            "source": "G:",
+                            "description": "poll relay",
+                        }
+                    ],
+                    True,
+                    None,
+                )
+            )
+
+        threads = [threading.Thread(target=append, args=(i,)) for i in range(16)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+        manifests = store.load_hook_manifests()
+        assert len(manifests) == 16
+        assert {m["name"] for m in manifests} == {f"hook-{i}" for i in range(16)}
+
+    def test_concurrent_ack_union_and_purge_has_serial_result(self, tmp_path):
+        store = _posix_store(tmp_path / "ack-union-purge")
+        agent = _CoreAgent(store)
+        store.update_ack_refs(
+            lambda _current: ({"keep", "stale"}, True, "seed")
+        )
+        barrier = threading.Barrier(3)
+
+        def union() -> None:
+            barrier.wait()
+            ack_large_result_refs(agent, {"new"})
+
+        def purge() -> None:
+            barrier.wait()
+            purge_stale_large_result_acks(agent, {"keep", "new"})
+
+        threads = [threading.Thread(target=union), threading.Thread(target=purge)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert store.load_ack_refs() == {"keep", "new"}
+
+    @pytest.mark.parametrize("selector", ("event_id", "ref_id"))
+    def test_concurrent_enqueue_vs_force_event_or_ref_dismiss_keeps_unrelated(
+        self, selector
+    ):
+        store = FakeNotificationStore()
+        agent = _CoreAgent(store)
+        old_id = _enqueue_system_notification(
+            agent, source="daemon", ref_id="old-ref", body="old"
+        )
+        barrier = threading.Barrier(3)
+        dismiss_result = []
+
+        def enqueue() -> None:
+            barrier.wait()
+            _enqueue_system_notification(
+                agent, source="daemon", ref_id="concurrent-ref", body="new"
+            )
+
+        def dismiss() -> None:
+            barrier.wait()
+            kwargs = {selector: old_id if selector == "event_id" else "old-ref"}
+            dismiss_result.append(
+                dismiss_channel(
+                    agent,
+                    "system",
+                    invoked_by="notification",
+                    force=True,
+                    **kwargs,
+                )
+            )
+
+        threads = [threading.Thread(target=enqueue), threading.Thread(target=dismiss)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert dismiss_result[0]["status"] == "ok"
+        refs = {event["ref_id"] for event in _system_events(store)}
+        assert "old-ref" not in refs
+        assert "concurrent-ref" in refs
+
+    def test_concurrent_enqueue_makes_whole_nonforce_dismiss_stale(self):
+        store = FakeNotificationStore()
+        agent = _CoreAgent(store)
+        _enqueue_system_notification(agent, source="daemon", ref_id="old", body="old")
+        agent._notification_fp = store.fingerprint(is_channel_allowed)
+        start = threading.Barrier(3)
+        enqueued = threading.Event()
+        result = []
+
+        def producer() -> None:
+            start.wait()
+            _enqueue_system_notification(agent, source="daemon", ref_id="new", body="new")
+            enqueued.set()
+
+        def dismiss() -> None:
+            start.wait()
+            assert enqueued.wait(timeout=5)
+            result.append(
+                dismiss_channel(agent, "system", invoked_by="notification")
+            )
+
+        threads = [threading.Thread(target=producer), threading.Thread(target=dismiss)]
+        for thread in threads:
+            thread.start()
+        start.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert result[0]["reason"] == "stale_channel_version"
+        assert {event["ref_id"] for event in _system_events(store)} == {"old", "new"}
+
+    def test_guarded_force_and_protected_goal_are_actual_dismissals(self):
+        store = FakeNotificationStore()
+        agent = _CoreAgent(store)
+        register_generic_dismiss_guard("email", "email(action='read')")
+        store.publish("email", {"header": "unread"})
+        guarded = dismiss_channel(agent, "email", invoked_by="notification")
+        assert guarded["reason"] == "guarded"
+        assert "email" in store.snapshot(_allow_all)
+        forced = dismiss_channel(
+            agent, "email", invoked_by="notification", force=True
+        )
+        assert forced["status"] == "ok" and forced["cleared"] is True
+
+        store.publish("goal", {"data": {"status": "active"}})
+        protected = dismiss_channel(
+            agent, "goal", invoked_by="notification", force=True
+        )
+        assert protected["reason"] == "protected_channel"
+        assert "goal" in store.snapshot(_allow_all)
+
+    def test_stale_expected_absence_refusal_at_core_boundary(self):
+        store = FakeNotificationStore()
+        agent = _CoreAgent(store, _notification_fp=())
+        store.publish("cron", {"header": "arrived after delivery"})
+        result = dismiss_channel(agent, "cron", invoked_by="notification")
+        assert result["reason"] == "stale_channel_version"
+        assert store.snapshot(_allow_all)["cron"]["header"] == "arrived after delivery"
+
+    def test_nudge_updates_share_store_serialization_and_interact_with_dismiss(self):
+        store = FakeNotificationStore()
+        agent = _CoreAgent(store)
+        barrier = threading.Barrier(9)
+
+        def upsert(index: int) -> None:
+            barrier.wait()
+            upsert_nudge(agent, f"kind-{index}", {"body": str(index)})
+
+        threads = [threading.Thread(target=upsert, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+        nudges = store.snapshot(_allow_all)["nudge"]["data"]["nudges"]
+        assert {entry["kind"] for entry in nudges} == {f"kind-{i}" for i in range(8)}
+        assert store.channel_mutations.count("nudge") == 8
+
+        dismiss = dismiss_channel(
+            agent, "nudge", invoked_by="notification", force=True
+        )
+        assert dismiss["cleared"] is True
+        upsert_nudge(agent, "after-dismiss", {"body": "current"})
+        remove_nudge(agent, "missing")
+        nudges = store.snapshot(_allow_all)["nudge"]["data"]["nudges"]
+        assert len(nudges) == 1
+        assert nudges[0]["body"] == "current"
+        assert nudges[0]["kind"] == "after-dismiss"
+        assert nudges[0]["policy"]["enabled"] == "on"
+        assert nudges[0]["policy"]["repeat_after_dismiss"] == "24h"
+
+
+class TestScopedNativeLockIsolation:
+    @pytest.mark.skipif(os.name != "posix", reason="requires POSIX native flock")
+    @pytest.mark.parametrize("scope", ("channel:system", "daemon-run:em-held"))
+    def test_real_held_scope_does_not_block_unrelated_email_process(self, tmp_path, scope):
+        workdir = tmp_path / "native-isolation"
+        workdir.mkdir()
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        release = context.Event()
+        results = context.Queue()
+        holder = context.Process(
+            target=_process_hold_native_scope,
+            args=(str(workdir), scope, ready, release),
+        )
+        holder.start()
+        assert ready.wait(timeout=15), "native scope holder did not acquire"
+        writer = context.Process(
+            target=_process_write_and_read_email, args=(str(workdir), results)
+        )
+        writer.start()
+        try:
+            applied, payload = results.get(timeout=8)
+            assert applied is True
+            assert payload == {"committed": True}
+            assert writer.is_alive() or writer.exitcode == 0
+        finally:
+            release.set()
+            writer.join(timeout=15)
+            holder.join(timeout=15)
+        assert writer.exitcode == 0
+        assert holder.exitcode == 0
+
+    @pytest.mark.skipif(os.name != "posix", reason="requires POSIX native flock")
+    def test_posix_bridge_waits_for_old_global_writer(self, tmp_path):
+        import fcntl
+
+        workdir = tmp_path / "legacy-bridge"
+        notification_dir = workdir / ".notification"
+        notification_dir.mkdir(parents=True)
+        legacy = open(notification_dir / ".store.lock", "a+b")
+        fcntl.flock(legacy.fileno(), fcntl.LOCK_EX)
+        context = multiprocessing.get_context("spawn")
+        results = context.Queue()
+        ready = context.Event()
+        writer = context.Process(
+            target=_process_write_and_read_email, args=(str(workdir), results, ready)
+        )
+        writer.start()
+        try:
+            import queue
+
+            assert ready.wait(timeout=15), "writer did not reach compare-update"
+            with pytest.raises(queue.Empty):
+                results.get(timeout=0.35)
+        finally:
+            fcntl.flock(legacy.fileno(), fcntl.LOCK_UN)
+            legacy.close()
+        applied, payload = results.get(timeout=10)
+        writer.join(timeout=15)
+        assert writer.exitcode == 0
+        assert applied is True and payload == {"committed": True}
+
+    def test_forty_owner_publishers_preserve_every_run_without_aggregate_rebuild(self, tmp_path):
+        workdir = tmp_path / "forty-daemon-publishers"
+        workdir.mkdir()
+        context = multiprocessing.get_context("spawn")
+        barrier = context.Barrier(41)
+        processes = [
+            context.Process(
+                target=_process_owner_daemon_append,
+                args=(str(workdir), f"em-{index}", barrier),
+            )
+            for index in range(40)
+        ]
+        for process in processes:
+            process.start()
+        barrier.wait(timeout=60)
+        for process in processes:
+            process.join(timeout=60)
+        assert [process.exitcode for process in processes] == [0] * 40
+        payload = PosixNotificationStoreAdapter(workdir).snapshot(_allow_all)["daemon"]
+        events = payload["data"]["events"]
+        assert {event["ref_id"] for event in events} == {f"em-{index}" for index in range(40)}
+        assert payload["data"]["daemon"]["count"] == 40
+        assert not (workdir / ".notification" / "daemon.json").exists()
+
+    def test_snapshot_never_creates_or_rebuilds_daemon_report(self, tmp_path):
+        store = _posix_store(tmp_path / "snapshot-no-write")
+        _publish_daemon(store, "em-a", "one")
+        report = tmp_path / "snapshot-no-write" / ".notification" / "daemon.json"
+        before = {path: path.read_bytes() for path in (tmp_path / "snapshot-no-write" / ".notification").rglob("*") if path.is_file()}
+        assert store.snapshot(_allow_all)["daemon"]["data"]["events"] == [{"event_id": "one"}]
+        after = {path: path.read_bytes() for path in (tmp_path / "snapshot-no-write" / ".notification").rglob("*") if path.is_file()}
+        assert after == before
+        assert not report.exists()
+
+    @pytest.mark.parametrize(
+        "corrupt_control",
+        (
+            "{not-json",
+            json.dumps(_tombstone_control(cleared={
+                "unrecognized.txt": {"raw_sha256": "0" * 64, "event_keys": []}
+            })),
+            json.dumps(_tombstone_control(pending={
+                "daemon_id": "!!bad", "event_id": "event-1",
+                "prior_batch_state": {"count": 0, "alarm_fired": False},
+                "batch_state": {"count": 1, "alarm_fired": False},
+            })),
+        ),
+    )
+    def test_corrupt_or_unrecognized_daemon_tombstone_is_loud_but_keeps_other_channels_deliverable(self, tmp_path, corrupt_control):
+        from lingtai.adapters.posix.notification_store import DaemonControlError
+
+        workdir = tmp_path / "corrupt-tombstone"
+        store = _posix_store(workdir)
+        _publish_daemon(store, "em-a", "one")
+        store.publish("email", {"header": "email remains deliverable"})
+        store.publish("system", {"header": "system remains deliverable"})
+        control = workdir / ".notification" / "daemon" / ".tombstone"
+        control.write_text(corrupt_control, encoding="utf-8")
+
+        snapshot = store.snapshot(_allow_all)
+        assert snapshot["email"]["header"] == "email remains deliverable"
+        assert snapshot["system"]["header"] == "system remains deliverable"
+        daemon_error = snapshot["daemon"]
+        assert daemon_error["priority"] == "high"
+        assert daemon_error["header"] == "Daemon notification control error; run lingtai-doctor"
+        assert daemon_error["data"]["error"] == {
+            "code": "daemon_control_error",
+            "action": "run lingtai-doctor",
+        }
+        raw = json.dumps(daemon_error, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        daemon_entry = next(entry for entry in store.fingerprint(_allow_all) if entry[0] == "daemon.json")
+        assert daemon_entry == ("daemon.json", len(raw), __import__("hashlib").sha256(raw).hexdigest())
+        assert (control.parent / "em-a.json").is_file(), "read containment must not erase live state"
+
+        with pytest.raises(DaemonControlError, match="tombstone"):
+            store.publish("daemon", _daemon_payload("em-a"))
+        with pytest.raises(DaemonControlError, match="tombstone"):
+            store.compare_update_channel(
+                "daemon", UNCONDITIONAL, lambda current: (current, False, None), owner="em-a"
+            )
+        with pytest.raises(DaemonControlError, match="tombstone"):
+            store.clear("daemon")
+
+    def test_only_committed_daemon_removal_cut_fsyncs_control(self, tmp_path, monkeypatch):
+        import lingtai.adapters.posix.notification_store as store_module
+
+        control_fsyncs = []
+        original_write = store_module.atomic_write_json
+
+        def record_control_fsync(path, value, **kwargs):
+            if path.name == ".tombstone":
+                control_fsyncs.append(kwargs.get("fsync", False))
+            return original_write(path, value, **kwargs)
+
+        monkeypatch.setattr(store_module, "atomic_write_json", record_control_fsync)
+        store = _posix_store(tmp_path / "durable-removal-cut")
+        store.compare_update_channel(
+            "daemon",
+            UNCONDITIONAL,
+            lambda _current: (_daemon_payload("em-a", "one", count=1), True, "one"),
+            owner="em-a",
+        )
+        assert control_fsyncs == [False, False], "hot append receipts remain non-fsync"
+        assert store.clear("daemon") is True
+        assert control_fsyncs[2] is True, "committed clear visibility cut is durable"
+
+    @pytest.mark.parametrize(
+        ("failure", "recompact"),
+        ((OSError, True), (DaemonControlError, False)),
+        ids=("crash-before-compaction", "post-cut-control-error"),
+    )
+    def test_committed_clear_stays_unambiguous_after_compaction_failure(
+        self, tmp_path, monkeypatch, failure, recompact
+    ):
+        store = _posix_store(tmp_path / "compaction-failure")
+        _publish_daemon(store, "em-a", "one")
+        monkeypatch.setattr(
+            store, "_compact_daemon_tombstone",
+            lambda: (_ for _ in ()).throw(failure("simulated compaction failure")),
+        )
+        result = store.compare_update_channel("daemon", UNCONDITIONAL, lambda _current: (None, True, "clear"))
+        assert result.applied and result.cleared
+        assert store.snapshot(_allow_all).get("daemon") is None
+        if recompact:
+            mini = tmp_path / "compaction-failure" / ".notification" / "daemon" / "em-a.json"
+            assert mini.is_file(), "physical body remains across crash before compaction"
+            monkeypatch.undo()
+            store._compact_daemon_tombstone()
+            assert not mini.exists()
+
+    def test_stale_tombstone_entry_is_compacted_after_replacement_without_heartbeat_leak(self, tmp_path, monkeypatch):
+        workdir = tmp_path / "stale-tombstone"
+        store = _posix_store(workdir)
+        _publish_daemon(store, "em-a", "old")
+        monkeypatch.setattr(
+            store,
+            "_compact_daemon_tombstone",
+            lambda: (_ for _ in ()).throw(OSError("simulated crash")),
+        )
+        assert store.clear("daemon") is True
+        monkeypatch.undo()
+        replacement = _daemon_payload("em-a", "new")
+        store.publish("daemon", replacement)
+        store._compact_daemon_tombstone()
+        control = json.loads((workdir / ".notification" / "daemon" / ".tombstone").read_text(encoding="utf-8"))
+        assert control["cleared"] == {}
+        first = store.snapshot(_allow_all)
+        first_fingerprint = store.fingerprint(_allow_all)
+        second = store.snapshot(_allow_all)
+        second_fingerprint = store.fingerprint(_allow_all)
+        assert first == second
+        assert first_fingerprint == second_fingerprint
+        assert first["daemon"]["data"]["events"] == [{"event_id": "new"}]
+
+    def test_inert_tombstone_with_no_matching_key_is_compacted(self, tmp_path):
+        workdir = tmp_path / "inert-tombstone"
+        store = _posix_store(workdir)
+        _publish_daemon(store, "em-a", "live")
+        mini = workdir / ".notification" / "daemon" / "em-a.json"
+        raw = mini.read_bytes()
+        control_path = workdir / ".notification" / "daemon" / ".tombstone"
+        control_path.write_text(
+            json.dumps(_tombstone_control(cleared={
+                "em-a.json": {
+                    "raw_sha256": __import__("hashlib").sha256(raw).hexdigest(),
+                    "event_keys": ["event:already-gone"],
+                }
+            })),
+            encoding="utf-8",
+        )
+        store._compact_daemon_tombstone()
+        control = json.loads(control_path.read_text(encoding="utf-8"))
+        assert control["cleared"] == {}
+        assert mini.read_bytes() == raw
+        assert store.snapshot(_allow_all)["daemon"]["data"]["events"] == [{"event_id": "live"}]
+
+
+class TestCompositionAndProvenance:
+    def test_submit_signature_is_strict_and_store_backed(self):
+        signature = inspect.signature(submit)
+        assert list(signature.parameters) == [
+            "agent",
+            "tool_name",
+            "data",
+            "header",
+            "icon",
+            "priority",
+            "instructions",
+        ]
+        with pytest.raises(AttributeError):
+            submit(Path("not-an-agent"), "email", data={}, header="strict")
+        store = FakeNotificationStore()
+        submit(SimpleNamespace(_notification_store=store), "email", data={"x": 1}, header="ok")
+        assert store.snapshot(_allow_all)["email"]["data"] == {"x": 1}
+
+    def test_import_provenance_is_current_worktree(self):
+        import lingtai
+        import lingtai.kernel.notification_store as port_module
+
+        repo = Path(__file__).resolve().parents[1]
+        assert Path(lingtai.__file__).resolve().is_relative_to(repo / "src")
+        assert Path(port_module.__file__).resolve() == (
+            repo / "src/lingtai/kernel/notification_store/__init__.py"
+        )
+
+    def test_telegram_server_composes_one_store_and_injects_same_instance(
+        self, tmp_path, monkeypatch
+    ):
+        import lingtai.mcp_servers.telegram.server as server
+
+        sentinel_store = FakeNotificationStore()
+        captured = {}
+
+        class Service:
+            def __init__(self, **kwargs):
+                captured["service_kwargs"] = kwargs
+
+        class Manager:
+            def __init__(self, **kwargs):
+                captured["manager_kwargs"] = kwargs
+
+        monkeypatch.setattr(
+            server,
+            "_load_config_with_source",
+            lambda: ({"accounts": [{"alias": "main"}]}, tmp_path / "telegram.json"),
+        )
+        monkeypatch.setattr(server, "TelegramService", Service)
+        monkeypatch.setattr(server, "TelegramManager", Manager)
+        monkeypatch.setattr(
+            server, "PosixNotificationStoreAdapter", lambda workdir: sentinel_store
+        )
+        monkeypatch.setenv("LINGTAI_AGENT_DIR", str(tmp_path / "telegram-server"))
+        manager, working_dir = server.build_manager()
+        assert manager.__class__ is Manager
+        assert captured["manager_kwargs"]["notification_store"] is sentinel_store
+        assert captured["manager_kwargs"]["working_dir"] == working_dir

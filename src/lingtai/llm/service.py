@@ -14,17 +14,21 @@ import os
 import threading
 import uuid
 from collections.abc import Callable
-from typing import Any
+from pathlib import Path
 
-from lingtai_kernel.llm.base import (
+from lingtai.kernel.llm.base import (
     ChatSession,
     FunctionSchema,
     LLMResponse,
 )
-from lingtai_kernel.llm.interface import ChatInterface, ToolResultBlock
-from lingtai_kernel.llm.service import LLMService as LLMServiceABC
+from lingtai.kernel.llm.interface import ChatInterface, ToolResultBlock
+from lingtai.kernel.llm.service import LLMService as LLMServiceABC
 
 from .base import LLMAdapter
+
+
+# Conservative fallback used when a caller has no valid model context window.
+CONSERVATIVE_CONTEXT_WINDOW = 272_000
 
 
 def _generate_session_id() -> str:
@@ -59,13 +63,81 @@ def _generate_tool_call_id() -> str:
 # api_compat="anthropic" custom providers (e.g. local GLM proxies) to
 # OpenAIAdapter, which then explodes on raw.choices access. See
 # Lingtai-AI/lingtai#112 for the full failure trace.
-_PROVIDER_DEFAULTS_PASS_THROUGH_KEYS = ("api_compat",)
+# ``codex_session_anchor`` / ``codex_thread_salt`` carry the agent's per-agent
+# Codex identity down to the adapter, which lets the Codex REST path send
+# ``session_id`` / ``thread_id`` cache-affinity headers (issue #378; the
+# underscore spelling is mandatory — the Codex backend matches the literal key,
+# and a hyphenated ``session-id`` / ``thread-id`` would lose cache affinity). The
+# adapter layer has no per-agent identity of its own, so the
+# ``codex_session_anchor`` is populated *automatically* for Codex agents from the
+# agent path (see ``build_provider_defaults_from_manifest_llm``); the adapter
+# derives an 8-char ``(agent-path, molt_count)`` hash from it and uses that value
+# byte-identically for session_id, thread_id, and prompt_cache_key. There is no
+# operator-level fixed-id override: the identity is always the anchor+molt hash.
+# ``codex_thread_salt`` remains available as a legacy manifest pass-through but
+# no longer derives a separate thread id (the thread tracks the session id), and
+# nothing reads the token ledger to pick the Codex identity.
+#
+# ``codex_base_urls`` is an OPTIONAL Codex-only endpoint pool (a list/tuple of
+# URLs, or a comma/newline-separated string). When it carries 2+ valid entries
+# the adapter chooses one per LingTai molt segment — stable within the segment,
+# rotating only at a molt boundary, keyed on the agent's stable offset plus the
+# current ``molt_count`` (from ``<working_dir>/.agent.json``; host/test
+# callers may pass ``codex_molt_count`` directly via provider defaults/adapter
+# kwargs). Empty/blank -> single ``base_url`` behavior.
+# This NEVER changes the ``prompt_cache_key`` / ``session_id`` / ``thread_id``
+# identity, which the pool routes off. Parsing/validation lives in the adapter.
+#
+# ``codex_auth_path`` selects which Codex OAuth token file the adapter reads
+# (the path to a ``codex-auth.json``-shaped file), enabling true multiple Codex
+# accounts: a preset/manifest can point one agent at its own token file instead
+# of the shared default ``~/.lingtai-tui/codex-auth.json``. The value is a local
+# filesystem path, not a secret, so it travels with the other provider defaults;
+# the adapter never logs token contents. Blank/whitespace values are treated as
+# omitted by the factory (legacy default-path behavior).
+_PROVIDER_DEFAULTS_PASS_THROUGH_KEYS = (
+    "api_compat",
+    "codex_session_anchor",
+    "codex_thread_salt",
+    "codex_auth_path",
+    # Optional Codex AUTH pool shared by every accepted Codex spelling. Points
+    # at the non-secret pool file listing token paths + weights; the one native
+    # adapter re-reads and selects at each real request boundary. A truly empty
+    # pool may fall back to the legacy default token path.
+    "codex_auth_pool_path",
+    # Optional Codex endpoint pool (molt-boundary shuffle). A manifest ``llm``
+    # block may carry ``codex_base_urls`` (list/tuple or comma/newline string);
+    # the adapter chooses one endpoint at request time without changing
+    # prompt_cache_key/session/thread identity.
+    "codex_base_urls",
+    # Optional Codex service tier. ``fast`` is normalized to the wire value
+    # ``priority`` at the common Codex factory boundary.
+    "service_tier",
+    # OpenAI-compatible wire selection. ``auto`` preserves legacy behavior;
+    # ``chat_completions``/``responses`` explicitly select the wire path even
+    # for custom base URLs. Scoped to OpenAI-compatible adapters.
+    "wire_api",
+    # Generic reasoning_content round-trip knobs (fable R2 F2). Manifest llm:
+    # values must reach the adapter, not be dropped by this safelist. Scoped
+    # to OpenAI-compatible adapters; other adapters ignore them.
+    "inject_reasoning_fallback",
+    "reasoning_effort_vocab",
+    "prompt_cache_namespace",
+)
+_PROVIDER_DEFAULTS_PRESERVE_NONE_KEYS = ("compact_threshold",)
+
+# Accepted Codex config spellings that get the automatic per-agent
+# ``codex_session_anchor`` (the resolved ``init.json`` path). They all resolve to
+# the same factory/adapter and therefore share cache-affinity and endpoint-pool
+# identity. LLMService itself does no dash/underscore normalization.
+_CODEX_ANCHOR_PROVIDERS = ("codex", "codex-pool", "codex_pool")
 
 
 def build_provider_defaults_from_manifest_llm(
     llm: dict,
     *,
     max_rpm: int,
+    working_dir: Path | None = None,
 ) -> dict | None:
     """Convert a manifest.llm block into LLMService.provider_defaults.
 
@@ -73,6 +145,19 @@ def build_provider_defaults_from_manifest_llm(
     configured provider so other providers stay unaffected), or ``None``
     when no fields are set — preserving the historical behavior where
     callers passed ``provider_defaults=None`` for the unconfigured case.
+
+    When ``working_dir`` is given and the provider is Codex, the agent's
+    per-agent Codex identity is injected by default: the ``codex_session_anchor``
+    is the resolved ``init.json`` path (the agent's durable identity anchor). The
+    adapter derives an 8-char ``(agent-path, molt_count)`` hash from that anchor
+    and uses it byte-identically for ``session_id``, ``thread_id``, and
+    ``prompt_cache_key``. This is the normal path — neither opt-in nor opt-out; a
+    Codex agent gets cache-affinity values out of the box. This no longer reads
+    the token ledger / ``api_call_id`` or molt time: the values depend only on the
+    agent path and the current ``molt_count``, so ordinary calls, refresh/rebuild,
+    and clear (same agent path, same molt_count) never rotate them; a molt advances
+    them. An explicit ``codex_session_anchor`` on the manifest ``llm`` block still
+    wins (internal override / testing escape hatch).
     """
     provider_key = llm["provider"].lower()
     per_provider: dict = {}
@@ -87,6 +172,21 @@ def build_provider_defaults_from_manifest_llm(
         value = llm.get(key)
         if value is not None:
             per_provider[key] = value
+    for key in _PROVIDER_DEFAULTS_PRESERVE_NONE_KEYS:
+        if key in llm:
+            per_provider[key] = llm[key]
+
+    # Default per-agent Codex identity from the agent path only. The adapter
+    # hashes this anchor together with the current molt_count into one 8-char
+    # value shared by session_id, thread_id, and prompt_cache_key. A
+    # manifest-supplied ``codex_session_anchor`` (handled above) takes precedence;
+    # we only fill the gap. No token ledger / molt time is consulted.
+    if provider_key in _CODEX_ANCHOR_PROVIDERS and working_dir is not None:
+        per_provider.setdefault(
+            "codex_session_anchor",
+            str((working_dir / "init.json").resolve()),
+        )
+
     return {provider_key: per_provider} if per_provider else None
 
 
@@ -130,14 +230,28 @@ class LLMService(LLMServiceABC):
         base_url: str | None = None,
         key_resolver: Callable[[str], str | None] | None = None,
         provider_defaults: dict | None = None,
-        context_window: int = 1_000_000,
+        context_window: int = CONSERVATIVE_CONTEXT_WINDOW,
     ) -> None:
         self._provider = provider.lower()
         self._model = model
-        self._context_window = context_window
+        self._context_window = (
+            context_window
+            if isinstance(context_window, int)
+            and not isinstance(context_window, bool)
+            and context_window > 0
+            else CONSERVATIVE_CONTEXT_WINDOW
+        )
         self._base_url = base_url
         self._key_resolver = key_resolver or (lambda p: os.environ.get(f"{p.upper()}_API_KEY"))
         self._provider_defaults = provider_defaults or {}
+        # Remember the directly supplied credential for this service's own
+        # provider. Agent boot resolves manifest ``api_key`` / ``api_key_env``
+        # before constructing LLMService, so this may be a key from a
+        # *noncanonical* env slot such as ``LLM_API_KEY`` / ``MIMO_1_API_KEY``.
+        # Keeping it lets an inheriting caller (the no-preset daemon path) reuse
+        # the real key directly instead of re-deriving it through a canonical-only
+        # resolver, which would lose a noncanonical-env key. Never logged.
+        self._api_key = api_key
         self._adapters: dict[tuple[str, str | None], LLMAdapter] = {}
         self._adapter_lock = threading.Lock()
         self._adapters[(self._provider, base_url)] = self._create_adapter(self._provider, api_key, base_url)
@@ -199,29 +313,36 @@ class LLMService(LLMServiceABC):
         with different base URLs (e.g. OpenRouter vs local vLLM) gets separate
         adapter instances.
 
+        When *base_url* is None and multiple adapters are cached for
+        *provider*, the returned adapter is chosen deterministically: the
+        ``(provider, None)`` entry wins, then the entry whose base_url matches
+        the provider's configured default, then the first match in sorted-key
+        order (see ``_find_provider_adapter``).
+
         Raises RuntimeError if the API key for *provider* is not configured.
         """
         provider = provider.lower()
         cache_key = (provider, base_url)
 
-        # Fast path — no lock needed for reads of an already-cached adapter
-        if cache_key in self._adapters:
-            return self._adapters[cache_key]
-        # When no base_url specified, find any cached adapter for this provider
+        # Fast path — atomic point read, then snapshot-based scan; no lock needed
+        adapter = self._adapters.get(cache_key)
+        if adapter is not None:
+            return adapter
         if base_url is None:
-            for (p, _url), adapter in self._adapters.items():
-                if p == provider:
-                    return adapter
+            adapter = self._find_provider_adapter(provider)
+            if adapter is not None:
+                return adapter
 
         # Slow path — lock to prevent duplicate adapter creation
         with self._adapter_lock:
             # Double-check after acquiring lock
-            if cache_key in self._adapters:
-                return self._adapters[cache_key]
+            adapter = self._adapters.get(cache_key)
+            if adapter is not None:
+                return adapter
             if base_url is None:
-                for (p, _url), adapter in self._adapters.items():
-                    if p == provider:
-                        return adapter
+                adapter = self._find_provider_adapter(provider)
+                if adapter is not None:
+                    return adapter
 
             # Need to create a new adapter — check API key first
             api_key = self._key_resolver(provider)
@@ -240,6 +361,28 @@ class LLMService(LLMServiceABC):
             self._adapters[cache_key] = adapter
             return adapter
 
+    def _find_provider_adapter(self, provider: str) -> LLMAdapter | None:
+        """Deterministically pick a cached adapter for *provider* (any base_url).
+
+        Preference order:
+        1. the (provider, None) entry,
+        2. the entry matching the provider's configured default base_url,
+        3. first match by sorted cache key (stable tie-break).
+
+        Snapshots the cache so it is safe to call without _adapter_lock.
+        """
+        items = list(self._adapters.items())  # atomic snapshot; safe vs concurrent insert
+        matches = {url: adapter for (p, url), adapter in items if p == provider}
+        if not matches:
+            return None
+        if None in matches:
+            return matches[None]
+        defaults = self._get_provider_defaults(provider)
+        default_url = defaults.get("base_url") if defaults else None
+        if default_url in matches:
+            return matches[default_url]
+        return matches[min(url for url in matches if url is not None)]
+
     def _get_provider_defaults(self, provider_name: str) -> dict | None:
         """Get defaults for a provider from the injected provider_defaults dict."""
         return self._provider_defaults.get(provider_name)
@@ -251,6 +394,25 @@ class LLMService(LLMServiceABC):
     @property
     def model(self) -> str:
         return self._model
+
+    @property
+    def api_key(self) -> str | None:
+        """The directly configured api_key for this service's primary provider.
+
+        Agent boot resolves manifest ``api_key`` / ``api_key_env`` before passing
+        the value here, so this captures noncanonical env slots that the generic
+        resolver cannot reconstruct. Intended for credential inheritance by
+        daemon-scoped services; callers must never log it.
+        """
+        return self._api_key
+
+    def static_adapter_comment(self) -> dict | None:
+        """Return static adapter guidance before a ChatSession exists, if any."""
+        adapter = self.get_adapter(self._provider, self._base_url)
+        comment_fn = getattr(adapter, "static_adapter_comment", None)
+        if not callable(comment_fn):
+            return None
+        return comment_fn()
 
     # --- Session management ---
 

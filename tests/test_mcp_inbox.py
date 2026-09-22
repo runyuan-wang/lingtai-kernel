@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 from lingtai.agent import Agent
-from lingtai.core.mcp.inbox import (
+from lingtai.services.mcp_inbox import (
     DEAD_DIRNAME,
     INBOX_DIRNAME,
     MCPInboxPoller,
@@ -30,14 +31,9 @@ from lingtai.core.mcp.inbox import (
     _scan_once,
     validate_event,
 )
+from tests._service_helpers import make_gemini_mock_service as make_mock_service
 
 
-def make_mock_service():
-    svc = MagicMock()
-    svc.get_adapter.return_value = MagicMock()
-    svc.provider = "gemini"
-    svc.model = "gemini-test"
-    return svc
 
 
 def _mk_agent(tmp_path: Path):
@@ -59,6 +55,18 @@ def _write_event(workdir: Path, mcp_name: str, event_id: str, event: dict) -> Pa
     tmp.write_text(json.dumps(event), encoding="utf-8")
     tmp.rename(final)
     return final
+
+
+def _capture_logs(agent):
+    events: list[tuple[str, dict]] = []
+    agent._log = lambda event, **fields: events.append((event, fields))
+    return events
+
+
+def _only_mcp_event(logs: list[tuple[str, dict]]) -> dict:
+    matches = [fields for event, fields in logs if event == "mcp_inbox_event"]
+    assert len(matches) == 1
+    return matches[0]
 
 
 # ---------------------------------------------------------------------------
@@ -134,8 +142,8 @@ def test_scan_dispatches_valid_event_to_notification(tmp_path):
     assert notif_file.exists(), "notification file not created"
     import json as _json
     notif = _json.loads(notif_file.read_text(encoding="utf-8"))
-    assert "telegram" in notif["header"]
-    assert "1 new event" in notif["header"]
+    assert notif["header"] == "1 new event from MCP 'telegram'"
+    assert notif["icon"] == "💬"
     assert notif["data"]["count"] == 1
     assert notif["data"]["source"] == "telegram"
     # Sender / subject / body must NOT be inlined; the agent learns them by
@@ -146,6 +154,61 @@ def test_scan_dispatches_valid_event_to_notification(tmp_path):
 
     # File was deleted on success.
     assert not (inbox_root / "telegram" / "ev1.json").exists()
+
+
+def test_scan_logs_drain_latency_and_producer_lag(tmp_path):
+    agent, workdir = _mk_agent(tmp_path)
+    logs = _capture_logs(agent)
+    received_at = (
+        datetime.now(timezone.utc) - timedelta(seconds=2)
+    ).isoformat().replace("+00:00", "Z")
+    _write_event(workdir, "telegram", "ev1", {
+        "from": "alice",
+        "subject": "hi",
+        "body": "hello",
+        "received_at": received_at,
+    })
+
+    assert _scan_once(agent, workdir / INBOX_DIRNAME) == 1
+
+    fields = _only_mcp_event(logs)
+    assert "drain_latency_s" in fields
+    assert fields["drain_latency_s"] >= 0
+    assert "producer_lag_s" in fields
+    assert fields["producer_lag_s"] >= 0
+
+
+def test_scan_legacy_event_logs_drain_latency_without_producer_lag(tmp_path):
+    agent, workdir = _mk_agent(tmp_path)
+    logs = _capture_logs(agent)
+    _write_event(workdir, "telegram", "ev1", {
+        "from": "alice", "subject": "hi", "body": "hello",
+    })
+
+    assert _scan_once(agent, workdir / INBOX_DIRNAME) == 1
+
+    fields = _only_mcp_event(logs)
+    assert "drain_latency_s" in fields
+    assert fields["drain_latency_s"] >= 0
+    assert "producer_lag_s" not in fields
+
+
+def test_scan_invalid_received_at_does_not_dead_letter_or_log_lag(tmp_path):
+    agent, workdir = _mk_agent(tmp_path)
+    logs = _capture_logs(agent)
+    _write_event(workdir, "telegram", "ev1", {
+        "from": "alice",
+        "subject": "hi",
+        "body": "hello",
+        "received_at": "not-a-timestamp",
+    })
+
+    assert _scan_once(agent, workdir / INBOX_DIRNAME) == 1
+
+    fields = _only_mcp_event(logs)
+    assert fields["drain_latency_s"] >= 0
+    assert "producer_lag_s" not in fields
+    assert not (workdir / INBOX_DIRNAME / "telegram" / DEAD_DIRNAME).exists()
 
 
 def test_scan_coalesces_multiple_events_into_one_notification(tmp_path):
@@ -189,50 +252,50 @@ def test_scan_coalesces_multiple_events_into_one_notification(tmp_path):
     assert {p["from"] for p in previews} == {"alice", "bob", "carol"}
     assert {p["subject"] for p in previews} == {"s1", "s2", "s3"}
     # Body snippets are present and capped at _PREVIEW_FIELD_CAP.
-    from lingtai.core.mcp.inbox import _PREVIEW_FIELD_CAP
+    from lingtai.services.mcp_inbox import _PREVIEW_FIELD_CAP
     for p in previews:
         assert "preview" in p
         assert len(p["preview"]) <= _PREVIEW_FIELD_CAP
-    # Instructions should render senders, subjects, and snippets so the
-    # model sees them inline.
+    # Instructions render only lightweight routing context. The body previews
+    # live once in data.previews and must not be duplicated verbatim into the
+    # instructions string.
     for sender in ("alice", "bob", "carol"):
         assert sender in notif["instructions"]
     for subject in ("s1", "s2", "s3"):
         assert subject in notif["instructions"]
-    assert "second body content" in notif["instructions"]
+    assert "second body content" in previews[1]["preview"]
+    assert "second body content" not in notif["instructions"]
+    for p in previews:
+        assert p["preview"] not in notif["instructions"]
 
 
-def test_scan_summary_uses_singular_for_one_event(tmp_path):
-    import json as _json
-
-    agent, workdir = _mk_agent(tmp_path)
-    _write_event(workdir, "imap", "ev1", {
-        "from": "a", "subject": "s", "body": "b",
-    })
-    _scan_once(agent, workdir / INBOX_DIRNAME)
-    notif_file = workdir / ".notification" / "mcp.imap.json"
-    assert notif_file.exists()
-    notif = _json.loads(notif_file.read_text(encoding="utf-8"))
-    assert "1 new event" in notif["header"]  # no plural 's'
 
 
-def test_scan_publishes_notification_file(tmp_path):
-    """Events are published to .notification/ — no explicit _wake_nap needed."""
+def test_dispatch_summary_instructions_do_not_require_reread_of_full_content(tmp_path):
+    """The instructions string must tell the agent not to reread content or an
+    id already fully present in the preview — only actually missing content
+    (capped/omitted) is a recovery trigger. Regression for a prior wording
+    that told the agent to read whenever the preview was merely ambiguous or
+    media/callback-heavy, contradicting the shared no-reread contract."""
     import json as _json
 
     agent, workdir = _mk_agent(tmp_path)
     _write_event(workdir, "telegram", "ev1", {
-        "from": "alice", "subject": "hi", "body": "hello",
+        "from": "alice", "subject": "s1", "body": "hello",
     })
 
     _scan_once(agent, workdir / INBOX_DIRNAME)
+    notif = _json.loads((workdir / ".notification" / "mcp.telegram.json").read_text(encoding="utf-8"))
+    instructions = " ".join(notif["instructions"].split())
 
-    notif_file = workdir / ".notification" / "mcp.telegram.json"
-    assert notif_file.exists()
-    notif = _json.loads(notif_file.read_text(encoding="utf-8"))
-    assert notif["icon"] == "💬"
-    assert notif["data"]["source"] == "telegram"
-    assert "previews" in notif["data"]
+    assert "do NOT call the MCP" in instructions
+    assert "reread that same content" in instructions
+    assert "re-fetch an id already present" in instructions
+    assert "actually missing, capped, or omitted" in instructions
+    assert "not by themselves reasons to reread" in instructions
+    # Old contradictory phrasing (read whenever ambiguous/media-heavy) is gone.
+    assert "media/callback-heavy" not in instructions
+    assert "the agent may reply directly" not in instructions
 
 
 def test_scan_truncates_long_body_into_preview_snippet(tmp_path):
@@ -245,7 +308,7 @@ def test_scan_truncates_long_body_into_preview_snippet(tmp_path):
     validate_event)."""
     import json as _json
 
-    from lingtai.core.mcp.inbox import _PREVIEW_FIELD_CAP
+    from lingtai.services.mcp_inbox import _PREVIEW_FIELD_CAP
 
     agent, workdir = _mk_agent(tmp_path)
     long_body = "B" * (_PREVIEW_FIELD_CAP + 500)
@@ -259,18 +322,17 @@ def test_scan_truncates_long_body_into_preview_snippet(tmp_path):
     notif_file = workdir / ".notification" / "mcp.telegram.json"
     notif = _json.loads(notif_file.read_text(encoding="utf-8"))
     preview = notif["data"]["previews"][0]
-    # Snippet hard-capped.
+    # Snippet hard-capped and explicitly marked truncated.
     assert len(preview["preview"]) == _PREVIEW_FIELD_CAP
     assert preview["preview"] == "B" * _PREVIEW_FIELD_CAP
+    assert preview["preview_truncated"] is True
     # from/subject pass through unchanged — no truncation at this layer.
     assert preview["from"] == "alice@example.com"
     assert preview["subject"] == "S" * 150
 
 
-def test_scan_legacy_event_without_metadata_yields_only_base_preview_fields(tmp_path):
-    """Phase-1 IM seam: events without metadata must produce the exact
-    pre-existing preview shape — {from, subject, preview} with no extras.
-    Behavioural baseline for the additive metadata change."""
+def test_scan_legacy_event_without_metadata_yields_base_preview_fields(tmp_path):
+    """Events without metadata keep base preview fields plus truncation state."""
     import json as _json
 
     agent, workdir = _mk_agent(tmp_path)
@@ -281,10 +343,11 @@ def test_scan_legacy_event_without_metadata_yields_only_base_preview_fields(tmp_
     _scan_once(agent, workdir / INBOX_DIRNAME)
     notif = _json.loads((workdir / ".notification" / "mcp.telegram.json").read_text(encoding="utf-8"))
     p = notif["data"]["previews"][0]
-    assert set(p.keys()) == {"from", "subject", "preview"}
+    assert set(p.keys()) == {"from", "subject", "preview", "preview_truncated"}
     assert p["from"] == "alice"
     assert p["subject"] == "hi"
     assert p["preview"] == "hello"
+    assert p["preview_truncated"] is False
 
 
 def test_scan_preserves_conversation_metadata_in_preview(tmp_path):
@@ -292,7 +355,7 @@ def test_scan_preserves_conversation_metadata_in_preview(tmp_path):
     metadata.{conversation_ref, message_ref, platform}, those values
     surface in the per-event preview entry and in the notification
     instructions so the agent can route follow-up work to the right
-    thread without calling read()."""
+    thread without duplicating body preview text."""
     import json as _json
 
     agent, workdir = _mk_agent(tmp_path)
@@ -318,9 +381,89 @@ def test_scan_preserves_conversation_metadata_in_preview(tmp_path):
     assert p["conversation_ref"] == "tg:chat:42"
     assert p["message_ref"] == "tg:msg:9001"
     assert p["platform"] == "telegram"
-    # Instructions render them concisely so the model sees them inline.
+    assert p["preview_truncated"] is False
+    # Instructions render routing metadata concisely, but not the body preview.
     assert "tg:chat:42" in notif["instructions"]
     assert "tg:msg:9001" in notif["instructions"]
+    assert "hello" in p["preview"]
+    assert "hello" not in notif["instructions"]
+
+
+def test_scan_preserves_structured_telegram_context_metadata(tmp_path):
+    """Curated IM producers may attach bounded structured recent-message context."""
+    import json as _json
+
+    agent, workdir = _mk_agent(tmp_path)
+    recent = [
+        {
+            "id": "main:123:52",
+            "direction": "incoming",
+            "sender": "alice",
+            "text": "previous",
+            "text_truncated": False,
+        },
+        {
+            "id": "main:123:53",
+            "direction": "incoming",
+            "sender": "alice",
+            "text": "hello",
+            "text_truncated": False,
+            "is_current": True,
+        },
+    ]
+    _write_event(workdir, "telegram", "ev1", {
+        "from": "alice",
+        "subject": "hi",
+        "body": "hello",
+        "metadata": {
+            "conversation_ref": "main:123",
+            "message_ref": "main:123:53",
+            "platform": "telegram",
+            "recent_messages": recent,
+            "latest_incoming": recent[-1],
+        },
+    })
+
+    _scan_once(agent, workdir / INBOX_DIRNAME)
+    notif = _json.loads((workdir / ".notification" / "mcp.telegram.json").read_text(encoding="utf-8"))
+    p = notif["data"]["previews"][0]
+    assert p["recent_messages"] == recent
+    assert p["latest_incoming"] == recent[-1]
+    assert "recent_messages=structured" in notif["instructions"]
+    assert "latest_incoming=structured" in notif["instructions"]
+
+
+def test_scan_preserves_referenced_messages_metadata(tmp_path):
+    """Full referenced reply-target messages pass through the preview seam."""
+    import json as _json
+
+    agent, workdir = _mk_agent(tmp_path)
+    referenced = [
+        {
+            "id": "main:123:1",
+            "direction": "incoming",
+            "sender": "alice",
+            "text": "the original message being replied to",
+            "text_truncated": False,
+            "source": "reply_target",
+        }
+    ]
+    _write_event(workdir, "telegram", "ev1", {
+        "from": "alice",
+        "subject": "hi",
+        "body": "answering your first message",
+        "metadata": {
+            "conversation_ref": "main:123",
+            "message_ref": "main:123:53",
+            "platform": "telegram",
+            "referenced_messages": referenced,
+        },
+    })
+
+    _scan_once(agent, workdir / INBOX_DIRNAME)
+    notif = _json.loads((workdir / ".notification" / "mcp.telegram.json").read_text(encoding="utf-8"))
+    p = notif["data"]["previews"][0]
+    assert p["referenced_messages"] == referenced
 
 
 def test_scan_ignores_non_string_or_empty_metadata_values(tmp_path):
@@ -330,7 +473,7 @@ def test_scan_ignores_non_string_or_empty_metadata_values(tmp_path):
     not become dead-lettered."""
     import json as _json
 
-    from lingtai.core.mcp.inbox import _PREVIEW_META_FIELD_CAP
+    from lingtai.services.mcp_inbox import _PREVIEW_META_FIELD_CAP
 
     agent, workdir = _mk_agent(tmp_path)
     _write_event(workdir, "telegram", "ev1", {

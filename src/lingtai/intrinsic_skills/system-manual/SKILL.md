@@ -1,122 +1,98 @@
 ---
 name: system-manual
 description: >
-  Second-layer router for LingTai's progressive-disclosure operating manuals.
-  Read this when resident substrate/procedures are too compact and you need to
-  route to the right lower reference. References include
-  `reference/substrate-manual/SKILL.md` for the expanded substrate/body/lifecycle/
-  communication/memory/idle/system-operations model;
-  `reference/procedures-manual/SKILL.md` for the expanded procedures/action discipline,
-  skill routing, responsiveness, deliverables, artifact sharing, and issue
-  reporting guidance; and `reference/sqlite-log-query/SKILL.md` for SQLite/log.sqlite
-  runtime trace inspection and trajectory/anomaly mining from event traces. Also
-  route here for lifecycle operations, notification
-  handling, molt/memory questions, MCP/addon ownership, preset tiers,
-  collaboration/network topology, resident prompt design, and the `system` tool
-  actions.
-version: 1.2.0
-tags: [lingtai, agent, runtime, procedures, substrate, system, lifecycle, memory, communication, skills, molt]
+  Short router for runtime, lifecycle, identity, Agent/Project relocation,
+  refresh transactions, presets, settings, update/mismatch diagnosis, LLM
+  adapters, and operating procedures.
+version: 1.24.0
+last_changed_at: "2026-09-14T00:00:00Z"
+tags: [lingtai, agent, project, workdir, relocation, runtime, procedures, substrate, system, lifecycle, alarm, memory, communication, skills, settings, molt, summarize, nudge, updates, refresh, preset, llm, adapters, codex, websocket]
+related_files:
+- src/lingtai/prompts/substrate/substrate.md
+- src/lingtai/prompts/procedures/procedures.md
+- src/lingtai/kernel/base_agent/lifecycle.py
+- src/lingtai/tools/system/karma.py
+- src/lingtai/tools/system/schema.py
+- src/lingtai/tools/system/CONTRACT.md
+- src/lingtai/tools/system/ANATOMY.md
+- src/lingtai/tools/system/settings.py
+- tests/test_system_declared_plugin.py
+- src/lingtai/kernel/nudge/ANATOMY.md
+- src/lingtai/intrinsic_skills/system-manual/reference/llm-adapters/SKILL.md
+- src/lingtai/intrinsic_skills/system-manual/reference/refresh-precheck/SKILL.md
+- src/lingtai/intrinsic_skills/system-manual/reference/runtime-update-checks/SKILL.md
+- src/lingtai/intrinsic_skills/system-manual/reference/migration-guide/SKILL.md
+- src/lingtai/intrinsic_skills/system-manual/reference/external-attach-diagnostic/SKILL.md
+- src/lingtai/llm/_register.py
+- src/lingtai/llm/openai/adapter.py
+- src/lingtai/intrinsic_skills/system-manual/reference/tool-plugin-settings/SKILL.md
+- src/lingtai/intrinsic_skills/system-manual/reference/settings-inventory/SKILL.md
+- tests/test_skills.py
+maintenance: |
+  Tracks the routed source/resources it summarizes; keep refresh-precheck as the
+  single refresh-transaction owner and runtime-update-checks as the update,
+  source, install, nudge, and mismatch owner.
 ---
 
-# System Manual — Progressive Disclosure Router
+# System Manual — Task Router
 
-`system-manual` is the second layer of LingTai operating guidance. The resident
-`substrate` and `procedures` prompts keep only the short rules every agent must
-hold constantly. This skill routes from those compact rules to the reference node
-that carries the actual detail.
+`system-manual` routes System's lifecycle, identity, presets, settings, and peer
+controls. Schema owns action names, fields, and types;
+read one route below for unfamiliar or consequential work.
 
-Use this file first when the question is about LingTai's agent runtime, resident
-prompt design, lifecycle, memory, communication, tool routing, system operations,
-or runtime trace inspection. Then open the referenced lower node.
+## Task routes
 
-
-## Nested reference catalog
-
-`system-manual` owns the following nested skill-references. Their frontmatter is
-kept here so the router advertises lower nodes without promoting them to
-standalone top-level skills. Open the listed `SKILL.md` when the router table
-selects that topic.
-
-```yaml
-- name: substrate-manual
-  location: reference/substrate-manual/SKILL.md
-  description: |
-    Expanded LingTai substrate/runtime model: body/extensions, bash vs daemon vs
-    avatar vs MCP, lifecycle states, system tool actions, notification/read/
-    dismiss discipline, communication channels, memory layers, molt model,
-    runtime log routing, collaboration topology, MCP/addon ownership, idle/soul,
-    preset tiers, and resident substrate maintenance.
-- name: procedures-manual
-  location: reference/procedures-manual/SKILL.md
-  description: |
-    Expanded LingTai procedure/action guidance: progressive disclosure,
-    responsiveness, external side-effect authorization, choosing bash vs daemon
-    vs avatar vs MCP, depositing work into pad/knowledge/skills/character,
-    idle/lifecycle procedure, molt checklist, skill routing, web/file/media/
-    artifact handling, standalone HTML deliverables, sharing artifacts, issue
-    reporting, and resident procedures maintenance.
-- name: sqlite-log-query
-  location: reference/sqlite-log-query/SKILL.md
-  description: |
-    SQLite/log.sqlite runtime trace inspection and trajectory/anomaly mining:
-    `lingtai-agent log doctor`, `lingtai-agent log query`,
-    `lingtai-agent log rebuild`, JSONL source-of-truth rules, read-only SQL
-    safety, offline rebuild/WAL caveats, events and chat_entries schema,
-    daemon/chat-history indexing, query recipes, runtime problem investigation,
-    SQL-based event metrics, cheap-model daemon strategy, finding schema,
-    improvement digest output, redaction/privacy rules, and event_summary.py script.
-```
-
-## Router table
-
-| Need / keywords | Read |
+| Task | Read |
 |---|---|
-| Expanded substrate; body/extensions; bash vs daemon vs avatar vs MCP; lifecycle states; ACTIVE/IDLE/ASLEEP/SUSPENDED; same-channel communication; notifications; memory layers; molt model; idle/soul; preset tiers; `system` operations | `reference/substrate-manual/SKILL.md` |
-| Expanded procedures; progressive disclosure; writing skills/knowledge; action discipline; responsiveness; skill routing; HTML deliverables; artifact sharing; issue reporting; when to read which manual | `reference/procedures-manual/SKILL.md` |
-| SQLite; `log.sqlite`; LingTai runtime logs; JSONL traces; `lingtai-agent log doctor`; `lingtai-agent log query`; `lingtai-agent log rebuild`; events/chat_entries schema; daemon/chat-history trace indexing; WAL/live-read caveats; SQL recipes; trajectory/anomaly mining; improvement digests; cheap-model strategy | `reference/sqlite-log-query/SKILL.md` |
-| Molt mechanics, pad tending, session journals, post-wipe recovery | `psyche-manual` |
-| Authoring/publishing skills or changing skill catalog behavior | `skills-manual` |
-| Knowledge-entry layout and private durable memory | `knowledge-manual` |
-| MCP registration/activation/addon ownership | `mcp-manual` |
-| Bash/cron/host scheduling details | `bash-manual` |
-| Daemon lifecycle/inspection/debugging | `daemon-manual` |
-| Avatar spawning/management/escalation | `avatar-manual` |
-| Kernel architecture/code truth | `lingtai-kernel-anatomy`, then cited code |
+| Runtime/lifecycle, alarms, MCP, memory, presets, or peer recovery | [substrate manual](reference/substrate-manual/SKILL.md) |
+| Action discipline, authorization, collaboration, or deliverables | [procedures manual](reference/procedures-manual/SKILL.md) |
+| Any refresh transaction: same-runtime reload, preset swap/revert, source/venv cutover, or failure recovery | [refresh pre-check](reference/refresh-precheck/SKILL.md) |
+| Update/source/install/nudge/mismatch diagnosis and cutover handoff, including `source_drift` | [runtime update checks](reference/runtime-update-checks/SKILL.md) |
+| Settings and SHOW ownership | [settings inventory](reference/settings-inventory/SKILL.md) |
+| Environment variables and runtime controls | [environment variables](reference/environment-variables/SKILL.md) |
+| Provider transport and adapter behavior | [LLM adapters](reference/llm-adapters/SKILL.md) |
+| SQLite traces and log queries | [SQLite log query](reference/sqlite-log-query/SKILL.md) |
+| Trajectory mining and recurring patterns | [trajectory mining](reference/trajectory-mining/SKILL.md) |
+| Goal lifecycle and goal records | [goal manual](reference/goal-manual/SKILL.md) |
+| Agent or Project address/workdir rename or relocation (mechanical cutover) | [migration-guide](reference/migration-guide/SKILL.md) |
+| External attach diagnostics | [external-attach diagnostic](reference/external-attach-diagnostic/SKILL.md) |
+| ToolFamily/plugin settings | [ToolFamily settings](reference/tool-plugin-settings/SKILL.md) |
+| Context, notification, MCP, shell, daemon, avatar, skills, or knowledge | Read that owning tool's manual; System does not own its procedure. |
 
-## How to choose between resident prompt, this router, and references
+## Everyday use
 
-- If the resident prompt already answers the question, act.
-- If the resident prompt names a broad system/runtime/procedure topic, read this
-  router to choose the lower reference.
-- If this router names a reference, read that reference before improvising.
-- If a reference points to anatomy/code/tests, descend there for ground truth.
+Use `action` with only that action's `input` fields and a short `reasoning`;
+`summarize` is optional. Fetch the installed manual with
+`system(action="manual", input={})` and keep it unsummarized. `settings` is
+read-only and its `comment` points to the owner; `presets` is allowed-only, so
+pass an exact returned path. Availability is not authority. Normal waiting is
+IDLE; positive `sleep.delay` is only a last-resort alarm without a reliable
+completion notification, and pending notifications require intentional `force`.
+`name_set` is immutable, `name_nickname` mutable, and neither moves the
+address/workdir. Route mechanical Agent/Project address or workdir movement
+through [migration-guide](reference/migration-guide/SKILL.md).
+`notification` owns reads/dismissals; `context` owns summarize/rebuild/molt and
+provider replay.
 
-## Substrate and procedures are separate on purpose
+## Consequential use
 
-`substrate` describes what an agent *is* and how the runtime behaves: bodies,
-lifecycle states, communication surfaces, memory layers, idle/soul, and system
-operations. `procedures` describes how an agent *acts*: progressive disclosure,
-tool/body selection, responsiveness, durable-store tending, skill routing,
-deliverables, artifact sharing, and issue reporting.
+- **Refresh/preset:** `reference/refresh-precheck/SKILL.md` is the single
+  owner of same-runtime reload, preset swap/revert, source/venv cutover, and
+  failure recovery: one targeted preflight, exactly one refresh, and one
+  targeted receipt. Route update/source/install/nudge/mismatch diagnosis through
+  `reference/runtime-update-checks/SKILL.md` first. Refresh never installs,
+  upgrades, fetches, or repairs code.
+- **Peer recovery:** use the exact target working-directory address within authority and
+  diagnose/communicate first. `lull`, `interrupt`, `suspend`, `cpr`, and `clear`
+  require `admin.karma=True`; `nirvana` also requires `admin.nirvana=True` and
+  permanently destroys the target. Read `reference/substrate-manual/SKILL.md`.
 
-Do not collapse their long explanations back into one resident prompt or one
-monolithic manual body. Keep the resident prompt compact, keep this file as a
-router, and put detailed explanations in `reference/substrate-manual/SKILL.md`,
-`reference/procedures-manual/SKILL.md`, and topic-specific references.
+### Cache-miss budget
 
-## Runtime log / SQLite note
+`system-manual#cache-miss-budget` remains an alias for
+`reference/settings-inventory/SKILL.md#cache-miss-budget`; query SHOW first.
 
-SQLite log guidance, including trajectory/anomaly mining from event traces,
-lives only in this manual's nested reference:
-`reference/sqlite-log-query/SKILL.md`. Route here for keywords such as SQLite,
-`log.sqlite`, runtime logs, trace index, `lingtai-agent log query`, `doctor`,
-`rebuild`, JSONL source of truth, daemon events, chat history, WAL, SQL recipes,
-improvement digests, cheap-model strategy, or finding schema.
+### Runtime policy (v2)
 
-## Maintaining this router
-
-When resident substrate/procedures gain new concepts, add a routing hint here and
-put detail in a nested reference. When a reference grows too large or needs
-companion scripts and assets, split it into another `reference/<name>/SKILL.md` folder and list
-its frontmatter summary in both this nested reference catalog and the router
-table. Keep this file short enough to scan.
+`system-manual#runtime-policy-v2` remains an alias for
+`reference/settings-inventory/SKILL.md#runtime-policy-v2-document-shape`.

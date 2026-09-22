@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from lingtai_kernel.llm.interface import (
+from lingtai.kernel.llm.interface import (
     ChatInterface,
     PendingToolCallsError,
     TextBlock,
@@ -145,6 +145,45 @@ class TestClosePendingToolCalls:
         # It must NOT say "did not complete" when the tool completed.
         assert "did not complete" not in result.content
 
+    def test_replay_lookup_can_recover_some_pending_calls(self):
+        """Mixed tails stay provider-valid: recovered calls use real results,
+        misses still get synthetic placeholders in the same result batch."""
+        iface = ChatInterface()
+        iface.add_system("prompt")
+        iface.add_user_message("go")
+        iface.add_assistant_message(
+            [
+                ToolCallBlock(id="call_A", name="tool1", args={}),
+                ToolCallBlock(id="call_B", name="tool2", args={}),
+            ],
+        )
+
+        def lookup(call):
+            if call.id == "call_A":
+                return ToolResultBlock(
+                    id="call_A",
+                    name="tool1",
+                    content={"status": "ok"},
+                    synthesized=False,
+                )
+            return None
+
+        iface.close_pending_tool_calls("network timeout", tool_result_recovery_lookup=lookup)
+
+        assert iface.has_pending_tool_calls() is False
+        tail = iface.entries[-1]
+        assert tail.role == "user"
+        assert len(tail.content) == 2
+        recovered, synthetic = tail.content
+        assert isinstance(recovered, ToolResultBlock)
+        assert recovered.id == "call_A"
+        assert recovered.content == {"status": "ok"}
+        assert recovered.synthesized is False
+        assert isinstance(synthetic, ToolResultBlock)
+        assert synthetic.id == "call_B"
+        assert synthetic.synthesized is True
+        assert "did not complete" in synthetic.content
+
     def test_idempotent(self):
         iface = _iface_with_pending_tool_calls()
         iface.close_pending_tool_calls("r1")
@@ -265,10 +304,10 @@ class TestRestoreDanglingToolCalls:
         assert "Reason recorded by the kernel: heal:idle_inject_blocked" in content
         assert "Recovery metadata:" in content
         assert "Tool call id: call_bash_1" in content
-        assert "bash action: run" in content
-        assert "bash working_dir: /agent" in content
-        assert "bash timeout: 30" in content
-        assert "bash command preview: cd /repo && git status --short" in content
+        assert "shell action: run" in content
+        assert "shell working_dir: /agent" in content
+        assert "shell timeout: 30" in content
+        assert "shell command preview: cd /repo && git status --short" in content
 
 
 # ---------------------------------------------------------------------------

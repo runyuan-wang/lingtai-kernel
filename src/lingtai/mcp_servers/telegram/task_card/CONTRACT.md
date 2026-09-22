@@ -1,0 +1,278 @@
+---
+name: telegram-task-card-projection
+contract_version: 11
+root_contract: CONTRACT.md
+related_files:
+  - src/lingtai/mcp_servers/telegram/task_card/ANATOMY.md
+  - src/lingtai/mcp_servers/telegram/task_card/BEHAVIORS.md
+  - src/lingtai/mcp_servers/telegram/task_card/resident.py
+  - src/lingtai/mcp_servers/task_card/resident.py
+  - src/lingtai/mcp_servers/telegram/task_card/SKILL.md
+  - src/lingtai/mcp_servers/task_card/event_projection.py
+  - src/lingtai/kernel/session_stats/CONTRACT.md
+  - src/lingtai/mcp_servers/telegram/manager.py
+  - src/lingtai/mcp_servers/telegram/service.py
+  - src/lingtai/mcp_servers/telegram/server.py
+  - src/lingtai/tools/task_card/CONTRACT.md
+  - pyproject.toml
+  - tests/test_telegram_task_card_programmable.py
+  - tests/test_telegram_task_card_toggle.py
+  - tests/test_telegram_task_card_event_tail.py
+  - tests/test_task_card_event_projection_shared.py
+  - tests/test_telegram_task_card_rows.py
+  - tests/test_telegram_task_card_display_expression.py
+  - tests/test_mcp_skill_manuals.py
+maintenance: |
+  This component contract is governed by the root CONTRACT.md. Keep related
+  files complete and repo-relative, keep the paired Anatomy/manual reciprocal,
+  and update Telegram tests plus the intrinsic producer contract together when
+  the projection boundary changes.
+---
+# Telegram Task Card Projection
+
+## Purpose
+Guarded by: [TT001](BEHAVIORS.md#behavior-tt001), [TT002](BEHAVIORS.md#behavior-tt002), [TT003](BEHAVIORS.md#behavior-tt003), [TT004](BEHAVIORS.md#behavior-tt004)
+
+
+Own Telegram's provider adapter and read-only projection of the intrinsic
+declarative Task Card artifact. Provider-neutral resident state/delivery lives
+in `src/lingtai/mcp_servers/task_card/resident.py`; Telegram-specific consuming
+semantics live here. The public producer contract lives in
+`src/lingtai/tools/task_card/CONTRACT.md`.
+
+## Behavior
+
+1. The shared resident core owns one tracked route transaction and composes two
+   independent channels: `automatic` and `programmable`. Its route includes
+   account, chat, and an optional thread. Telegram continues to route resident
+   cards per account+chat and passes no thread in this slice.
+2. The programmable channel is read-only with respect to the intrinsic
+   producer. It reads `<workdir>/taskcard/status` and `<workdir>/taskcard/taskcard.md`.
+3. Telegram reads and composes the programmable body only when `taskcard/status`
+   is exactly `active` and the body is nonempty. Exact `inactive` instead
+   excludes only the programmable frame from composition and updates the same
+   resident using Telegram's own automatic content. Missing status, unreadable
+   status content that is neither exactly `active` nor exactly `inactive`, or
+   `active` with a missing/blank body remain a no-op.
+4. A no-op (rule 3's third case) preserves the last valid programmable Telegram
+   frame. Exact-`inactive` handling (rule 3's second case) is itself idempotent:
+   once the programmable frame is already excluded, repeated `inactive` delivers
+   nothing further. Neither case ever deletes/hides the resident message,
+   deletes the local producer body, or pauses Telegram's own automatic updates.
+5. Projection is diff-only. If the body bytes match the committed programmable
+   frame, Telegram performs no transport update.
+6. When the Telegram `/taskcard` setting is off, presentation is suppressed.
+   Automatic mechanics continue, and hidden programmable finalize still clears
+   the committed programmable slot internally so a stale frame cannot resurface
+   after re-enable.
+7. Telegram owns `events.jsonl` tail I/O/lifecycle, compound-ID and high-water
+   semantics, Bot API error classification, real transport, and persistence.
+   The shared `TaskCardResident` owns route locking, proposed-slot composition,
+   commit-after-success, edit-first delivery, conservative old-first rotation,
+   peer adoption, and failure-state projection. It invokes Telegram only through
+   `TaskCardResidentTransport` callbacks.
+8. The automatic channel's on-screen layout is a durable, hot-swappable
+   `display_expression` stored alongside the other agent-wide presentation
+   preferences in `<agent-workdir>/telegram/taskcard.json` (owned by
+   `TelegramService`, never the bootstrap `.secrets/telegram.json`
+   account/token config). The expression is only an ordered, allowlisted
+   selection of the fragments `TaskCardEventProjection` already renders
+   (`header`/`rows`/`blank`/`footer`/`divider`/`metadata`/`time`/`ask_agent`);
+   composing it never evaluates code, interpolates arbitrary
+   workdir/config/event/prompt data, or scrapes a regex match. The documented
+   default order is Jason's approved footer-first presentation. A
+   direct atomic external edit of `taskcard.json` becomes visible at the next
+   automatic projection tick without a process restart; an unset, malformed,
+   or unknown-slot expression fails closed to the documented default without
+   corrupting sibling durable settings or the last valid in-memory state. This
+   guarantee also holds when a local `/taskcard`-style setter fires before any
+   getter or projection tick has observed the external edit: every
+   persistence setter reloads current disk state under the same lock before
+   deriving its siblings, so it can only ever apply its own requested field
+   change on top of the freshly observed file — it never writes back a stale
+   in-memory copy of an unseen edit's other fields.
+9. The automatic API-call divider renders a valid per-call thinking/reasoning
+   token count as a compact parenthesized value immediately after output tokens:
+   `↓<output> (<thinking>) ↑<cache-miss>`. Both the
+   `token_usage.current_call.thinking` carrier and the `llm_response`
+   `thinking_tokens` fallback produce the same representation. A missing,
+   malformed, or output-less count is omitted without a dangling parenthesis,
+   preserving old-event rendering and never exposing reasoning text.
+10. When an existing `apriori_summary_generated` event, its preceding successful
+    `tool_result`, and the already-recorded `source=summarize_apriori` main-ledger
+    row correlate by `tool_call_id`, the automatic card appends
+    `(summary, <elapsed>, <input> in, <output> out)` immediately after that tool
+    row. Elapsed time derives only from the two existing event timestamps; token
+    counts come from a bounded recent read of `logs/token_ledger.jsonl`. Missing,
+    malformed, unsuccessful, unmatched, or out-of-bound data preserves the old
+    output. Generated summary text and provider metadata are never projected.
+11. Async Work metadata comes only from the strict kernel-owned
+    `agent_record.async_work` v1 consumer. Telegram performs no daemon ledger or
+    Shell job scan and has no legacy fallback. Missing, malformed, future-dated,
+    or stale snapshots render no Async Work rows. Valid snapshots retain the
+    aggregate and separate daemon/Shell lanes; usage/backend/model detail stays
+    daemon-scoped. Telegram's HTML adapter presents this block as its own
+    icon-free Async Work section rather than folding it into Session.
+12. A pending canonical `shell.run` automatic row reads only the literal safe
+    `input.async` boolean. Sync/default mode renders `foreground`; literal
+    `async=true` renders `dispatching async job`. The row retains redacted
+    reasoning but never projects command, working directory, environment,
+    credentials, or any other raw argument. Completed rows keep normal result
+    wording.
+13. Telegram sends and edits the one composed resident with the original Bot API
+    `parse_mode=HTML`. The automatic renderer HTML-escapes every dynamic
+    shared automatic frame before replacing only exact static lines with
+    Telegram-supported bold, italic, and code markup; when the shared source
+    frame is within its budget, only escaped dynamic content may be shortened
+    to account for that fixed presentation overhead. The static Telegram
+    hierarchy keeps the existing Session and Identity section icons, renders the
+    since-molt `token_usage.session.output_tokens` count as compact `out <count>`
+    under Session's Context row, gives Async Work its own icon-free section, and
+    leaves the per-call `↻ … ↓ … ↑ …` metrics line plain. At the Telegram resident
+    transport boundary, only the programmable section after Telegram's injected
+    header is interpreted as Markdown: ATX headings/subheadings become bold
+    headings, `**strong**` becomes bold, inline backtick spans become code, and
+    unordered, ordered, and task-list items receive visible list markers. Raw
+    HTML and every dynamic character are escaped before the adapter adds only
+    its closed Telegram-supported tags. Unsupported or unmatched Markdown stays
+    escaped literal text rather than forming malformed provider markup. The
+    shared resident retains the authored programmable bytes, so diff-only,
+    slot composition, commit timing, and retry behavior do not change. Feishu
+    and other consumers keep their own rendering mode. Telegram appends a concise
+    `/taskcard on|off` and `/taskcard N (1-10)` settings hint immediately after
+    the existing ask-agent line.
+14. Every new kernel `llm_response` may carry the additive child schema
+    `lingtai.token_usage.session/v1`. It is the authoritative since-molt SESSION
+    source for both live append and bounded rehydrate; legacy
+    `notification_block_injected` session metadata is fallback only until a valid
+    v1 snapshot is observed. A newer legacy carrier-less `llm_response`
+    invalidates stale legacy SESSION, and `psyche_molt` clears the old generation.
+    The shared reducer validates same-generation API ordering, cumulative/current
+    relationships, exact cache miss, cache/context rates and budget remaining,
+    monotonic counters, and generation reset. Malformed or incoherent current
+    snapshots render no SESSION; lower generation/index snapshots cannot replace
+    a newer accepted state. Per-call dividers and all non-token metadata retain
+    their existing sources and rendering.
+
+## Port
+
+Internal `TaskCardResidentTransport` boundary implemented by `TelegramManager`.
+The automatic metadata path consumes `kernel.session_stats.query_published_async_work`
+as a read-only safe projection. There is no public MCP `task_card` family in
+this component.
+
+## Adapters
+
+- Filesystem reader for `<workdir>/taskcard/status` and `taskcard/taskcard.md`
+- Strict read-only consumer of `<workdir>/system/agent_record.json.async_work`
+- Telegram transport adapter in `TelegramManager`
+- Durable Telegram account state for tracked resident message ids
+- Shared in-memory route locks and automatic/programmable slot frames
+
+## Contract rules
+
+1. Telegram must not expose a public MCP `task_card` tool from `server.py`.
+2. Programmable projection must remain read-only; no Telegram code may rewrite
+   the intrinsic producer files.
+3. Missing/unreadable producer status, or `active` with a missing/blank body,
+   is a no-op, not an implicit clear. Exact `inactive` is instead a deliberate,
+   idempotent exclusion of only the programmable frame — never an implicit
+   clear of the resident message, the automatic frame, or the local body.
+4. Diff-only comparison is against the committed programmable frame, not the
+   composed resident text.
+5. The automatic Task Card behavior remains independent of the programmable
+   file projector.
+6. The shared resident core must preserve Telegram's result fields, call order,
+   slot commit timing, singleton/rotation behavior, and private compatibility
+   helpers. Telegram's journal tail, ID/high-water semantics, API classification,
+   state-file I/O, and provider transport must remain in `TelegramManager`.
+7. The shared core must not import Telegram or assume numeric chat/message ids;
+   provider authorization and exact route binding stay adapter responsibilities.
+8. This package's manual and governed docs remain explicitly packaged through
+   `pyproject.toml`.
+9. `TaskCardEventProjection.validate_display_expression` is the single
+   allowlist gate for `display_expression`: a non-list, empty, oversized,
+   non-string-element, or unknown-slot value is rejected wholesale (never
+   partially accepted) and the caller falls back to
+   `DEFAULT_DISPLAY_EXPRESSION`. `TelegramService` re-validates on every hot
+   reload and never lets an invalid `display_expression` reset `taskcard`,
+   `normal_rows`, `max_refreshes`, or `locale` to their own defaults.
+10. Every `TelegramService` persistence setter (`set_taskcard_enabled`,
+    `set_taskcard_normal_rows`, `set_taskcard_max_refreshes`,
+    `set_taskcard_locale`, `set_taskcard_display_expression`) calls
+    `_maybe_reload_taskcard_state()` under `self._taskcard_lock` before
+    deriving the sibling fields it persists, and `set_taskcard_enabled`
+    computes its `changed`/listener decision only after that reload. A setter
+    must never rewrite the file from a cache older than the file it is about
+    to overwrite; only genuinely concurrent writers overlapping at the same
+    instant remain last-writer-wins.
+11. Summary metrics reuse only existing producer data. Telegram must not add or
+    require a new kernel event/accounting path, may read at most
+    `_TASK_CARD_TOKEN_LEDGER_TAIL_BYTES` recent ledger bytes per correlation
+    attempt, and must expose only validated elapsed/input/output integers.
+12. Async Work rendering must use only the kernel's validated versioned Agent
+    Record child and must not read daemon or Shell stores directly or invent a
+    fallback count.
+13. Pending Shell wording may branch only on canonical tool/action names and the
+    literal nested `input.async` boolean. No other Shell input field enters the
+    projected row.
+14. Telegram Task Card transport must pass `parse_mode=HTML` on both send and
+    edit. The adapter escapes the whole shared automatic frame before adding its
+    exact static HTML lines, and escape-first renders only the composed
+    programmable suffix from Task Card Markdown to its closed supported HTML
+    subset. Raw authored HTML never enters Telegram as markup. Non-Telegram
+    consumers and the shared resident's stored programmable frame remain
+    unchanged.
+15. Automatic Task Card transport must remain diff-only on meaningful content.
+    Its stable fingerprint excludes only the renderer-owned wall-clock
+    `Last Updated` field (whether raw or wrapped in Telegram's exact static
+    presentation prefix) and the numeric seconds in the canonical active-session
+    field; lifecycle and every other row, footer, and metadata change remain
+    transport-visible. Renderer HTML or emoji decoration must never turn those
+    volatile-only ticks back into edits. This is rate-limit-critical behavior:
+    regressing it produces no-op Bot API writes on every projection poll and can
+    trigger Telegram `429 Too Many Requests` throttling.
+16. Telegram must not derive SESSION totals by summing its bounded event window,
+    scanning the token ledger, or reading Agent Session state directly. It may
+    only reduce versioned `llm_response` snapshots and legacy carriers already in
+    its bounded event tail through the shared pure projector. Restart rehydrate
+    applies the existing event window to SESSION events even when the recent tail
+    has no projectable activity rows; it must not retain or scan the full history
+    merely to recover an older visible row.
+
+## Tests
+
+- `tests/test_telegram_task_card_programmable.py` covers active projection,
+  screenshot-shaped Markdown rendering (headings/subheadings, bold, inline code,
+  and list items), raw HTML/special-character escaping, malformed-delimiter safe
+  fallback, unchanged HTML parse mode and raw slot bytes, diff-only updates,
+  exact-`inactive` frame exclusion (idempotent, resident/automatic/body
+  preserved), reactivation, and last-good preservation for missing/blank
+  producer state.
+- `tests/test_telegram_task_card_toggle.py` covers toggle suppression and the
+  hidden-finalize clear semantics.
+- `tests/test_telegram_task_card_event_tail.py` continues to cover the automatic
+  channel independently, including identical parenthesized reasoning-token
+  rendering from current-call carriers and `llm_response` fallbacks, authoritative
+  v1 SESSION updates (including the 93.8k-to-150.3k stale regression),
+  carrier-less invalidation, molt clearing, live/rehydrate parity, plus correlated
+  a-priori summary time/input/output rendering from existing events and a bounded
+  ledger tail with fail-closed legacy/malformed cases.
+- `tests/test_telegram_task_card_rows.py` proves strict common `async_work`
+  consumption, missing/malformed/stale omission, mixed-lane rendering, and
+  pending sync-versus-async Shell wording without raw-argument leakage.
+- `tests/test_task_card_event_projection_shared.py` pins shared-core safety and
+  byte compatibility with Telegram's established render surface.
+- `tests/test_task_card_resident_shared.py` pins provider-neutral route/slot,
+  old-first rotation, peer adoption, and partial-failure state transitions.
+- `tests/test_telegram_task_card_display_expression.py` covers the
+  `display_expression` grammar allowlist, approved footer-first default
+  rendering, a valid changed expression reordering/dropping slots end-to-end
+  through `TelegramManager`, hot JSON reload without a process restart,
+  malformed/unsafe-expression fallback that never corrupts sibling durable
+  settings, and (contract rule 10) that every persistence setter reloads
+  before persisting: an unrelated setter invoked with no preceding getter
+  after a valid atomic external replace preserves the external
+  `normal_rows`/`locale`/`display_expression`/`max_refreshes` siblings in both
+  the persisted file and the next manager projection tick.
+- `tests/test_mcp_skill_manuals.py` covers packaged docs for this subpackage.

@@ -8,14 +8,20 @@ which model/backend it is currently running. **No API keys, no env-var
 names, no secrets** must ever appear in either surface.
 """
 from __future__ import annotations
+from lingtai.tools.registry import INTRINSICS as _TEST_INTRINSICS
 
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
 from lingtai.agent import Agent
-from lingtai_kernel.base_agent import BaseAgent, _build_identity_section
-from lingtai_kernel.base_agent.identity import _build_manifest, _safe_llm_from_service
+from lingtai.kernel.base_agent import BaseAgent, _build_identity_section
+from lingtai.kernel.base_agent.identity import _build_manifest, _safe_llm_from_service, sanitize_endpoint
+from tests._workdir_lease_helpers import make_test_lease
+from tests._snapshot_helpers import make_test_snapshot_port, make_test_source_revision_port
+from tests._lifecycle_clock_helpers import make_test_lifecycle_clock
+from tests._notification_store_helpers import notification_store_for
+from tests._agent_presence_helpers import make_test_presence_store
 
 
 def _mock_service(
@@ -72,9 +78,12 @@ def _write_init(
 
 def test_kernel_manifest_includes_llm_from_service(tmp_path):
     agent = BaseAgent(
+        intrinsics=_TEST_INTRINSICS,
         service=_mock_service("anthropic", "claude-opus-4-7", "https://api.anthropic.com"),
         agent_name="alice",
         working_dir=tmp_path / "alice",
+        workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "alice"),
     )
     data = _build_manifest(agent)
     assert data["llm"] == {
@@ -87,9 +96,12 @@ def test_kernel_manifest_includes_llm_from_service(tmp_path):
 
 def test_kernel_manifest_omits_base_url_when_none(tmp_path):
     agent = BaseAgent(
+        intrinsics=_TEST_INTRINSICS,
         service=_mock_service("openai", "gpt-4.6", base_url=None),
         agent_name="bob",
         working_dir=tmp_path / "bob",
+        workdir_lease=make_test_lease(),
+        agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "bob"),
     )
     data = _build_manifest(agent)
     assert data["llm"] == {"provider": "openai", "model": "gpt-4.6"}
@@ -98,7 +110,7 @@ def test_kernel_manifest_omits_base_url_when_none(tmp_path):
 
 def test_kernel_manifest_drops_mock_attrs(tmp_path):
     svc = MagicMock()
-    agent = BaseAgent(service=svc, agent_name="ghost", working_dir=tmp_path / "ghost")
+    agent = BaseAgent(intrinsics=_TEST_INTRINSICS, service=svc, agent_name="ghost", working_dir=tmp_path / "ghost", workdir_lease=make_test_lease(), agent_presence=make_test_presence_store(), snapshot_port=make_test_snapshot_port(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "ghost"))
     data = _build_manifest(agent)
     if "llm" in data:
         for v in data["llm"].values():
@@ -114,6 +126,22 @@ def test_safe_llm_from_service_unit():
         "model": "m",
         "base_url": "https://example.test",
     }
+
+
+def test_sanitize_endpoint_removes_userinfo_query_and_fragment():
+    assert sanitize_endpoint("https://user:secret@example.test/v1?key=secret#frag") == "https://example.test/v1"
+
+
+def test_sanitize_endpoint_preserves_ipv6_and_port_without_secrets():
+    assert sanitize_endpoint("https://user:secret@[::1]:8443/v1?token=x#frag") == "https://[::1]:8443/v1"
+
+
+def test_sanitize_endpoint_rejects_malformed_port_with_credentials():
+    assert sanitize_endpoint("https://user:secret@example.test:not-a-port/v1") == ""
+
+
+def test_sanitize_endpoint_rejects_non_url_secret_like_input():
+    assert sanitize_endpoint("api_key=super-secret-value") == ""
 
 
 def test_safe_llm_from_service_uses_provider_default_base_url():
@@ -132,6 +160,24 @@ def test_safe_llm_from_service_uses_provider_default_base_url():
     assert out["base_url"] == "https://relay.example.test/v1"
     assert out["api_compat"] == "openai"
     assert out["context_limit"] == 123456
+
+
+def test_safe_llm_from_service_exposes_codex_responses_service_tier():
+    agent = MagicMock()
+    svc = _mock_service("codex-pool", "gpt-5.6-terra", None)
+    svc._provider_defaults = {"codex-pool": {"service_tier": "fast"}}
+    agent.service = svc
+
+    assert _safe_llm_from_service(agent)["service_tier"] == "fast"
+
+
+def test_safe_llm_from_service_labels_omitted_codex_service_tier_default():
+    agent = MagicMock()
+    svc = _mock_service("codex-pool", "gpt-5.6-terra", None)
+    svc._provider_defaults = {"codex-pool": {}}
+    agent.service = svc
+
+    assert _safe_llm_from_service(agent)["service_tier"] == "default"
 
 
 def test_safe_llm_from_service_with_no_service():
@@ -198,6 +244,23 @@ def test_identity_section_silent_when_preset_active_absent():
     assert "active preset" not in text
 
 
+def test_identity_section_renders_created_at_but_omits_started_at():
+    """`started_at` (session start) changes on every process restart,
+    including a plain refresh with no source/config change, and would
+    otherwise invalidate the cached system-prompt prefix. `created_at` is
+    stable across refreshes and must remain model-facing; `started_at` must
+    not be rendered at all, and no "woken" text should appear."""
+    text = _build_identity_section({
+        "agent_name": "alice",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "started_at": "2026-07-14T12:00:00+00:00",
+    })
+    assert "2026-01-01T00:00:00+00:00" in text
+    assert "born" in text
+    assert "2026-07-14T12:00:00+00:00" not in text
+    assert "woken" not in text
+
+
 def test_manifest_never_contains_api_key(tmp_path):
     workdir = tmp_path / "leaky"
     _write_init(
@@ -227,6 +290,71 @@ def test_manifest_never_contains_api_key(tmp_path):
     agent.stop(timeout=1.0)
 
 
+def test_nested_capability_secrets_are_absent_from_manifest_and_agent_json(tmp_path):
+    """Every supported container depth is redacted without losing runtime identity."""
+    service = object()
+    port = object()
+    class _HashableMapping(dict):
+        __hash__ = object.__hash__
+
+    sentinels = {
+        "api_key": "nested-api-key-sentinel",
+        "api_key_env": "NESTED_API_KEY_ENV_SENTINEL",
+        "api_secret": "nested-api-secret-sentinel",
+        "token": "nested-token-sentinel",
+        "password": "nested-password-sentinel",
+    }
+    sentinel_map = _HashableMapping(sentinels)
+    agent = Agent(
+        service=_mock_service(),
+        agent_name="nested-secrets",
+        working_dir=tmp_path / "nested-secrets",
+        capabilities={
+            "web": {
+                "search_service": service,
+                "browser_port": port,
+                "provider": "duckduckgo",
+                "model": "public-model",
+                "nested": {
+                    "provider": "public-provider",
+                    "model": "public-nested-model",
+                    **sentinels,
+                    "items": [sentinels, (sentinels,)],
+                },
+            }
+        },
+    )
+    # Exercise the serialization-boundary walk for set/frozenset containers as
+    # well; normal capability normalization intentionally copies JSON-like
+    # configuration and cannot represent a mapping as a set member.
+    agent._capabilities.append((
+        "nested-regression",
+        {"set_items": {sentinel_map}, "frozen_items": frozenset({sentinel_map})},
+    ))
+    try:
+        manifest = agent._build_manifest()
+        agent._workdir.write_manifest(manifest)
+        agent_json = json.loads((tmp_path / "nested-secrets" / ".agent.json").read_text())
+        for value in (manifest, agent_json):
+            blob = json.dumps(value)
+            for sentinel in sentinels.values():
+                assert sentinel not in blob
+            assert "public-provider" in blob
+            assert "public-nested-model" in blob
+            def keys(node):
+                if isinstance(node, dict):
+                    yield from node.keys()
+                    for child in node.values():
+                        yield from keys(child)
+                elif isinstance(node, list):
+                    for child in node:
+                        yield from keys(child)
+            assert not ({"api_key", "api_key_env", "api_secret", "token", "password"} & set(keys(value)))
+        assert agent._capability_managers["web"]._specs["duckduckgo"].service is service
+    finally:
+        agent.stop(timeout=1.0)
+
+
 def test_wrapper_manifest_includes_preset_from_init(tmp_path):
     workdir = tmp_path / "withpreset"
     active_path = "~/.lingtai-tui/presets/saved/codex-gpt5.5.json"
@@ -251,6 +379,7 @@ def test_wrapper_manifest_includes_preset_from_init(tmp_path):
         "provider": "codex",
         "model": "gpt-5.5",
         "base_url": "https://chatgpt.com/backend-api/codex",
+        "service_tier": "default",
     }
     agent.stop(timeout=1.0)
 

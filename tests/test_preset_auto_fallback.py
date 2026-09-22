@@ -1,14 +1,20 @@
 """Tests for auto-fallback to default preset on AED exhaustion."""
 import json
+from lingtai.tools.registry import INTRINSICS as _TEST_INTRINSICS
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from tests._workdir_lease_helpers import make_test_lease
+from tests._snapshot_helpers import make_test_snapshot_port, make_test_source_revision_port
+from tests._lifecycle_clock_helpers import make_test_lifecycle_clock
+from tests._notification_store_helpers import notification_store_for
+from tests._agent_presence_helpers import make_test_presence_store
 
 
 def _make_test_agent(tmp_path):
     """BaseAgent with init.json that has a non-default active preset."""
-    from lingtai_kernel.base_agent import BaseAgent
+    from lingtai.kernel.base_agent import BaseAgent
     svc = MagicMock()
     svc.get_adapter.return_value = MagicMock()
     svc.provider = "x"
@@ -31,11 +37,11 @@ def _make_test_agent(tmp_path):
             "molt_pressure": 0.8, "molt_prompt": "", "max_turns": 50,
             "admin": {}, "streaming": False,
         },
-        "principle": "p", "covenant": "c", "pad": "", "prompt": "",
+        "principle": "p", "covenant": "c", "pad": "", "lingtai": "",
         "soul": "",
     }
     (wd / "init.json").write_text(json.dumps(init))
-    return BaseAgent(service=svc, agent_name="alice", working_dir=wd)
+    return BaseAgent(intrinsics=_TEST_INTRINSICS, service=svc, agent_name="alice", working_dir=wd, workdir_lease=make_test_lease(), snapshot_port=make_test_snapshot_port(), agent_presence=make_test_presence_store(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(wd))
 
 
 def test_can_fallback_preset_true_when_active_differs_from_default(tmp_path):
@@ -55,7 +61,7 @@ def test_can_fallback_preset_false_when_active_equals_default(tmp_path):
 
 
 def test_can_fallback_preset_false_when_no_preset_block(tmp_path):
-    from lingtai_kernel.base_agent import BaseAgent
+    from lingtai.kernel.base_agent import BaseAgent
     svc = MagicMock()
     svc.get_adapter.return_value = MagicMock()
     svc.provider = "x"
@@ -70,10 +76,10 @@ def test_can_fallback_preset_false_when_no_preset_block(tmp_path):
             "molt_pressure": 0.8, "molt_prompt": "", "max_turns": 50,
             "admin": {}, "streaming": False,
         },
-        "principle": "p", "covenant": "c", "pad": "", "prompt": "", "soul": "",
+        "principle": "p", "covenant": "c", "pad": "", "lingtai": "", "soul": "",
     }
     (wd / "init.json").write_text(json.dumps(init))
-    agent = BaseAgent(service=svc, agent_name="alice", working_dir=wd)
+    agent = BaseAgent(intrinsics=_TEST_INTRINSICS, service=svc, agent_name="alice", working_dir=wd, workdir_lease=make_test_lease(), snapshot_port=make_test_snapshot_port(), agent_presence=make_test_presence_store(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(wd))
     assert agent._can_fallback_preset() is False
 
 

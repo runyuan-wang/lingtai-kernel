@@ -4,9 +4,15 @@ When swapping to a preset with a smaller context_limit than the agent's
 current context usage, the swap must be refused with a clear error
 message asking the agent to molt first."""
 import json
+from lingtai.tools.registry import INTRINSICS as _TEST_INTRINSICS
 from pathlib import Path
 
 import pytest
+from tests._workdir_lease_helpers import make_test_lease
+from tests._snapshot_helpers import make_test_snapshot_port, make_test_source_revision_port
+from tests._lifecycle_clock_helpers import make_test_lifecycle_clock
+from tests._notification_store_helpers import notification_store_for
+from tests._agent_presence_helpers import make_test_presence_store
 
 
 def _build_lib(plib: Path, *, big_limit=200000, small_limit=8000):
@@ -17,7 +23,7 @@ def _build_lib(plib: Path, *, big_limit=200000, small_limit=8000):
         "manifest": {
             "llm": {"provider": "p1", "model": "m1",
                     "api_key": None, "api_key_env": "P1KEY"},
-            "capabilities": {"file": {}},
+            "capabilities": {"shell": {}},
             "context_limit": big_limit,
         },
     }))
@@ -27,7 +33,7 @@ def _build_lib(plib: Path, *, big_limit=200000, small_limit=8000):
         "manifest": {
             "llm": {"provider": "p2", "model": "m2",
                     "api_key": None, "api_key_env": "P2KEY"},
-            "capabilities": {"file": {}},
+            "capabilities": {"shell": {}},
             "context_limit": small_limit,
         },
     }))
@@ -37,7 +43,7 @@ def _build_lib(plib: Path, *, big_limit=200000, small_limit=8000):
         "manifest": {
             "llm": {"provider": "p3", "model": "m3",
                     "api_key": None, "api_key_env": "P3KEY"},
-            "capabilities": {"file": {}},
+            "capabilities": {"shell": {}},
             # NB: no context_limit field
         },
     }))
@@ -47,6 +53,9 @@ def _build_workdir(wd: Path, plib: Path, active: str = "big"):
     wd.mkdir(parents=True, exist_ok=True)
     env = wd / ".env"
     env.write_text("P1KEY=sk-test\nP2KEY=sk-test\nP3KEY=sk-test\n")
+    allowed = [str(p) for p in sorted(plib.glob("*.json"))] if plib.is_dir() else []
+    if active not in allowed:
+        allowed.append(active)
     init = {
         "manifest": {
             "agent_name": "test", "language": "en",
@@ -54,6 +63,7 @@ def _build_workdir(wd: Path, plib: Path, active: str = "big"):
                 "path": str(plib),
                 "active": active,
                 "default": active,
+                "allowed": allowed,
             },
             "llm": {"provider": "PLACEHOLDER", "model": "PLACEHOLDER",
                     "api_key": None, "api_key_env": "PLACEHOLDER"},
@@ -63,7 +73,7 @@ def _build_workdir(wd: Path, plib: Path, active: str = "big"):
             "molt_pressure": 0.8, "molt_prompt": "", "max_turns": 50,
             "admin": {"karma": True}, "streaming": False,
         },
-        "principle": "p", "covenant": "c", "pad": "", "prompt": "",
+        "principle": "p", "covenant": "c", "pad": "", "lingtai": "",
         "soul": "",
         "env_file": str(env),
     }
@@ -72,7 +82,7 @@ def _build_workdir(wd: Path, plib: Path, active: str = "big"):
 
 def _make_test_agent(tmp_path):
     """BaseAgent with stubs for _activate_preset, _perform_refresh, and get_token_usage."""
-    from lingtai_kernel.base_agent import BaseAgent
+    from lingtai.kernel.base_agent import BaseAgent
     from unittest.mock import MagicMock
     svc = MagicMock()
     svc.get_adapter.return_value = MagicMock()
@@ -82,8 +92,30 @@ def _make_test_agent(tmp_path):
     _build_lib(plib)
     wd = tmp_path / "test"
     _build_workdir(wd, plib, active=str(plib / "big.json"))
-    agent = BaseAgent(service=svc, agent_name="test", working_dir=wd)
+    agent = BaseAgent(intrinsics=_TEST_INTRINSICS, service=svc, agent_name="test", working_dir=wd, workdir_lease=make_test_lease(), snapshot_port=make_test_snapshot_port(), agent_presence=make_test_presence_store(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(wd))
+    # This unit-test BaseAgent stands in for the concrete Agent composition root.
+    # Compose the same wrapper-level loader that production Agent installs; a bare
+    # BaseAgent intentionally fails loud under the MigrationWorkspace Contract.
+    from lingtai.agent import load_preset as composed_load_preset
+    agent._preset_loader = composed_load_preset
     return agent, plib
+
+
+def _allow_preset(agent, preset_path: Path) -> None:
+    """Append *preset_path* to init.json's manifest.preset.allowed.
+
+    Tests that add a preset file to the library after `_make_test_agent`
+    has already written `init.json` need this so the new file is
+    authorized under the fail-closed allowlist gate.
+    """
+    init_path = agent._working_dir / "init.json"
+    data = json.loads(init_path.read_text())
+    preset_block = data["manifest"]["preset"]
+    allowed = preset_block.setdefault("allowed", [])
+    entry = str(preset_path)
+    if entry not in allowed:
+        allowed.append(entry)
+    init_path.write_text(json.dumps(data))
 
 
 def test_swap_refused_when_current_context_exceeds_target_limit(tmp_path, monkeypatch):
@@ -112,7 +144,7 @@ def test_swap_refused_when_current_context_exceeds_target_limit(tmp_path, monkey
                         lambda evt, **kw: (log_events.append((evt, kw)), real_log(evt, **kw))[1])
 
     small_path = str(plib / "small.json")
-    result = agent._intrinsics["system"]({"action": "refresh", "preset": small_path})
+    result = agent._intrinsics["system"]({"action": "refresh", "input": {"preset": small_path}})
 
     assert result["status"] == "error"
     msg = result["message"].lower()
@@ -144,7 +176,7 @@ def test_swap_allowed_when_current_context_fits(tmp_path, monkeypatch):
                         lambda: perform_calls.append(True))
 
     small_path = str(plib / "small.json")
-    result = agent._intrinsics["system"]({"action": "refresh", "preset": small_path})
+    result = agent._intrinsics["system"]({"action": "refresh", "input": {"preset": small_path}})
 
     assert result["status"] == "ok"
     assert activate_calls == [small_path]
@@ -169,7 +201,7 @@ def test_swap_allowed_when_target_has_no_context_limit(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_perform_refresh", lambda: None)
 
     no_limit_path = str(plib / "no_limit.json")
-    result = agent._intrinsics["system"]({"action": "refresh", "preset": no_limit_path})
+    result = agent._intrinsics["system"]({"action": "refresh", "input": {"preset": no_limit_path}})
 
     assert result["status"] == "ok"
     assert activate_calls == [no_limit_path]
@@ -185,10 +217,11 @@ def test_swap_skips_guard_when_target_limit_is_zero(tmp_path, monkeypatch):
         "manifest": {
             "llm": {"provider": "p4", "model": "m4",
                     "api_key": None, "api_key_env": "P4KEY"},
-            "capabilities": {"file": {}},
+            "capabilities": {"shell": {}},
             "context_limit": 0,
         },
     }))
+    _allow_preset(agent, plib / "zero.json")
 
     monkeypatch.setattr(agent, "get_token_usage", lambda: {
         "ctx_total_tokens": 999999,
@@ -204,7 +237,7 @@ def test_swap_skips_guard_when_target_limit_is_zero(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_perform_refresh", lambda: None)
 
     zero_path = str(plib / "zero.json")
-    result = agent._intrinsics["system"]({"action": "refresh", "preset": zero_path})
+    result = agent._intrinsics["system"]({"action": "refresh", "input": {"preset": zero_path}})
     assert result["status"] == "ok"
     assert activate_calls == [zero_path]
 
@@ -218,10 +251,11 @@ def test_swap_skips_guard_when_target_limit_is_negative(tmp_path, monkeypatch):
         "manifest": {
             "llm": {"provider": "p5", "model": "m5",
                     "api_key": None, "api_key_env": "P5KEY"},
-            "capabilities": {"file": {}},
+            "capabilities": {"shell": {}},
             "context_limit": -1,
         },
     }))
+    _allow_preset(agent, plib / "negone.json")
 
     monkeypatch.setattr(agent, "get_token_usage", lambda: {
         "ctx_total_tokens": 999999,
@@ -237,7 +271,7 @@ def test_swap_skips_guard_when_target_limit_is_negative(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_perform_refresh", lambda: None)
 
     negone_path = str(plib / "negone.json")
-    result = agent._intrinsics["system"]({"action": "refresh", "preset": negone_path})
+    result = agent._intrinsics["system"]({"action": "refresh", "input": {"preset": negone_path}})
     assert result["status"] == "ok"
     assert activate_calls == [negone_path]
 
@@ -259,9 +293,10 @@ def test_guard_reads_context_limit_from_llm_block(tmp_path, monkeypatch):
             "llm": {"provider": "px", "model": "mx",
                     "api_key": None, "api_key_env": "PXKEY",
                     "context_limit": 8000},
-            "capabilities": {"file": {}},
+            "capabilities": {"shell": {}},
         },
     }))
+    _allow_preset(agent, plib / "tight.json")
 
     # Current usage exceeds the 8000 cap → swap should be refused.
     monkeypatch.setattr(agent, "get_token_usage", lambda: {
@@ -278,7 +313,7 @@ def test_guard_reads_context_limit_from_llm_block(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_perform_refresh", lambda: None)
 
     tight_path = str(plib / "tight.json")
-    result = agent._intrinsics["system"]({"action": "refresh", "preset": tight_path})
+    result = agent._intrinsics["system"]({"action": "refresh", "input": {"preset": tight_path}})
 
     assert result["status"] == "error"
     assert "molt" in result["message"].lower()
@@ -303,6 +338,7 @@ def test_revert_refused_when_current_context_exceeds_default_limit(tmp_path, mon
         "active": str(plib / "big.json"),
         "default": str(plib / "small.json"),
         "path": str(plib),
+        "allowed": [str(plib / "big.json"), str(plib / "small.json")],
     }
     init_path.write_text(json.dumps(data))
 
@@ -327,7 +363,7 @@ def test_revert_refused_when_current_context_exceeds_default_limit(tmp_path, mon
     monkeypatch.setattr(agent, "_log",
                         lambda evt, **kw: (log_events.append((evt, kw)), real_log(evt, **kw))[1])
 
-    result = agent._intrinsics["system"]({"action": "refresh", "revert_preset": True})
+    result = agent._intrinsics["system"]({"action": "refresh", "input": {"revert_preset": True}})
 
     assert result["status"] == "error"
     msg = result["message"].lower()
@@ -350,7 +386,7 @@ def test_swap_to_unknown_preset_still_returns_not_found(tmp_path, monkeypatch):
     })
 
     ghost_path = str(plib / "ghost.json")
-    result = agent._intrinsics["system"]({"action": "refresh", "preset": ghost_path})
+    result = agent._intrinsics["system"]({"action": "refresh", "input": {"preset": ghost_path}})
 
     assert result["status"] == "error"
     assert "ghost" in result["message"]

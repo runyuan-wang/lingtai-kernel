@@ -1,0 +1,85 @@
+---
+name: daemon-backend-qwen-code
+description: >
+  Nested daemon-cli-backends reference for the Qwen Code (`qwen-code` /
+  `qwen`) daemon backend's flag surface. Read this only when a daemon task
+  needs Qwen-specific CLI flags (model selection, provider tunables): it
+  routes you to the installed CLI's live help via shell and shows how to
+  translate that help into the generic `backend_options` mechanism. It is
+  not a flag catalog.
+version: 0.3.0
+last_changed_at: 2026-08-07T00:00:00Z
+related_files:
+- src/lingtai/tools/daemon/manual/reference/cli-backends/SKILL.md
+maintenance: |
+  Tracks the Qwen Code daemon backend flag-discovery topic it documents; update when that integration changes.
+---
+
+# Qwen Code Daemon Backend — Flag Discovery Entrypoint
+
+The installed CLI's own help is the authority for Qwen Code (npm package
+`@qwen-code/qwen-code`, binary `qwen`) flags; this page is only the entrypoint.
+Conversion rules, key safety, and persistence live in the parent
+[`reference/cli-backends/SKILL.md`](../../../SKILL.md). The alias `qwen`
+canonicalizes to the `qwen-code` backend id.
+
+## Discover flags from the installed CLI
+
+1. Run, in bash: `qwen --version` and `qwen --help`. The daemon backend wraps
+   the top-level `qwen` binary directly — it spawns
+   `qwen --yolo <backend_argv...> -p <prompt>`, no subcommand — so
+   `qwen --help` is the whole relevant flag surface. These are local
+   read-only commands; no session is started.
+2. Translate what you found into `backend_options` with the parent's generic
+   conversion rules. Nothing Qwen-specific is added to that contract here.
+   Verify the installed `qwen --help` before passing `backend_options`;
+   do not confuse provider setup with shell execution.
+
+## Example: model selection via the generic route
+
+Your options land between the harness-owned `--yolo` and the final
+`-p <prompt>` (argv placement is pinned by
+`tests/test_daemon_backend_options.py::test_qwen_code_cmd_appends_backend_argv_before_prompt`):
+
+```jsonc
+{
+  "backend": "qwen",
+  "tasks": [{
+    "task": "Implement and validate the change.",
+    "tools": [],
+    "backend_options": {
+      "model": "qwen3-coder-plus"
+    }
+  }]
+}
+// argv: qwen --yolo --model qwen3-coder-plus -p <prompt>
+```
+
+The model vocabulary belongs to the installed CLI and the configured provider —
+LingTai does not validate, enumerate, or simulate model names.
+
+## Subscription & auth
+
+Authenticates via the installed CLI's provider config (Qwen/DashScope keys);
+LingTai does not set or rotate credentials.
+
+Official docs: https://github.com/QwenLM/qwen-code
+
+## Harness boundary
+
+Qwen Code reserves `--prompt`/`-p`, `--yolo`/`-y`, and `--approval-mode`:
+they drive LingTai's non-interactive headless harness, and passing any of
+them in `backend_options` refuses the whole batch before spawn. Beyond that,
+do not re-point harness-owned surfaces: the daemon writes a per-run
+`<run>/qwen-daemon-settings.json` (carrying `mcpServers.daemon_common` plus
+parent stdio MCP registrations) and injects it via the
+`QWEN_CODE_SYSTEM_SETTINGS_PATH` environment variable — overriding settings
+paths silently breaks completion enforcement.
+
+Plan flags at emanate time: `daemon(action='ask', input={'id': ..., 'message': ...})` is intentionally
+unsupported for this backend (no stable headless resume contract), so there
+is no later chance to adjust a running session. Output parsing is verbatim
+text — Qwen Code headless mode has no machine-readable event stream here, so
+stdout/stderr are recorded as-is and the result is the final stdout text;
+the `daemon_common` `finish(status="done")` call is still required for
+success.

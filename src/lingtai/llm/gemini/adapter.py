@@ -13,19 +13,21 @@ from typing import Any
 from google import genai
 from google.genai import errors as genai_errors, types
 
-from lingtai_kernel.logging import get_logger
+from lingtai.kernel.logging import get_logger
 
-from lingtai_kernel.llm.base import (
+from lingtai.kernel.llm.base import (
     ChatSession,
     FunctionSchema,
     LLMResponse,
     ToolCall,
     UsageMetadata,
+    wire_tool_description,
 )
-from lingtai_kernel.llm.interface import ToolResultBlock
+from lingtai.kernel.llm.interface import ToolResultBlock
 from lingtai.llm.base import LLMAdapter
-from lingtai_kernel.llm.interface import ChatInterface
-from lingtai_kernel.llm.streaming import StreamingAccumulator
+from lingtai.kernel.llm.interface import ChatInterface
+from lingtai.kernel.llm.streaming import StreamingAccumulator
+from lingtai.llm.identity_headers import merge_lingtai_identity_headers
 
 logger = get_logger()
 
@@ -38,13 +40,20 @@ logger = get_logger()
 def _build_function_declarations(
     tools: list[FunctionSchema] | None,
 ) -> list[types.FunctionDeclaration] | None:
-    """Convert our FunctionSchema list to Gemini FunctionDeclaration list."""
+    """Convert our FunctionSchema list to Gemini FunctionDeclaration list.
+
+    The wire description comes from ``wire_tool_description``: the constant
+    ``WIRE_TOOL_DESCRIPTION`` pointer while the resident ``## tools`` section is
+    opted in via ``LINGTAI_TOOL_PROSE_SECTION_ENABLED``, otherwise the full
+    ``FunctionSchema.description`` prose (that section is not rendered by
+    default, so the wire is where the prose lives).
+    """
     if not tools:
         return None
     return [
         types.FunctionDeclaration(
             name=t.name,
-            description=t.description,
+            description=wire_tool_description(t.description),
             parameters=t.parameters,
         )
         for t in tools
@@ -204,14 +213,21 @@ def _sanitize_parameters_for_interactions(params: dict) -> dict:
 def _build_interactions_tools(
     tools: list[FunctionSchema] | None,
 ) -> list[dict] | None:
-    """Convert FunctionSchema list to Interactions API tool dicts."""
+    """Convert FunctionSchema list to Interactions API tool dicts.
+
+    The wire description comes from ``wire_tool_description``: the constant
+    ``WIRE_TOOL_DESCRIPTION`` pointer while the resident ``## tools`` section is
+    opted in via ``LINGTAI_TOOL_PROSE_SECTION_ENABLED``, otherwise the full
+    ``FunctionSchema.description`` prose (that section is not rendered by
+    default, so the wire is where the prose lives).
+    """
     if not tools:
         return None
     return [
         {
             "type": "function",
             "name": t.name,
-            "description": t.description,
+            "description": wire_tool_description(t.description),
             "parameters": _sanitize_parameters_for_interactions(t.parameters),
         }
         for t in tools
@@ -269,74 +285,6 @@ def _parse_interaction_response(interaction) -> LLMResponse:
         thoughts=thoughts,
         raw=interaction,
     )
-
-
-def _convert_history_to_turns(history: list[dict]) -> list[dict]:
-    """Convert Chat API history dicts to Interactions API TurnParam format.
-
-    Chat API history is a list of dicts with "role" and "parts" keys.
-    Interactions API wants TurnParam dicts with "role" and "content" keys,
-    where content is a list of ContentParam dicts.
-
-    Also handles client_history format (already in TurnParam format with
-    "role" and "content" keys) — passes through directly.
-    """
-    turns: list[dict] = []
-    for entry in history:
-        # Check if already in TurnParam format (client_history from get_client_history)
-        if "content" in entry:
-            # Already in TurnParam format - pass through directly
-            turns.append(
-                {"role": entry.get("role", "user"), "content": entry["content"]}
-            )
-            continue
-
-        role = entry.get("role", "user")
-        parts = entry.get("parts", [])
-        content_blocks: list[dict] = []
-
-        for part in parts:
-            if isinstance(part, str):
-                content_blocks.append({"type": "text", "text": part})
-            elif isinstance(part, dict):
-                if "text" in part and not part.get("thought"):
-                    content_blocks.append({"type": "text", "text": part["text"]})
-                elif part.get("thought") and "text" in part:
-                    # Thought blocks — include signature for proper chaining
-                    thought_block: dict[str, Any] = {"type": "thought"}
-                    if part.get("text"):
-                        thought_block["summary"] = [
-                            {"type": "text", "text": part["text"]}
-                        ]
-                    content_blocks.append(thought_block)
-                elif "function_call" in part:
-                    fc = part["function_call"]
-                    content_blocks.append(
-                        {
-                            "type": "function_call",
-                            "id": fc.get("id", fc.get("name", "")),
-                            "name": fc["name"],
-                            "arguments": fc.get("args", {}),
-                        }
-                    )
-                elif "function_response" in part:
-                    fr = part["function_response"]
-                    resp = fr.get("response", {})
-                    content_blocks.append(
-                        {
-                            "type": "function_result",
-                            "call_id": fr.get("id", fr.get("name", "")),
-                            "result": json.dumps(resp)
-                            if not isinstance(resp, str)
-                            else resp,
-                            "name": fr.get("name", ""),
-                        }
-                    )
-
-        if content_blocks:
-            turns.append({"role": role, "content": content_blocks})
-
-    return turns
 
 
 class InteractionsChatSession(ChatSession):
@@ -645,6 +593,13 @@ class InteractionsChatSession(ChatSession):
         - str → wrapped as ``[{"type": "text", "text": ...}]``
         - list of ToolResultBlock → converted to FunctionResultContentParam dicts
         - list of FunctionResultContentParam dicts → passed as-is
+
+        Tool results here are the current turn's batch and are converted
+        directly. Full-history replay (the ``seed_turns`` resume path)
+        serializes via ``interface_converters.to_gemini``; that shared
+        converter preserves every historical holder's content and does not
+        strip timely-transient ``_meta`` keys. Only the newest emitted holder
+        per family represents current state.
         """
         if isinstance(message, str):
             return [{"type": "text", "text": message}]
@@ -687,10 +642,14 @@ class GeminiAdapter(LLMAdapter):
     """Adapter that wraps all ``google-genai`` SDK calls."""
 
     def __init__(self, api_key: str, timeout_ms: int = 300_000, max_rpm: int = 0,
-                 default_model: str = "gemini-3-flash-preview"):
+                 default_model: str = "gemini-3-flash-preview",
+                 default_headers: dict | None = None):
         self._client = genai.Client(
             api_key=api_key,
             http_options=types.HttpOptions(
+                # google-genai appends its own lowercase user-agent internally;
+                # use explicit LingTai X-headers here to avoid duplicate UA keys.
+                headers=merge_lingtai_identity_headers(default_headers, user_agent=False),
                 timeout=timeout_ms,
                 retry_options=types.HttpRetryOptions(),
             ),

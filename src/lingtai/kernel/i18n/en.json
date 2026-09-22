@@ -1,0 +1,8 @@
+{
+  "system.current_time": "[Current time: {time} | context: {ctx}]",
+  "system.context_breakdown": "{pct} (sys {sys} + ctx {ctx})",
+  "system.context_unknown": "unavailable",
+  "system.mail_bounce": "[system] Mail delivery failed: {error}\n  To: {address}\n  Subject: {subject}",
+  "system.stuck_revive": "[system] LLM call failed at {ts}. Last error: {err_desc}. Retrying.",
+  "system.refresh_successful": "[system] Refresh successful. Tools and configuration reloaded. You may continue."
+}

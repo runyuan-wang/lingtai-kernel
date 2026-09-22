@@ -16,7 +16,7 @@ def _make_workdir_and_lib(tmp_path: Path) -> tuple[Path, Path]:
         "manifest": {
             "llm": {"provider": "deepseek", "model": "deepseek-v4-flash",
                     "api_key": None, "api_key_env": "DEEPSEEK_API_KEY"},
-            "capabilities": {"file": {}, "web_search": {"provider": "duckduckgo"}},
+            "capabilities": {"shell": {}, "web_search": {"provider": "duckduckgo"}},
         },
     }))
     (plib / "minimax.json").write_text(json.dumps({
@@ -25,7 +25,7 @@ def _make_workdir_and_lib(tmp_path: Path) -> tuple[Path, Path]:
         "manifest": {
             "llm": {"provider": "minimax", "model": "MiniMax-M2.7-highspeed",
                     "api_key": None, "api_key_env": "MINIMAX_API_KEY"},
-            "capabilities": {"file": {}, "vision": {"provider": "minimax",
+            "capabilities": {"shell": {}, "vision": {"provider": "minimax",
                                                     "api_key_env": "MINIMAX_API_KEY"}},
         },
     }))
@@ -43,7 +43,7 @@ def _make_workdir_and_lib(tmp_path: Path) -> tuple[Path, Path]:
             },
             "llm": {"provider": "deepseek", "model": "deepseek-v4-flash",
                     "api_key": None, "api_key_env": "DEEPSEEK_API_KEY"},
-            "capabilities": {"file": {}, "web_search": {"provider": "duckduckgo"}},
+            "capabilities": {"shell": {}, "web_search": {"provider": "duckduckgo"}},
             "soul": {"delay": 120},
             "stamina": 3600,
             "molt_pressure": 0.8,
@@ -52,7 +52,7 @@ def _make_workdir_and_lib(tmp_path: Path) -> tuple[Path, Path]:
             "admin": {"karma": True},
             "streaming": False,
         },
-        "principle": "p", "covenant": "c", "pad": "", "prompt": "",
+        "principle": "p", "covenant": "c", "pad": "", "lingtai": "",
         "soul": "",
     }
     (wd / "init.json").write_text(json.dumps(init))
@@ -88,7 +88,7 @@ def test_activate_preset_substitutes_llm_and_capabilities(tmp_path):
 
 
 def test_activate_preset_preserves_other_manifest_fields(tmp_path):
-    """admin, soul, stamina, agent_name, etc. survive the swap."""
+    """admin, agent_name, and the inert legacy soul block survive; legacy stamina is removed."""
     wd, plib = _make_workdir_and_lib(tmp_path)
     a = _make_probe_agent(wd)
     a._activate_preset(str(plib / "minimax.json"))
@@ -98,7 +98,22 @@ def test_activate_preset_preserves_other_manifest_fields(tmp_path):
     assert m["agent_name"] == "alice"
     assert m["admin"]["karma"] is True
     assert m["soul"]["delay"] == 120
-    assert m["stamina"] == 3600
+    assert "stamina" not in m
+
+
+def test_activate_preset_does_not_handoff_preset_context_limit(tmp_path):
+    wd, plib = _make_workdir_and_lib(tmp_path)
+    preset_path = plib / "minimax.json"
+    preset = json.loads(preset_path.read_text())
+    preset["manifest"]["llm"]["context_limit"] = 16_384
+    preset_path.write_text(json.dumps(preset))
+
+    a = _make_probe_agent(wd)
+    a._activate_preset(str(preset_path))
+
+    manifest = json.loads((wd / "init.json").read_text())["manifest"]
+    assert "context_limit" not in manifest
+    assert "context_limit" not in manifest["llm"]
 
 
 def test_activate_preset_unknown_raises_key_error(tmp_path):
@@ -148,7 +163,7 @@ def test_activate_preset_uses_default_path_when_unset(tmp_path, monkeypatch):
         "manifest": {
             "llm": {"provider": "minimax", "model": "x",
                     "api_key": None, "api_key_env": "MINIMAX_API_KEY"},
-            "capabilities": {"file": {}},
+            "capabilities": {"shell": {}},
         },
     }))
 
@@ -168,7 +183,7 @@ def test_activate_preset_uses_default_path_when_unset(tmp_path, monkeypatch):
             "soul": {"delay": 120}, "stamina": 3600, "molt_pressure": 0.8,
             "molt_prompt": "", "max_turns": 50, "admin": {}, "streaming": False,
         },
-        "principle": "p", "covenant": "c", "pad": "", "prompt": "", "soul": "",
+        "principle": "p", "covenant": "c", "pad": "", "lingtai": "", "soul": "",
     }
     (wd / "init.json").write_text(json.dumps(init))
     a = _make_probe_agent(wd)

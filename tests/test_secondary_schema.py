@@ -1,26 +1,26 @@
-"""Tests for secondary nested tool-call schema injection."""
+"""Tests that the removed secondary channel is absent from tool schemas."""
 from __future__ import annotations
+from lingtai.tools.registry import INTRINSICS as _TEST_INTRINSICS
 
 from unittest.mock import MagicMock
 
-from lingtai_kernel.base_agent import BaseAgent
-from lingtai_kernel.intrinsics import ALL_INTRINSICS
+from lingtai.kernel.base_agent import BaseAgent
+from tests._service_helpers import make_gemini_mock_service as make_mock_service
+from tests._workdir_lease_helpers import make_test_lease
+from tests._snapshot_helpers import make_test_snapshot_port, make_test_source_revision_port
+from tests._lifecycle_clock_helpers import make_test_lifecycle_clock
+from tests._notification_store_helpers import notification_store_for
+from tests._agent_presence_helpers import make_test_presence_store
 
 
-def make_mock_service():
-    svc = MagicMock()
-    svc.get_adapter.return_value = MagicMock()
-    svc.provider = "gemini"
-    svc.model = "gemini-test"
-    return svc
 
 
 def _schema_by_name(agent: BaseAgent) -> dict[str, dict]:
     return {schema.name: schema.parameters for schema in agent._build_tool_schemas()}
 
 
-def test_secondary_schema_injected_into_eligible_dynamic_tool(tmp_path):
-    agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
+def test_secondary_schema_not_injected_into_dynamic_or_intrinsic_tools(tmp_path):
+    agent = BaseAgent(intrinsics=_TEST_INTRINSICS, service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test", workdir_lease=make_test_lease(), snapshot_port=make_test_snapshot_port(), agent_presence=make_test_presence_store(), lifecycle_clock=make_test_lifecycle_clock(), source_revision_port=make_test_source_revision_port(), notification_store=notification_store_for(tmp_path / "test"))
     agent.add_tool(
         "long_work",
         schema={"type": "object", "properties": {"path": {"type": "string"}}},
@@ -30,59 +30,9 @@ def test_secondary_schema_injected_into_eligible_dynamic_tool(tmp_path):
 
     schemas = _schema_by_name(agent)
 
-    secondary = schemas["long_work"]["properties"]["secondary"]
-    assert secondary["properties"]["tool"]["enum"] == ["email", "feishu", "telegram", "wechat", "whatsapp"]
-    assert "timely human replies" in secondary["description"]
-    assert "Do not use for routine short calls" in secondary["description"]
-    assert "action=read" in secondary["description"]
-    assert secondary["properties"]["args"]["required"] == ["action"]
-    assert secondary["properties"]["args"]["properties"]["action"]["enum"] == [
-        "send", "reply", "read",
-    ]
-    assert "chat_id" in secondary["properties"]["args"]["properties"]
-    assert "text" in secondary["properties"]["args"]["properties"]
-    assert "limit" in secondary["properties"]["args"]["properties"]
-    assert "telegram.send needs chat_id+text" in secondary["properties"]["args"]["description"]
-    assert "telegram.read needs chat_id" in secondary["properties"]["args"]["description"]
+    for schema in schemas.values():
+        props = schema.get("properties", {})
+        assert "secondary" not in props
     assert "reasoning" in schemas["long_work"]["properties"]
-    agent.stop(timeout=1.0)
-
-
-def test_secondary_schema_not_injected_into_communication_tools_and_lifecycle_intrinsics(tmp_path):
-    agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
-    for name in ["telegram", "wechat", "feishu", "whatsapp", "imap"]:
-        agent.add_tool(
-            name,
-            schema={"type": "object", "properties": {"action": {"type": "string"}}},
-            handler=lambda args: {"status": "ok"},
-            description=name,
-        )
-
-    schemas = _schema_by_name(agent)
-
-    for name in ["telegram", "wechat", "feishu", "whatsapp", "imap", "system", "psyche", "soul", "email"]:
-        assert name in schemas
-        assert "secondary" not in schemas[name].get("properties", {})
-    agent.stop(timeout=1.0)
-
-
-def test_secondary_schema_injected_into_eligible_intrinsic(tmp_path, monkeypatch):
-    class FakeIntrinsicModule:
-        @staticmethod
-        def get_schema(lang):
-            return {"type": "object", "properties": {"path": {"type": "string"}}}
-
-        @staticmethod
-        def get_description(lang):
-            return "fake intrinsic"
-
-    agent = BaseAgent(service=make_mock_service(), agent_name="test", working_dir=tmp_path / "test")
-    agent._intrinsics = [*agent._intrinsics, "fake_intrinsic"]
-    monkeypatch.setitem(ALL_INTRINSICS, "fake_intrinsic", {"module": FakeIntrinsicModule})
-
-    schemas = _schema_by_name(agent)
-
-    assert "fake_intrinsic" in schemas
-    assert "secondary" in schemas["fake_intrinsic"]["properties"]
-    assert "reasoning" in schemas["fake_intrinsic"]["properties"]
+    assert "reasoning" in schemas["email"]["properties"]
     agent.stop(timeout=1.0)

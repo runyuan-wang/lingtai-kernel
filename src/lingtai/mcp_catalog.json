@@ -1,5 +1,5 @@
 {
-  "_comment": "LingTai curated MCP catalog. Each entry is a registry record template that the `mcp` capability decompresses into the agent's mcp_registry.jsonl when the addon name appears in init.json's `addons` list. The `homepage` field points at the canonical setup docs (typically a GitHub README) — agents fetch it via web_read or curl when they need install/config instructions. See core/mcp/manual/SKILL.md for the schema.",
+  "_comment": "LingTai curated MCP catalog. Each entry is a registry record template that the `mcp` capability decompresses into the agent's mcp_registry.jsonl when the addon name appears in init.json's `addons` list. The `homepage` field points at the canonical setup docs (typically a GitHub README) — agents fetch it via web_read or curl when they need install/config instructions. See tools/mcp/skills/mcp-manual/SKILL.md for the schema.",
   "imap": {
     "name": "imap",
     "summary": "Real email via IMAP/SMTP — multi-account support.",
@@ -7,7 +7,7 @@
     "command": "{python}",
     "args": [
       "-m",
-      "lingtai_imap"
+      "lingtai.mcp_servers.imap"
     ],
     "source": "lingtai-curated",
     "homepage": "https://github.com/Lingtai-AI/lingtai-imap"
@@ -19,7 +19,7 @@
     "command": "{python}",
     "args": [
       "-m",
-      "lingtai_telegram"
+      "lingtai.mcp_servers.telegram"
     ],
     "source": "lingtai-curated",
     "homepage": "https://github.com/Lingtai-AI/lingtai-telegram"
@@ -31,7 +31,7 @@
     "command": "{python}",
     "args": [
       "-m",
-      "lingtai_feishu"
+      "lingtai.mcp_servers.feishu"
     ],
     "source": "lingtai-curated",
     "homepage": "https://github.com/Lingtai-AI/lingtai-feishu"
@@ -43,21 +43,33 @@
     "command": "{python}",
     "args": [
       "-m",
-      "lingtai_wechat"
+      "lingtai.mcp_servers.wechat"
     ],
     "source": "lingtai-curated",
     "homepage": "https://github.com/Lingtai-AI/lingtai-wechat"
   },
   "whatsapp": {
     "name": "whatsapp",
-    "summary": "WhatsApp Cloud API client — official Meta API send/receive with LICC inbox callback.",
+    "summary": "Personal-account WhatsApp Web client via a local whatsapp-web.js bridge with LICC inbox delivery.",
     "transport": "stdio",
     "command": "{python}",
     "args": [
       "-m",
-      "lingtai_whatsapp"
+      "lingtai.mcp_servers.whatsapp"
     ],
     "source": "lingtai-curated",
     "homepage": "https://github.com/Lingtai-AI/lingtai-whatsapp"
+  },
+  "cloud_mail": {
+    "name": "cloud_mail",
+    "summary": "Cloud Mail REST email client — Cloudflare Workers Cloud Mail polling with LICC inbox callback.",
+    "transport": "stdio",
+    "command": "{python}",
+    "args": [
+      "-m",
+      "lingtai.mcp_servers.cloud_mail"
+    ],
+    "source": "lingtai-curated",
+    "homepage": "https://github.com/maillab/cloud-mail"
   }
 }

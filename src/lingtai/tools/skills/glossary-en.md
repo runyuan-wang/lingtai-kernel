@@ -1,0 +1,15 @@
+---
+kind: tool-glossary
+schema_version: 1
+tool_package: lingtai.tools.skills
+language: en
+related_files:
+- docs.yaml
+- src/lingtai/kernel/tool_glossary.py
+- src/lingtai/tools/glossary_validator.py
+- src/lingtai/tools/skills/glossary-zh.md
+- src/lingtai/tools/skills/glossary-wen.md
+maintenance: |
+  English glossary for the `skills` tool package (lingtai.tools.skills); the English body must stay empty per tool_glossary.py's language contract — update only the identity/schema fields here, and update the zh/wen bodies in lockstep when the Skills capability's private lifecycle ownership or its routing through `psyche(action='skills')` changes. Skills registers no public tool root.
+  Body policy: maintain only a minimal term mapping plus at most one or two sentences of naming rationale; do not translate or duplicate the tool schema, parameters, action behavior, manual, contract, or anatomy.
+---

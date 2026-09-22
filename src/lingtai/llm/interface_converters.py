@@ -7,10 +7,13 @@ Naming convention:
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
+import math
 from typing import Any
 
-from lingtai_kernel.llm.interface import (
+from lingtai.kernel.llm.interface import (
     ContentBlock,
     ChatInterface,
     TextBlock,
@@ -18,6 +21,265 @@ from lingtai_kernel.llm.interface import (
     ToolCallBlock,
     ToolResultBlock,
 )
+
+
+_RESPONSES_OUTPUT_ITEMS_KEY = "openai_responses_output_items"
+_RESPONSES_REPLAY_FINGERPRINT_KEY = "openai_responses_replay_fingerprint"
+
+
+def _responses_replay_fingerprint(content: list[ContentBlock]) -> str:
+    """Fingerprint visible canonical blocks that validate raw Responses replay.
+
+    Provider metadata is intentionally excluded: changing a summary, message,
+    or tool call in canonical history must invalidate the raw provider snapshot,
+    while an opaque provider field must not become part of the validity token.
+    """
+    blocks: list[dict[str, Any]] = []
+    for block in content:
+        if isinstance(block, TextBlock):
+            blocks.append({"type": "text", "text": block.text})
+        elif isinstance(block, ThinkingBlock):
+            blocks.append({"type": "thinking", "text": block.text})
+        elif isinstance(block, ToolCallBlock):
+            blocks.append({
+                "type": "tool_call",
+                "id": block.id,
+                "name": block.name,
+                "args": block.args,
+            })
+        elif isinstance(block, ToolResultBlock):
+            blocks.append({
+                "type": "tool_result",
+                "id": block.id,
+                "name": block.name,
+                "content": block.content,
+            })
+        else:  # pragma: no cover - ContentBlock is a closed union today.
+            blocks.append({"type": type(block).__name__, "value": repr(block)})
+    try:
+        encoded = json.dumps(
+            blocks,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        # Canonical blocks are normally JSON-shaped.  A malformed/manual block
+        # still needs a stable validity token, but it must never be serialized
+        # as a provider snapshot or invented with ``default=str``.
+        encoded = repr(blocks)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _responses_snapshot_is_json(value: Any) -> bool:
+    """Accept only values that can exist in a JSON Responses snapshot."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_responses_snapshot_is_json(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, str) and _responses_snapshot_is_json(item)
+            for key, item in value.items()
+        )
+    return False
+
+
+def _responses_snapshot_ids_are_unique(items: list[dict]) -> bool:
+    """Reject duplicate stable IDs in a persisted output-item snapshot."""
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        for field_name in ("id", "call_id"):
+            value = item.get(field_name)
+            if not isinstance(value, str) or not value:
+                continue
+            identity = (field_name, value)
+            if identity in seen:
+                return False
+            seen.add(identity)
+    return True
+
+
+def _contains_redacted_value(value: Any) -> bool:
+    """Reject redacted opaque values from raw upstream replay."""
+    if isinstance(value, str):
+        return value.startswith("<REDACTED:") and value.endswith(">")
+    if isinstance(value, dict):
+        return any(_contains_redacted_value(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_redacted_value(v) for v in value)
+    return False
+
+
+def _responses_replay_items_for_entry(entry: Any) -> list[dict] | None:
+    """Return a valid immutable-copy raw output snapshot for one entry.
+
+    Missing metadata, a changed canonical entry, or redacted provider data all
+    deliberately fall back to the normal lossy projection for compatibility
+    with old/manual histories. The returned list is always a deep copy so a
+    provider SDK cannot mutate canonical history during conversion.
+    """
+    provider_data = getattr(entry, "provider_data", None)
+    if not isinstance(provider_data, dict):
+        return None
+    items = provider_data.get(_RESPONSES_OUTPUT_ITEMS_KEY)
+    fingerprint = provider_data.get(_RESPONSES_REPLAY_FINGERPRINT_KEY)
+    if not isinstance(items, list) or not isinstance(fingerprint, str):
+        return None
+    if fingerprint != _responses_replay_fingerprint(getattr(entry, "content", [])):
+        return None
+    try:
+        if _contains_redacted_value(items):
+            return None
+        if not _responses_snapshot_is_json(items):
+            return None
+        if not all(isinstance(item, dict) for item in items):
+            return None
+        if not _responses_snapshot_ids_are_unique(items):
+            return None
+        return copy.deepcopy(items)
+    except Exception:
+        # Malformed/cyclic manually-created metadata is an invalid snapshot.
+        return None
+
+
+_RUNTIME_ROOTS = frozenset({"tool_meta", "agent_meta"})
+_HISTORICAL_ROOTS = frozenset({
+    "tool_meta", "agent_meta", "notifications", "notification_persistent",
+    "guidance", "notification_guidance",
+})
+
+
+def _normalize_runtime_envelope(raw: Any) -> dict | None:
+    """Normalize runtime ownership without classifying business ``_meta``."""
+    if not isinstance(raw, dict) or not set(raw).intersection(_HISTORICAL_ROOTS):
+        return None
+    tool_meta = copy.deepcopy(raw.get("tool_meta")) if isinstance(raw.get("tool_meta"), dict) else {}
+    old_agent = raw.get("agent_meta")
+    agent = copy.deepcopy(old_agent) if isinstance(old_agent, dict) else {}
+    has_agent_axis = bool(agent) or any(k in raw for k in (
+        "agent_meta", "notifications", "notification_persistent", "guidance", "notification_guidance"
+    ))
+    agent_state = agent.get("agent_state")
+    if not isinstance(agent_state, dict):
+        agent_state = {}
+    # Historical kernel envelopes put state in tool_meta and/or directly in
+    # agent_meta. Move ownership only in the projected copy; canonical history
+    # remains byte/value-equivalent.
+    for key in ("current_time", "token_usage", "context"):
+        if key in tool_meta:
+            agent_state.setdefault(key, copy.deepcopy(tool_meta.pop(key)))
+    for key in ("current_tool_result_chars", "adapter_comment", "active_turn_tool_calls"):
+        if key in agent and key not in {"agent_state", "notifications", "guidance", "instruction"}:
+            agent_state.setdefault(key, copy.deepcopy(agent.pop(key)))
+    if "reconstruction" in tool_meta:
+        agent_state.setdefault("events", {})["reconstruction"] = copy.deepcopy(tool_meta.pop("reconstruction"))
+    if not has_agent_axis:
+        return {"tool_meta": tool_meta}
+    agent["agent_state"] = agent_state
+    agent.setdefault("instruction", "Only the latest agent_meta in conversation is current; older ones are historical traces.")
+    daemon_local_state = isinstance(agent_state.get("daemon"), dict)
+    has_notification_axis = (
+        "notifications" in agent
+        or "notifications" in raw
+        or "notification_persistent" in raw
+    )
+    if daemon_local_state and not has_notification_axis:
+        # Daemon agent_meta deliberately carries no parent-only notification or
+        # communication axis. Preserve that omission through provider projection
+        # instead of manufacturing the main-agent's empty compatibility object.
+        agent.pop("notifications", None)
+    else:
+        notifications = agent.get("notifications")
+        if not isinstance(notifications, dict):
+            notifications = {}
+        if "notifications" in raw:
+            notifications.setdefault("attention", copy.deepcopy(raw["notifications"]))
+        if "notification_persistent" in raw:
+            notifications.setdefault("persistent", copy.deepcopy(raw["notification_persistent"]))
+        agent["notifications"] = notifications
+    has_guidance_axis = (
+        "guidance" in agent
+        or "guidance" in raw
+        or "notification_guidance" in raw
+    )
+    if daemon_local_state and not has_guidance_axis:
+        # A daemon does not carry the main agent's resident meta_guidance section,
+        # so an absent guidance axis must stay absent rather than point nowhere.
+        agent.pop("guidance", None)
+    else:
+        guidance = agent.get("guidance")
+        if not isinstance(guidance, dict):
+            guidance = {}
+        if "guidance" in raw:
+            guidance.setdefault("persistent", copy.deepcopy(raw["guidance"]))
+        if "notification_guidance" in raw:
+            guidance.setdefault("transient", copy.deepcopy(raw["notification_guidance"]))
+        agent["guidance"] = guidance
+    return {"tool_meta": tool_meta, "agent_meta": agent}
+
+
+def _project_tool_result(block: ToolResultBlock) -> Any:
+    """Project canonical sidecar metadata without rewriting block.content."""
+    if not isinstance(block.metadata, dict) or not block.metadata:
+        # Historical/legacy content, including content["_meta"], is already
+        # the holder that full-history replay must preserve verbatim.
+        return block.content
+
+    if isinstance(block.content, dict):
+        projected = dict(block.content)
+        has_business_meta = "_meta" in projected
+        business_meta = projected.get("_meta")
+        envelope = _normalize_runtime_envelope(business_meta)
+        if isinstance(block.metadata, dict) and block.metadata:
+            envelope = _normalize_runtime_envelope(block.metadata) or {}
+            if has_business_meta:
+                # Keep the handler dictionary intact inside the established
+                # result sidecar shape; otherwise its own ``_meta`` would be
+                # mistaken for the runtime envelope and overwritten.
+                return {"result": block.content, "_meta": envelope}
+            projected.pop("_meta", None)
+        elif envelope is not None:
+            projected.pop("_meta", None)
+        if business_meta is not None or envelope is not None:
+            if envelope is not None:
+                projected["_meta"] = envelope
+        return projected
+    if block.metadata:
+        envelope = _normalize_runtime_envelope(block.metadata)
+        return {"result": block.content, "_meta": envelope}
+    return block.content
+
+
+def _restore_projected_result(value: Any) -> tuple[Any, dict]:
+    """Recover a sidecar when a provider round-trip returns the projected JSON."""
+    if isinstance(value, dict) and isinstance(value.get("_meta"), dict):
+        body = dict(value)
+        metadata = _normalize_runtime_envelope(body.get("_meta"))
+        if metadata is None:
+            return value, {}
+        body.pop("_meta")
+        if set(body) == {"result"}:
+            return body["result"], metadata
+        return body, metadata
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return value, {}
+        if isinstance(parsed, dict) and isinstance(parsed.get("_meta"), dict):
+            body = dict(parsed)
+            metadata = _normalize_runtime_envelope(body.get("_meta"))
+            if metadata is None:
+                return value, {}
+            body.pop("_meta")
+            if set(body) == {"result"}:
+                return body["result"], metadata
+            return body, metadata
+    return value, {}
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +290,14 @@ from lingtai_kernel.llm.interface import (
 def to_anthropic(iface: ChatInterface) -> list[dict]:
     """Convert canonical interface to Anthropic message list.
     System entries excluded (Anthropic passes system separately).
+    Every historical ``ToolResultBlock``'s content is serialized as-is,
+    including any ``_meta.agent_meta`` / ``guidance`` / ``notifications`` /
+    ``notification_guidance`` it carries — full-history conversion does not
+    strip these keys from any holder. String content passes through
+    unchanged; dict content is re-serialized to JSON (equal, not
+    byte-identical). A ``summarize``-replaced body is the only historical
+    tool-result body a rebuild replaces (see ``lingtai.kernel.meta_block``
+    for the latest-holder-is-current-state reading rule).
     """
     messages: list[dict] = []
     for entry in iface.entries:
@@ -52,10 +322,11 @@ def _to_anthropic_block(block: ContentBlock) -> dict:
     elif isinstance(block, ToolCallBlock):
         return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.args}
     elif isinstance(block, ToolResultBlock):
+        content = _project_tool_result(block)
         return {
             "type": "tool_result",
             "tool_use_id": block.id,
-            "content": block.content if isinstance(block.content, str) else json.dumps(block.content, default=str),
+            "content": content if isinstance(content, str) else json.dumps(content, default=str),
         }
     elif isinstance(block, ThinkingBlock):
         d: dict = {"type": "thinking", "thinking": block.text}
@@ -92,7 +363,8 @@ def from_anthropic(messages: list[dict], system_prompt: str | None = None) -> Ch
 
 
 def _from_anthropic_tool_result(b: dict) -> ToolResultBlock:
-    return ToolResultBlock(id=b["tool_use_id"], name=b.get("name", ""), content=b.get("content", ""))
+    content, metadata = _restore_projected_result(b.get("content", ""))
+    return ToolResultBlock(id=b["tool_use_id"], name=b.get("name", ""), content=content, metadata=metadata)
 
 
 def _from_anthropic_block(b: dict) -> ContentBlock:
@@ -119,7 +391,14 @@ def _from_anthropic_block(b: dict) -> ContentBlock:
 
 def to_openai(iface: ChatInterface) -> list[dict]:
     """Convert canonical interface to OpenAI Chat Completions message list.
-    System entries become role=system.  Tool results become separate role=tool messages.
+    System entries become role=system.  Tool results become separate role=tool
+    messages.  Every historical tool result's content is serialized as-is,
+    including any ``_meta.agent_meta``/``guidance``/``notifications``/
+    ``notification_guidance`` it carries — full-history conversion does not
+    strip these keys from any holder. String content passes through
+    unchanged; dict content is re-serialized to JSON (equal, not
+    byte-identical). A ``summarize``-replaced body is the only historical
+    tool-result body a rebuild replaces.
     """
     messages: list[dict] = []
     for entry in iface.entries:
@@ -129,10 +408,11 @@ def to_openai(iface: ChatInterface) -> list[dict]:
             if entry.content and isinstance(entry.content[0], ToolResultBlock):
                 for block in entry.content:
                     if isinstance(block, ToolResultBlock):
+                        content = _project_tool_result(block)
                         messages.append({
                             "role": "tool",
                             "tool_call_id": block.id,
-                            "content": block.content if isinstance(block.content, str) else json.dumps(block.content, default=str),
+                            "content": content if isinstance(content, str) else json.dumps(content, default=str),
                         })
             elif len(entry.content) == 1 and isinstance(entry.content[0], TextBlock):
                 messages.append({"role": "user", "content": entry.content[0].text})
@@ -190,11 +470,13 @@ def _pair_responses_orphan_function_calls(items: list[dict]) -> list[dict]:
     """Wire-layer guard for the Responses API input list.
 
     Walks the list and, for any ``function_call`` item whose ``call_id``
-    is not followed by a matching ``function_call_output`` item (in any
-    later position, not just immediately after), inserts a synthesized
-    ``function_call_output`` placeholder immediately after the
-    ``function_call``. The canonical interface is not mutated — this
-    repair is local to the serialization and re-runs on the next send.
+    has no matching ``function_call_output`` item (in any position),
+    appends a synthesized ``function_call_output`` placeholder at the END
+    of the list. The placeholders are emitted as one contiguous tail block,
+    in ``function_call`` order, so the serialization stays stable across
+    continuation turns (see the in-body comment for why tail placement beats
+    interleaving). The canonical interface is not mutated — this repair is
+    local to the serialization and re-runs on the next send.
 
     Mirrors :func:`lingtai.llm.openai.adapter.OpenAIChatSession._pair_orphan_tool_calls`
     which provides the same guarantee for OpenAI Chat Completions. The
@@ -214,13 +496,27 @@ def _pair_responses_orphan_function_calls(items: list[dict]) -> list[dict]:
         for it in items
         if it.get("type") == "function_call_output" and it.get("call_id")
     }
-    patched: list[dict] = []
+    # Append synthesized placeholders at the END of the list, after every real
+    # item, rather than interleaving each one immediately after its
+    # ``function_call``. The Responses API does not require adjacency, so the tail
+    # position is equally valid — and it keeps the serialization STABLE across
+    # continuation turns. ``to_responses_input`` already emits all of an assistant
+    # entry's ``function_call``s contiguously and all real
+    # ``function_call_output``s afterwards, so when a multi-call turn resolves
+    # incrementally the real outputs land in a fixed order. Interleaving each
+    # placeholder right after its call instead made the placeholder positions
+    # drift relative to where the real outputs eventually appear, which broke the
+    # Codex strict-prefix continuation and forced a ``*_full`` request every turn
+    # (the observed ``prefix_mismatch`` with ``function_call_output`` vs
+    # ``function_call``). Placing placeholders contiguously at the tail lets the
+    # baseline recorder strip them as one block and keeps the real prefix stable.
+    patched: list[dict] = list(items)
+    seen: set[str] = set(output_ids)
     for item in items:
-        patched.append(item)
         if item.get("type") != "function_call":
             continue
         call_id = item.get("call_id")
-        if not call_id or call_id in output_ids:
+        if not call_id or call_id in seen:
             continue
         patched.append(
             {
@@ -229,11 +525,15 @@ def _pair_responses_orphan_function_calls(items: list[dict]) -> list[dict]:
                 "output": _RESPONSES_ORPHAN_OUTPUT_PLACEHOLDER,
             }
         )
-        output_ids.add(call_id)
+        seen.add(call_id)
     return patched
 
 
-def to_responses_input(iface: ChatInterface) -> list[dict]:
+def to_responses_input(
+    iface: ChatInterface,
+    *,
+    replay_raw_output_items: bool = False,
+) -> list[dict]:
     """Convert canonical interface to OpenAI Responses API ``input`` items.
 
     System entries are excluded (the Responses API takes the system prompt
@@ -246,8 +546,17 @@ def to_responses_input(iface: ChatInterface) -> list[dict]:
       * assistant thought -> ``{"type": "reasoning", "summary": [{"type": "summary_text", "text": <str>}]}``
       * tool result     -> ``{"type": "function_call_output", "call_id", "output": <str>}``
 
-    Used by stateless Responses sessions (e.g. Codex) that must replay the
-    full conversation each turn instead of relying on ``previous_response_id``.
+    Used by stateless Responses sessions that must replay the full conversation
+    each turn instead of relying on ``previous_response_id``. Provider-specific
+    sessions choose whether to opt into the raw-output sidecar below.
+    Successful generic stateless turns may carry a provider-data snapshot;
+    when its canonical validity fingerprint still matches, this converter
+    deep-copies and emits those raw output items in their original order.
+    Changed, redacted, old, and manually-created entries use the projections
+    below instead. Raw output replay is opt-in at this converter seam via
+    ``replay_raw_output_items=True``; generic stateless Responses sessions and
+    MiMo/DeepSeek opt in, while native Codex deliberately keeps its existing
+    canonical projection.
 
     Before returning, the wire-layer guard
     :func:`_pair_responses_orphan_function_calls` synthesizes a
@@ -257,6 +566,20 @@ def to_responses_input(iface: ChatInterface) -> list[dict]:
     canonical history carries a tool_call whose result was lost — for
     example after a continuation send that failed AFTER local tool
     execution and was rolled back by the adapter (issue #170).
+
+    Every historical tool result's content is serialized as-is, including any
+    ``_meta.agent_meta`` / ``guidance`` / ``notifications`` /
+    ``notification_guidance`` it carries — full-history conversion does not
+    strip these keys from any holder. String content passes through
+    unchanged; dict content is re-serialized to JSON (equal, not
+    byte-identical). A ``summarize``-replaced body is the only historical
+    tool-result body a rebuild replaces. On the Codex WS path the
+    per-``call_id`` freeze (``lingtai.llm.openai.adapter._freeze_responses_outputs``)
+    keeps already-sent outputs byte-identical STRINGS within an epoch for
+    reasons unrelated to this preservation (in-place canonical rewrites such
+    as summarize marker/status flips); a fresh replay after an epoch reset
+    re-serializes through this converter, which still emits every historical
+    holder's content.
     """
     items: list[dict] = []
     for entry in iface.entries:
@@ -266,10 +589,11 @@ def to_responses_input(iface: ChatInterface) -> list[dict]:
             if entry.content and isinstance(entry.content[0], ToolResultBlock):
                 for block in entry.content:
                     if isinstance(block, ToolResultBlock):
+                        content = _project_tool_result(block)
                         output = (
-                            block.content
-                            if isinstance(block.content, str)
-                            else json.dumps(block.content, default=str)
+                            content
+                            if isinstance(content, str)
+                            else json.dumps(content, default=str)
                         )
                         items.append({
                             "type": "function_call_output",
@@ -285,6 +609,18 @@ def to_responses_input(iface: ChatInterface) -> list[dict]:
                     "content": "\n".join(text_parts) if text_parts else "",
                 })
         elif entry.role == "assistant":
+            raw_items = (
+                _responses_replay_items_for_entry(entry)
+                if replay_raw_output_items
+                else None
+            )
+            if raw_items is not None:
+                # A successful stateless Responses turn is replayed as the
+                # provider returned it: item/content order, field presence,
+                # phases, and argument strings all remain intact.  The helper
+                # deep-copies and validates the snapshot before this point.
+                items.extend(raw_items)
+                continue
             text_parts: list[str] = []
             reasoning_items: list[dict] = []
             tool_calls: list[dict] = []
@@ -292,7 +628,24 @@ def to_responses_input(iface: ChatInterface) -> list[dict]:
                 if isinstance(block, TextBlock):
                     text_parts.append(block.text)
                 elif isinstance(block, ThinkingBlock):
-                    if block.text:
+                    raw_item = block.provider_data.get("openai_responses_reasoning_item")
+                    encrypted_content = (
+                        raw_item.get("encrypted_content")
+                        if isinstance(raw_item, dict) else None
+                    )
+                    if (
+                        isinstance(raw_item, dict)
+                        and raw_item.get("type") == "reasoning"
+                        and isinstance(encrypted_content, str)
+                        and encrypted_content != "<REDACTED:secret>"
+                    ):
+                        # The OpenAI SDK/request pipeline may normalize or mutate
+                        # request dictionaries. Replay a deep copy so the
+                        # persisted provider_data raw reasoning state remains an
+                        # immutable cache anchor across turns. If durable history
+                        # redacted the opaque provider blob, fall back to summary_text.
+                        reasoning_items.append(copy.deepcopy(raw_item))
+                    elif block.text:
                         reasoning_items.append({
                             "type": "reasoning",
                             "summary": [
@@ -328,6 +681,13 @@ def to_responses_input(iface: ChatInterface) -> list[dict]:
 def to_gemini(iface: ChatInterface) -> list[dict]:
     """Convert canonical interface to Gemini Interactions TurnParam list.
     System entries excluded (Gemini uses system_instruction parameter).
+    Every historical tool result's content is serialized as-is, including any
+    ``_meta.agent_meta`` / ``guidance`` / ``notifications`` /
+    ``notification_guidance`` it carries — full-history conversion does not
+    strip these keys from any holder. String content passes through
+    unchanged; dict content is re-serialized to JSON (equal, not
+    byte-identical). A ``summarize``-replaced body is the only historical
+    tool-result body a rebuild replaces.
     """
     turns: list[dict] = []
     for entry in iface.entries:
@@ -344,10 +704,11 @@ def _to_gemini_block(block: ContentBlock) -> dict:
     elif isinstance(block, ToolCallBlock):
         return {"type": "function_call", "id": block.id, "name": block.name, "arguments": block.args}
     elif isinstance(block, ToolResultBlock):
+        content = _project_tool_result(block)
         return {
             "type": "function_result",
             "call_id": block.id,
-            "result": block.content if isinstance(block.content, str) else json.dumps(block.content, default=str),
+            "result": content if isinstance(content, str) else json.dumps(content, default=str),
             "name": block.name,
         }
     elif isinstance(block, ThinkingBlock):
@@ -385,7 +746,8 @@ def _from_gemini_block(b: dict) -> ContentBlock:
     elif btype == "function_call":
         return ToolCallBlock(id=b.get("id", ""), name=b["name"], args=b.get("arguments", {}))
     elif btype == "function_result":
-        return ToolResultBlock(id=b.get("call_id", ""), name=b.get("name", ""), content=b.get("result", ""))
+        content, metadata = _restore_projected_result(b.get("result", ""))
+        return ToolResultBlock(id=b.get("call_id", ""), name=b.get("name", ""), content=content, metadata=metadata)
     elif btype == "thought":
         text = ""
         for s in b.get("summary", []):

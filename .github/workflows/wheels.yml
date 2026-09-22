@@ -2,6 +2,21 @@ name: Build Python wheels
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: >-
+          Actually publish the manifest/wheels/sdist to the GitHub release.
+          Default false keeps manual dispatch a safe dry-run/shape-check; the
+          automatic release.published trigger always publishes. Gitee is not
+          part of this publish path.
+        type: boolean
+        default: false
+      release_tag:
+        description: >-
+          Optional existing v* tag to check out for an exact-tag manual
+          recovery. Empty keeps the selected workflow ref.
+        type: string
+        default: ""
   release:
     types: [published]
 
@@ -10,63 +25,367 @@ permissions:
 
 jobs:
   build-wheels:
-    name: Wheels on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-13, macos-14, windows-latest]
+    name: Universal wheel
+    runs-on: ubuntu-latest
+    # The kernel is pure Python: one ``py3-none-any`` wheel serves every
+    # platform and interpreter, so there is no per-OS matrix, no native
+    # toolchain, and no emulated architecture leg.
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+          persist-credentials: false
 
-      - name: Set up QEMU for Linux aarch64 wheels
-        if: runner.os == 'Linux'
-        uses: docker/setup-qemu-action@v3
+      - name: Validate manual recovery tag
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$PUBLISH_REQUESTED" == "true" && -z "$RELEASE_TAG" ]]; then
+            echo "::error::Manual publishing requires an explicit existing vX.Y.Z release_tag."
+            exit 1
+          fi
+          if [[ -z "$RELEASE_TAG" ]]; then
+            exit 0
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]]; then
+            echo "::error::release_tag must be a release tag such as v1.0.6 or v1.0.6a1."
+            exit 1
+          fi
+          tag_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          if [[ "$tag_commit" != "$head_commit" ]]; then
+            echo "::error::Checked-out HEAD does not match refs/tags/${RELEASE_TAG}."
+            exit 1
+          fi
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
-      - name: Build wheels
-        uses: pypa/cibuildwheel@v2.22.0
-        env:
-          # Fail CI loudly if the native sidecar cannot be built. Local/source
-          # installs still keep setup.py's soft fallback unless this env var is
-          # explicitly set.
-          LINGTAI_REQUIRE_RUST_BUILD: "1"
-          CIBW_BUILD: "cp311-* cp312-* cp313-*"
-          CIBW_SKIP: "*-musllinux_* pp*"
-          # The sidecar is a native executable, so build arch-specific macOS
-          # wheels on the Intel and Apple Silicon runners instead of universal2.
-          CIBW_ARCHS_MACOS: "auto"
-          CIBW_ARCHS_LINUX: "auto64 aarch64"
-          CIBW_ARCHS_WINDOWS: "AMD64"
-          CIBW_BEFORE_BUILD_LINUX: >-
-            curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
-          CIBW_ENVIRONMENT_LINUX: >-
-            PATH="$HOME/.cargo/bin:$PATH"
-            LINGTAI_REQUIRE_RUST_BUILD=1
-          CIBW_TEST_COMMAND: "python {project}/scripts/smoke_wheel_sidecar.py"
+      - name: Build universal wheel
+        run: uv build --wheel --out-dir dist
 
-      - name: Build source distribution
-        if: runner.os == 'Linux'
-        run: uv build --sdist --out-dir dist
+      - name: Verify built wheel is a pure-Python universal artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(./dist/*.whl)
+          if [ ${#wheels[@]} -ne 1 ]; then
+            echo "expected exactly one wheel in ./dist, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+          # Fail loud if a native payload or a platform-specific layout crept
+          # in: the release contract is one py3-none-any wheel whose packages
+          # sit at the archive root. Then prove the wheel installs and imports
+          # without its dependency tree (the same --no-deps proof the manifest
+          # generator repeats before trusting the artifact).
+          python - "${wheels[0]}" <<'PY'
+          import sys, zipfile
+          from pathlib import Path
+          wheel = Path(sys.argv[1])
+          if not wheel.name.endswith("-py3-none-any.whl"):
+              sys.exit(f"{wheel.name} is not a py3-none-any universal wheel")
+          with zipfile.ZipFile(wheel) as zf:
+              names = zf.namelist()
+          bad = [n for n in names if ".data/" in n or n.startswith("lingtai/bin/")]
+          if bad:
+              sys.exit(f"unexpected native/.data entries in {wheel.name}: {bad[:5]}")
+          if "lingtai/__init__.py" not in names:
+              sys.exit(f"{wheel.name} does not place lingtai/ at the archive root")
+          print(f"universal wheel OK: {wheel.name}")
+          PY
+          python -m venv /tmp/wheel-smoke
+          /tmp/wheel-smoke/bin/python -m pip install --disable-pip-version-check --no-deps "${wheels[0]}"
+          /tmp/wheel-smoke/bin/python -c "import importlib.resources as r, lingtai; tools = r.files('lingtai.tools'); assert tools.joinpath('CONTRACT.md').is_file(); assert not tools.joinpath('file').is_dir(); print('import OK', lingtai.__version__)"
 
-      - name: Upload wheel artifacts
+      - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}
-          path: ./wheelhouse/*.whl
+          name: wheels-universal
+          path: ./dist/*.whl
           if-no-files-found: error
 
+  build-sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    # Independent of build-wheels so a wheel-verification failure cannot
+    # suppress the source release, and vice versa.
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+          persist-credentials: false
+
+      - name: Validate manual recovery tag
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$PUBLISH_REQUESTED" == "true" && -z "$RELEASE_TAG" ]]; then
+            echo "::error::Manual publishing requires an explicit existing vX.Y.Z release_tag."
+            exit 1
+          fi
+          if [[ -z "$RELEASE_TAG" ]]; then
+            exit 0
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]]; then
+            echo "::error::release_tag must be a release tag such as v1.0.6 or v1.0.6a1."
+            exit 1
+          fi
+          tag_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          if [[ "$tag_commit" != "$head_commit" ]]; then
+            echo "::error::Checked-out HEAD does not match refs/tags/${RELEASE_TAG}."
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build source distribution
+        run: uv build --sdist --out-dir dist
+
       - name: Upload sdist artifact
-        if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
           name: sdist
           path: ./dist/*.tar.gz
+          if-no-files-found: error
+
+  release-manifest:
+    name: Generate release manifest
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    # Serial by design: this job only aggregates the wheel+sdist artifacts the
+    # build jobs already built and verified (see "Verify built wheel is a
+    # pure-Python universal artifact" above); it must never rebuild anything.
+    # `needs: [build-wheels, build-sdist]` makes a failed build fail this job
+    # loud via `needs` rather than silently shipping an incomplete manifest.
+    timeout-minutes: 15
+    permissions:
+      # write is required only for the actual publish path (gh release
+      # upload / create); the dry-run path never mutates anything regardless
+      # of this permission grant.
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+          persist-credentials: false
+
+      - name: Validate manual recovery tag
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$PUBLISH_REQUESTED" == "true" && -z "$RELEASE_TAG" ]]; then
+            echo "::error::Manual publishing requires an explicit existing vX.Y.Z release_tag."
+            exit 1
+          fi
+          if [[ -z "$RELEASE_TAG" ]]; then
+            exit 0
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]]; then
+            echo "::error::release_tag must be a release tag such as v1.0.6 or v1.0.6a1."
+            exit 1
+          fi
+          tag_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          if [[ "$tag_commit" != "$head_commit" ]]; then
+            echo "::error::Checked-out HEAD does not match refs/tags/${RELEASE_TAG}."
+            exit 1
+          fi
+
+      - name: Set up Python for the manifest/publish scripts
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install manifest runtime dependencies
+        run: python -m pip install "packaging>=24.0"
+
+      - name: Download all wheel + sdist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "wheels-*"
+          path: release-assets
+          merge-multiple: true
+
+      - name: Download sdist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: release-assets
+
+      - name: Generate release manifest + SHA256SUMS
+        env:
+          # release.published fires with a real tag; workflow_dispatch has no
+          # tag unless release_tag explicitly selects an existing tag for
+          # exact-source recovery. Otherwise fall back to the pyproject version
+          # and checked-out workflow ref for dry-run manifest-shape testing.
+          KERNEL_TAG: ${{ github.event.release.tag_name || inputs.release_tag || '' }}
+        run: |
+          set -euo pipefail
+          version="$(python -c 'import tomllib,sys; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          tag="${KERNEL_TAG:-v${version}}"
+          generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python scripts/generate_release_manifest.py \
+            --assets-dir release-assets \
+            --kernel-version "$version" \
+            --kernel-tag "$tag" \
+            --commit "$(git rev-parse HEAD)" \
+            --generated-at "$generated_at" \
+            --out-manifest release-assets/lingtai-kernel-release-manifest.json \
+            --out-sha256sums release-assets/SHA256SUMS
+
+      - name: Determine publish mode
+        id: publish_mode
+        run: |
+          set -euo pipefail
+          # Publish for real only on the automatic release.published trigger,
+          # or on an explicit workflow_dispatch with publish=true. Every other
+          # run (default workflow_dispatch, or any run without the input)
+          # stays dry-run — this is the fix for the prior version of this job,
+          # which unconditionally omitted --execute and so could never
+          # publish anything even on a real release.
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "execute=1" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.publish }}" == "true" ]]; then
+            if [[ -z "${{ inputs.release_tag }}" ]]; then
+              echo "::error::Manual publishing requires release_tag."
+              exit 1
+            fi
+            echo "execute=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "execute=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish manifest/wheels/sdist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(python -c 'import tomllib,sys; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          tag="${{ github.event.release.tag_name || inputs.release_tag || '' }}"
+          tag="${tag:-v${version}}"
+          execute_flag=""
+          if [[ "${{ steps.publish_mode.outputs.execute }}" == "1" ]]; then
+            execute_flag="--execute"
+            echo "Publishing $tag for real (event=${{ github.event_name }})."
+          else
+            echo "Manifest ready for $tag. Dry run only (event=${{ github.event_name }}, publish input=${{ inputs.publish }})."
+          fi
+          # publish_release_assets.py is idempotent (skips already-attached
+          # same-name assets) and never force-syncs/deletes — safe to run
+          # repeatedly. --skip-gitee keeps the primary release path
+          # GitHub-only: Gitee is not synchronized or published from this
+          # job, so a Gitee problem can never delay or fail a release.
+          python scripts/publish_release_assets.py \
+            --manifest release-assets/lingtai-kernel-release-manifest.json \
+            --assets-dir release-assets \
+            --skip-gitee \
+            $execute_flag
+
+      - name: Notify lingtai-web download mirror
+        # Only after the GitHub upload above actually ran for real -- never on
+        # a dry run, and never before the upload step, so the mirror can only
+        # ever be asked to fetch bytes GitHub has already accepted. This is a
+        # download-acceleration mirror, not an alternate release-publication
+        # path: a missing/failed dispatch never edits or undoes the GitHub
+        # release published above. continue-on-error isolates a dispatch
+        # failure (e.g. an expired/under-scoped LINGTAI_WEB_DISPATCH_TOKEN,
+        # or a transient API error) from this job's overall result, so a
+        # download-acceleration outage can never fail the release-manifest
+        # job or skip the "Upload release manifest artifact" step below --
+        # only the actual manifest/wheel/sdist publish gate stays fail-closed.
+        if: steps.publish_mode.outputs.execute == '1'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.LINGTAI_WEB_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::LINGTAI_WEB_DISPATCH_TOKEN is not set; skipping the lingtai.ai download-mirror dispatch. This is a documented deployment prerequisite (a token with repository_dispatch write access on Lingtai-AI/lingtai-web), not a release failure -- the GitHub release above already succeeded."
+            exit 0
+          fi
+          version="$(python -c 'import tomllib,sys; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          tag="${{ github.event.release.tag_name || inputs.release_tag || '' }}"
+          tag="${tag:-v${version}}"
+          python3 - "$tag" << 'PY' | gh api repos/Lingtai-AI/lingtai-web/dispatches --method POST --input -
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          tag = sys.argv[1]
+          assets_dir = Path("release-assets")
+          manifest = json.loads((assets_dir / "lingtai-kernel-release-manifest.json").read_text())
+
+          def sha256_of(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          assets = []
+          # The wheel/sdist already carry a verified sha256 in the manifest
+          # (verify_local_assets() proved it matches on-disk bytes earlier in
+          # this job); the manifest and SHA256SUMS files describe themselves,
+          # so their digests are computed fresh here.
+          for artifact in manifest["artifacts"]:
+              path = assets_dir / artifact["filename"]
+              assets.append({
+                  "name": artifact["filename"],
+                  "sha256": artifact["sha256"],
+                  "size": path.stat().st_size,
+              })
+          for extra_name in ("lingtai-kernel-release-manifest.json", "SHA256SUMS"):
+              path = assets_dir / extra_name
+              assets.append({
+                  "name": extra_name,
+                  "sha256": sha256_of(path),
+                  "size": path.stat().st_size,
+              })
+
+          print(json.dumps({
+              "event_type": "release-asset-published",
+              "client_payload": {
+                  "source_repo": "Lingtai-AI/lingtai-kernel",
+                  "tag": tag,
+                  "assets": assets,
+              },
+          }))
+          PY
+
+      - name: Upload release manifest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: |
+            release-assets/lingtai-kernel-release-manifest.json
+            release-assets/SHA256SUMS
           if-no-files-found: error
